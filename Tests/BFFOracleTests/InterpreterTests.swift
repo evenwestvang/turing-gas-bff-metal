@@ -154,22 +154,31 @@ final class LoopSemanticsTests: XCTestCase {
         XCTAssertEqual(r.halt, .pcOut)
     }
 
-    // Taken '[' with no ']' anywhere: hard halt, and the halting op still costs
-    // one step (mirrors the GPU kernel's pc++/steps++ after the halt flag).
+    // Taken '[' with no ']' anywhere: hard halt. Pins the 01 §3 canonical timing
+    // (assumed cubff alignment, tag 4 extended, pending golden confirmation): the
+    // halting bracket is still a fully executed op — it consumes exactly one step
+    // and the shared pc advance runs once before `.unmatched` is recorded, mirroring
+    // the GPU kernel's load-bearing pc++/steps++ fall-through (02 §6). steps == 2,
+    // not 1, is the whole assertion — and it must hold in BOTH bracket modes.
     func testUnmatchedForwardBracketHalts() {
-        let r = exec(makeTape([BFFOp.head0Left, BFFOp.loopOpen]))
-        XCTAssertEqual(r.halt, .unmatched)
-        XCTAssertEqual(r.steps, 2)
-        XCTAssertEqual(r.loopOps, 1)
+        for mode in BracketMode.allCases {
+            let r = exec(makeTape([BFFOp.head0Left, BFFOp.loopOpen]), brackets: mode)
+            XCTAssertEqual(r.halt, .unmatched, "\(mode)")
+            XCTAssertEqual(r.steps, 2, "'<' + the halting '[' cost one step each (\(mode))")
+            XCTAssertEqual(r.loopOps, 1, "\(mode)")
+        }
     }
 
-    // Taken ']' with no '[' behind it: hard halt.
+    // Taken ']' with no '[' behind it: hard halt, same pinned one-step/one-pc-advance
+    // rule as the forward case, in both bracket modes.
     func testUnmatchedBackwardBracketHalts() {
         // '+' makes tape[0] nonzero (0x2B -> 0x2C), so ']' is taken.
-        let r = exec(makeTape([BFFOp.inc, BFFOp.loopClose]))
-        XCTAssertEqual(r.halt, .unmatched)
-        XCTAssertEqual(r.steps, 2)
-        XCTAssertEqual(r.loopOps, 1)
+        for mode in BracketMode.allCases {
+            let r = exec(makeTape([BFFOp.inc, BFFOp.loopClose]), brackets: mode)
+            XCTAssertEqual(r.halt, .unmatched, "\(mode)")
+            XCTAssertEqual(r.steps, 2, "'+' + the halting ']' cost one step each (\(mode))")
+            XCTAssertEqual(r.loopOps, 1, "\(mode)")
+        }
     }
 
     // Non-taken unmatched brackets are harmless no-ops + condition test.
@@ -281,6 +290,24 @@ final class BracketModeDivergenceTests: XCTestCase {
         XCTAssertFalse(cmp.diverges)
         XCTAssertEqual(cmp.dynamicScan.remapEvents, 0)
         XCTAssertEqual(cmp.jumpTable.remapEvents, 0)
+    }
+}
+
+final class JumpTableSentinelTests: XCTestCase {
+
+    // An unclosed '[' in the interaction-start tape gets the Swift unmatched
+    // sentinel in the frozen table, and a frozen-mode run that takes it halts
+    // `.unmatched`. The CPU sentinel is -1 while the GPU encodes the same semantic
+    // value as 0xFF (valid indices are 0...127); only the predicate must agree.
+    func testUnclosedOpenBracketMapsToSentinelAndHaltsFrozenRun() {
+        // '<' wraps h0 to 127 (a zero cell) so the '[' at pc = 1 is taken.
+        let tape = makeTape([BFFOp.head0Left, BFFOp.loopOpen])
+        let table = BFFInterpreter.buildJumpTable(for: tape)
+        XCTAssertEqual(table[1], BFFInterpreter.jumpTableUnmatched,
+                       "unclosed '[' must map to the unmatched sentinel")
+        let r = exec(tape, brackets: .jumpTable)
+        XCTAssertEqual(r.halt, .unmatched)
+        XCTAssertEqual(r.steps, 2, "the halting '[' still costs one step + pc advance")
     }
 }
 

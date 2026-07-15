@@ -3,10 +3,17 @@
 /// Implements the normative step semantics of 01 §3 exactly, in both bracket modes,
 /// with the remap-event counter required by the D1 decision procedure (01 §7.3).
 
-/// Sentinel for "no match" in a frozen jump table (mirrors `BFF_JT_UNMATCHED`).
-private let jtUnmatched = -1
-
 public enum BFFInterpreter {
+
+    /// CPU-side sentinel for "no match" in a frozen jump-table entry.
+    ///
+    /// The GPU's `BFF_JT_UNMATCHED` is `0xFF`: its tables are `uchar`, and valid
+    /// match indices are 0...127, so the high half of the byte range is free to
+    /// carry the sentinel (02 §5). This table is `[Int]`, so `-1` is the natural
+    /// choice. The two encodings are deliberately *different numbers for the same
+    /// semantic value* — ports must agree on the predicate "is this entry
+    /// unmatched?", never on the raw sentinel bits.
+    static let jumpTableUnmatched = -1
 
     // MARK: - Bracket matching
 
@@ -47,7 +54,7 @@ public enum BFFInterpreter {
 
     /// Frozen jump table built from the interaction-start tape (02 §5).
     ///
-    /// `table[i]` is the match index for a bracket at `i`, or `jtUnmatched`.
+    /// `table[i]` is the match index for a bracket at `i`, or `jumpTableUnmatched`.
     /// Semantic trap, deliberately preserved: entries are only *written* for bytes
     /// that are brackets at build time. A byte that self-modifies *into* a bracket
     /// mid-run reads whatever the table holds at that position. The GPU kernel
@@ -56,7 +63,7 @@ public enum BFFInterpreter {
     /// so jump-table-mode behavior is at least deterministic. This is one of the
     /// divergence sources the D1 experiment measures.
     public static func buildJumpTable(for tape: [UInt8]) -> [Int] {
-        var table = [Int](repeating: jtUnmatched, count: tape.count)
+        var table = [Int](repeating: jumpTableUnmatched, count: tape.count)
         var stack: [Int] = []
         for i in 0..<tape.count {
             let c = tape[i]
@@ -67,7 +74,7 @@ public enum BFFInterpreter {
                     table[open] = i
                     table[i] = open
                 } else {
-                    table[i] = jtUnmatched
+                    table[i] = jumpTableUnmatched
                 }
             }
         }
@@ -127,8 +134,11 @@ public enum BFFInterpreter {
             if steps >= stepBudget { halt = .budget; break }
             if pc < 0 || pc >= BFF.pairTapeSize { halt = .pcOut; break }
 
-            // `unmatchedHalt` is deferred so the halting bracket still pays its
-            // `pc += 1; steps += 1`, exactly like the GPU kernel (02 §6).
+            // `unmatchedHalt` is deferred so the halting bracket consumes exactly one
+            // step and advances pc once before `.unmatched` is recorded — the canonical
+            // rule of 01 §3, mirroring the GPU kernel's load-bearing fall-through to
+            // `pc++; steps++` (02 §6). Assumed cubff behavior (alignment tag 4 extended
+            // to the unmatched case); still needs golden confirmation.
             var unmatchedHalt = false
             let op = tape[pc]
             switch op {
@@ -147,20 +157,20 @@ public enum BFFInterpreter {
             case BFFOp.loopOpen:
                 loopOps += 1
                 if tape[h0] == 0 {
-                    let live = matchForward(in: tape, from: pc) ?? jtUnmatched
+                    let live = matchForward(in: tape, from: pc) ?? jumpTableUnmatched
                     let table = frozen[pc]
                     if live != table { remapEvents += 1 }
                     let target = (bracketMode == .dynamicScan) ? live : table
-                    if target == jtUnmatched { unmatchedHalt = true } else { pc = target }
+                    if target == jumpTableUnmatched { unmatchedHalt = true } else { pc = target }
                 }
             case BFFOp.loopClose:
                 loopOps += 1
                 if tape[h0] != 0 {
-                    let live = matchBackward(in: tape, from: pc) ?? jtUnmatched
+                    let live = matchBackward(in: tape, from: pc) ?? jumpTableUnmatched
                     let table = frozen[pc]
                     if live != table { remapEvents += 1 }
                     let target = (bracketMode == .dynamicScan) ? live : table
-                    if target == jtUnmatched { unmatchedHalt = true } else { pc = target }
+                    if target == jumpTableUnmatched { unmatchedHalt = true } else { pc = target }
                 }
             default:
                 break // byte 0 and all other data values: no-op

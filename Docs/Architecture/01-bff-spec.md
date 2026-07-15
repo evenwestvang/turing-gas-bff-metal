@@ -112,12 +112,13 @@ loop:
         '.': tape[head1] = tape[head0]
         ',': tape[head0] = tape[head1]
         '[': if tape[head0] == 0:
-                 pc = match_forward(pc)    # index of matching ']', or HALT(UNMATCHED)
+                 pc = match_forward(pc)    # matching ']' index; no match ⇒ flag UNMATCHED
         ']': if tape[head0] != 0:
-                 pc = match_backward(pc)   # index of matching '[', or HALT(UNMATCHED)
+                 pc = match_backward(pc)   # matching '[' index; no match ⇒ flag UNMATCHED
         default: no-op                     # includes byte 0 and all 246 data values
     pc += 1
     steps += 1
+    if UNMATCHED flagged: halt(UNMATCHED)  # checked AFTER pc/steps — see bullet below
 ```
 
 Conventions locked down here (all consistent with "scan to the match, then the shared `pc += 1`
@@ -132,6 +133,12 @@ moves past/into it"):
   scan iterations as steps, our `steps` metric will read lower; dynamics are unaffected).
 - **Unmatched bracket** on a *taken* branch = hard halt: cubff implements this by setting pc
   out of range; we record it as a distinct halt reason `UNMATCHED` (it is the same event).
+  **Canonical timing**: the halting bracket is still a fully executed op — it consumes
+  **exactly one step** and the shared `pc += 1` runs **once** before the halt is recorded
+  (in the pseudocode above, the UNMATCHED flag is checked *after* `pc += 1; steps += 1`).
+  **Verify vs cubff** — this is the *assumed* answer, extending alignment tag 4 (§7.4) to
+  the unmatched case; it still needs golden confirmation. A reference that halts before
+  charging the step would read one step lower on every UNMATCHED interaction.
   A non-taken unmatched bracket is harmless (falls through as no-op + condition test).
 
 ### Bracket matching (normative)
@@ -315,7 +322,7 @@ link 1 (mismatches are corrected in the oracle first, then propagated to MSL).
 | 1 | Opcode byte values | ASCII table of §2 (`"[]+-.,<>{}"`) | CommandRepr / instruction decode |
 | 2 | Initial pc/heads | `noheads`: pc = h0 = h1 = 0. `bff`: h0 = tape[0] & 127, h1 = tape[1] & 127, pc = 2 | variant setup code |
 | 3 | Mutate-vs-run order | mutate → pair → run, within an epoch; no mutation mid-run | epoch loop |
-| 4 | Step counting | every executed op = 1 step, incl. no-ops and non-taken brackets; bracket-scan iterations do **not** count | main interpreter loop |
+| 4 | Step counting | every executed op = 1 step, incl. no-ops, non-taken brackets, **and the taken-but-unmatched bracket that halts UNMATCHED** (it still gets the shared `pc += 1; steps += 1`, §3); bracket-scan iterations do **not** count | main interpreter loop |
 | 5 | Loop re-entry landing | taken `]` lands **on** the matching `[`; the shared `pc += 1` re-enters the body; the `[` is **not** re-executed (its condition is not re-tested) | bracket handling |
 | 6 | CheckSelfRep accounting | the candidate's half (`tape[0..63]`) feeds forward; "reliably reproduced" = byte equal across all 13 seeds; classify at ≥ 5 bytes | CheckSelfRep |
 

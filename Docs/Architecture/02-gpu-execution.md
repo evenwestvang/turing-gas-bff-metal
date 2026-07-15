@@ -144,6 +144,12 @@ kernel void bff_build_jump_tables(
 }
 ```
 
+Sentinel encoding note: `BFF_JT_UNMATCHED = 0xFF` works because the tables are `uchar` and
+valid match indices are only 0...127. The Swift CPU oracle stores its frozen table as `[Int]`
+and uses `-1` for the same semantic state — *different numbers, one meaning*. CPU/GPU parity
+(01 §7.2) therefore compares semantic unmatched status (halt reason, steps, final tapes),
+never raw sentinel values across the two representations.
+
 Non-bracket entries are never read, so no table clearing is needed. Tables are rebuilt **every
 epoch after mutation** (they'd be stale otherwise) but **not during a run** — see the semantic
 caveat in 01 §3 / 06: programs that rewrite their own brackets mid-run see the epoch-start
@@ -243,6 +249,10 @@ kernel void bff_interpret(
                         break;
                     default: break;                       // 246 data values + null: no-op
                     }
+                    // LOAD-BEARING fall-through: this line must run even when the switch
+                    // just set BFF_HALT_UNMATCHED — the halting bracket still pays one
+                    // step and one pc advance (01 §3 canonical timing, alignment tag 4).
+                    // Do not "fix" by breaking out of the step before this line.
                     pc++; steps++;
                 }
             }

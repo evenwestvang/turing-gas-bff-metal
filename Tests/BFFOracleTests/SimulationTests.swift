@@ -26,6 +26,18 @@ final class RandomTests: XCTestCase {
         XCTAssertNotEqual(a, BFFRandom.rng3(seed: 8, stream: 0, index: 0))
     }
 
+    // Literal golden contract for `counter-pcg-v1`: these values were computed once
+    // from the documented PCG algorithm (02 §4) via an independent reimplementation
+    // and are hard-coded here on purpose. If any of them changes, the RNG contract
+    // is broken — every existing fixture is invalidated and `BFFRandom.contractID`
+    // must be bumped.
+    func testRng3GoldenValues() {
+        XCTAssertEqual(BFFRandom.rng3(seed: 0, stream: 0, index: 0), 0x30BE_035E)
+        XCTAssertEqual(BFFRandom.rng3(seed: 1, stream: 0, index: 0), 0xE92A_518A)
+        XCTAssertEqual(BFFRandom.rng3(seed: 0xDEAD_BEEF, stream: 5, index: 12345), 0x2111_A1D3)
+        XCTAssertEqual(BFFRandom.rng3(seed: 42, stream: 9, index: 0xFFFF_FFFF), 0xACCE_0DE5)
+    }
+
     func testSoupInitIsDeterministic() {
         let a = BFFRandom.initialSoup(programs: 4, seed: 99)
         let b = BFFRandom.initialSoup(programs: 4, seed: 99)
@@ -70,6 +82,16 @@ final class RandomTests: XCTestCase {
             XCTAssertTrue(seen.insert(a).inserted)
             XCTAssertTrue(seen.insert(b).inserted)
         }
+    }
+
+    // Literal golden pairing vector (hard-coded from an independent reimplementation
+    // of the documented Fisher–Yates): unlike the permutation-validity tests above,
+    // this pins the *draw convention* — swaps iterate i = count-1 down to 1, the
+    // partner is `rng3(seed, epoch*4+1, i) % (i+1)`. Any permutation would pass the
+    // validity tests; only the pinned convention produces exactly this vector.
+    func testPairingPermutationGoldenVector() {
+        XCTAssertEqual(BFFRandom.pairingPermutation(count: 8, seed: 11, epoch: 2),
+                       [1, 0, 7, 2, 4, 5, 6, 3])
     }
 
     func testPairingIsDeterministicPerEpoch() {
