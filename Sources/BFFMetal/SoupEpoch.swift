@@ -1,0 +1,224 @@
+import BFFOracle
+
+/// The two program identities that meet in one interaction. Pairing does NOT
+/// redefine identity: `a` and `b` are the *stable program IDs* (indices into the
+/// soup) that a shuffled position selected as partners, and results scatter back
+/// to exactly these IDs. Stored as a named struct (not a tuple) so plans are
+/// `Equatable` for replay tests.
+public struct PairIdentity: Equatable, Sendable {
+    public var a: UInt32
+    public var b: UInt32
+    public init(a: UInt32, b: UInt32) {
+        self.a = a
+        self.b = b
+    }
+}
+
+/// Everything a single epoch needs before touching the GPU — a pure function of
+/// `(soup, config, epoch)`, so it is fully testable without a Metal device and is
+/// the exact bytes the shadow comparator captures.
+public struct EpochPlan: Equatable, Sendable {
+    /// 0-based epoch index this plan is for.
+    public var epoch: Int
+    /// The Fisher–Yates permutation of `0..<programCount` (01 §4, `BFFRandom`).
+    public var permutation: [UInt32]
+    /// Pair `p` is `(permutation[2p], permutation[2p+1])`, mapped to program IDs.
+    public var pairs: [PairIdentity]
+    /// Pair `p`'s packed 128-byte interaction tape: program `pairs[p].a`'s 64 bytes
+    /// followed by program `pairs[p].b`'s 64 bytes, taken from the post-mutation
+    /// soup. This is precisely what is uploaded to the GPU and what the shadow
+    /// comparator re-runs.
+    public var inputTapes: [[UInt8]]
+    /// Number of soup bytes the mutation predicate fired on this epoch.
+    public var mutationCount: Int
+
+    public init(epoch: Int, permutation: [UInt32], pairs: [PairIdentity],
+                inputTapes: [[UInt8]], mutationCount: Int) {
+        self.epoch = epoch
+        self.permutation = permutation
+        self.pairs = pairs
+        self.inputTapes = inputTapes
+        self.mutationCount = mutationCount
+    }
+}
+
+/// Platform-independent epoch mechanics: mutate → pair → pack, then (after the
+/// evaluator runs) scatter. No GPU, no randomness of its own — it only sequences
+/// the existing `counter-pcg-v1` `BFFRandom` routines.
+public enum SoupPlanner {
+
+    /// Mutate a copy of `soup` and build the epoch plan. Does not touch the caller's
+    /// soup; the mutated soup is returned so the caller commits it only alongside
+    /// the scattered GPU results.
+    ///
+    /// RNG domains are the fixed contract: mutation draws from stream `epoch*4+0`,
+    /// pairing from `epoch*4+1` (`BFFRandom.Pass`). Nothing here depends on Swift
+    /// hash iteration order.
+    public static func plan(soup: [UInt8], config: SoupConfig, epoch: Int)
+        -> (mutatedSoup: [UInt8], plan: EpochPlan) {
+        precondition(soup.count == config.soupByteCount,
+                     "soup is \(soup.count) bytes, expected \(config.soupByteCount)")
+        precondition(epoch >= 0 && epoch <= Int(UInt32.max), "epoch out of range")
+        let e = UInt32(epoch)
+
+        var mutated = soup
+        let mutationCount = BFFRandom.mutate(soup: &mutated, seed: config.seed,
+                                             epoch: e, mutationP32: config.mutationP32)
+
+        let perm = BFFRandom.pairingPermutation(count: config.programCount,
+                                                seed: config.seed, epoch: e)
+
+        var pairs: [PairIdentity] = []
+        var tapes: [[UInt8]] = []
+        pairs.reserveCapacity(config.pairCount)
+        tapes.reserveCapacity(config.pairCount)
+        for p in 0..<config.pairCount {
+            let a = perm[2 * p]
+            let b = perm[2 * p + 1]
+            pairs.append(PairIdentity(a: a, b: b))
+
+            let ra = Int(a) * BFF.tapeSize
+            let rb = Int(b) * BFF.tapeSize
+            var tape = [UInt8]()
+            tape.reserveCapacity(BFF.pairTapeSize)
+            tape.append(contentsOf: mutated[ra ..< ra + BFF.tapeSize])
+            tape.append(contentsOf: mutated[rb ..< rb + BFF.tapeSize])
+            tapes.append(tape)
+        }
+
+        let plan = EpochPlan(epoch: epoch, permutation: perm, pairs: pairs,
+                             inputTapes: tapes, mutationCount: mutationCount)
+        return (mutated, plan)
+    }
+
+    /// Scatter both 64-byte halves of each final pair tape back to the stable
+    /// program identities that formed the pair. Pairs are disjoint (a permutation),
+    /// so no two writes alias.
+    public static func scatter(into soup: inout [UInt8], plan: EpochPlan,
+                               finalTapes: [[UInt8]]) {
+        precondition(finalTapes.count == plan.pairs.count,
+                     "expected \(plan.pairs.count) final tapes, got \(finalTapes.count)")
+        for (p, pair) in plan.pairs.enumerated() {
+            let tape = finalTapes[p]
+            precondition(tape.count == BFF.pairTapeSize,
+                         "final tape \(p) is \(tape.count) bytes")
+            let ra = Int(pair.a) * BFF.tapeSize
+            let rb = Int(pair.b) * BFF.tapeSize
+            soup.replaceSubrange(ra ..< ra + BFF.tapeSize,
+                                 with: tape[0 ..< BFF.tapeSize])
+            soup.replaceSubrange(rb ..< rb + BFF.tapeSize,
+                                 with: tape[BFF.tapeSize ..< BFF.pairTapeSize])
+        }
+    }
+}
+
+/// Per-epoch aggregate accounting, reduced on the host from the per-interaction
+/// GPU result records (no per-step global atomics — 02 §8 "epoch summaries come
+/// free"). All counters preserve the split the evaluator/oracle define:
+/// `steps` is raw gas, `noopSteps` is cubff `nskip`, `commandSteps` is derived.
+public struct EpochCounters: Equatable, Sendable, Codable {
+    public var epoch: Int
+    public var interactions: Int
+    public var mutationCount: Int
+    /// Raw executed ops (budget accounting) summed over all interactions.
+    public var totalRawSteps: Int
+    /// Executed null/non-command bytes (cubff `nskip`) summed.
+    public var totalNoopSteps: Int
+    /// cubff observable op count summed: `totalRawSteps - totalNoopSteps`.
+    public var totalCommandSteps: Int
+    /// Bracket ops executed (taken or not) summed.
+    public var totalLoopOps: Int
+    /// Cross-half `.`/`,` executions summed.
+    public var totalCopyWrites: Int
+    /// Halt-reason histogram (01 §3): budget / pc-out / unmatched. The three
+    /// buckets sum to `interactions` (the evaluator always halts with one of them).
+    public var haltBudget: Int
+    public var haltPCOut: Int
+    public var haltUnmatched: Int
+
+    /// Reduce per-interaction GPU outcomes into one epoch's totals.
+    public static func reduce(epoch: Int, mutationCount: Int,
+                              outcomes: [GPUPairOutcome]) -> EpochCounters {
+        var c = EpochCounters(
+            epoch: epoch, interactions: outcomes.count, mutationCount: mutationCount,
+            totalRawSteps: 0, totalNoopSteps: 0, totalCommandSteps: 0,
+            totalLoopOps: 0, totalCopyWrites: 0,
+            haltBudget: 0, haltPCOut: 0, haltUnmatched: 0)
+        for o in outcomes {
+            c.totalRawSteps += Int(o.steps)
+            c.totalNoopSteps += Int(o.noopSteps)
+            c.totalLoopOps += Int(o.loopOps)
+            c.totalCopyWrites += Int(o.copyWrites)
+            switch o.halt {
+            case UInt32(HaltReason.budget.rawValue): c.haltBudget += 1
+            case UInt32(HaltReason.pcOut.rawValue): c.haltPCOut += 1
+            case UInt32(HaltReason.unmatched.rawValue): c.haltUnmatched += 1
+            default: break // an out-of-contract halt code is a divergence the shadow catches
+            }
+        }
+        c.totalCommandSteps = c.totalRawSteps - c.totalNoopSteps
+        return c
+    }
+}
+
+/// One deterministic metric record per stable program ID after an epoch — the raw
+/// numbers a later renderer will map to color/activity, computed here with no
+/// textures, mipmaps, or colors.
+public struct ProgramMetric: Equatable, Sendable, Codable {
+    public var programID: Int
+    /// Integer activity: the interaction's *command-step* count
+    /// (`steps - noopSteps`, i.e. executed non-no-op ops), attributed identically
+    /// to BOTH partners of the pair. Activity is a pair-level event — the two
+    /// programs shared one interaction — so both members receive the same value,
+    /// mirroring the evaluator design's `progStats[ia] = progStats[ib]` (02 §6).
+    public var activity: Int
+    /// Order-0 (plug-in) Shannon entropy of the program's 64 post-epoch bytes, in
+    /// bits per byte, range [0, 6] (a 64-byte window holds at most 64 distinct
+    /// values → log2(64) = 6). Uses the same definition as `ByteHistogram`.
+    public var entropyBitsPerByte: Double
+
+    public init(programID: Int, activity: Int, entropyBitsPerByte: Double) {
+        self.programID = programID
+        self.activity = activity
+        self.entropyBitsPerByte = entropyBitsPerByte
+    }
+}
+
+/// Platform-independent per-program metric computation.
+public enum SoupMetrics {
+
+    /// Byte entropy of a single 64-byte program, bits/byte in [0, 6].
+    /// Thin wrapper over `ByteHistogram` so the definition lives in exactly one
+    /// place; pinned by tests (uniform → 0, 64 distinct → 6).
+    public static func entropyBitsPerByte(_ program: [UInt8]) -> Double {
+        ByteHistogram(bytes: program).shannonEntropyBitsPerByte
+    }
+
+    /// One `ProgramMetric` per program ID `0..<programCount`, in ID order.
+    /// Activity is taken from the pair outcome and attributed to both partners;
+    /// entropy is computed from the post-epoch soup. Every program appears in
+    /// exactly one pair (the pairing is a permutation), so every activity is set.
+    public static func programMetrics(soup: [UInt8], plan: EpochPlan,
+                                      outcomes: [GPUPairOutcome],
+                                      programCount: Int) -> [ProgramMetric] {
+        precondition(soup.count == programCount * BFF.tapeSize)
+        precondition(outcomes.count == plan.pairs.count)
+
+        var activity = [Int](repeating: 0, count: programCount)
+        for (p, pair) in plan.pairs.enumerated() {
+            let a = outcomes[p].commandSteps
+            activity[Int(pair.a)] = a
+            activity[Int(pair.b)] = a
+        }
+
+        var metrics: [ProgramMetric] = []
+        metrics.reserveCapacity(programCount)
+        for id in 0..<programCount {
+            let start = id * BFF.tapeSize
+            let bytes = Array(soup[start ..< start + BFF.tapeSize])
+            metrics.append(ProgramMetric(programID: id, activity: activity[id],
+                                         entropyBitsPerByte: entropyBitsPerByte(bytes)))
+        }
+        return metrics
+    }
+}

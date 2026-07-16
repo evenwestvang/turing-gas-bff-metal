@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "BFFMetal", targets: ["BFFMetal"]),
         .executable(name: "bff-oracle", targets: ["bff-oracle"]),
         .executable(name: "bff-metal-parity", targets: ["bff-metal-parity"]),
+        .executable(name: "bff-metal-soup", targets: ["bff-metal-soup"]),
         .executable(name: "SoupScope", targets: ["SoupScopeApp"]),
     ],
     targets: [
@@ -28,6 +29,9 @@ let package = Package(
         ),
         // Command-line GPU fixture parity runner (exits 2 on non-Metal hosts).
         .executableTarget(name: "bff-metal-parity",
+                          dependencies: ["BFFMetal", "BFFOracle"]),
+        // Headless small-soup epoch runner (exits 2 on non-Metal hosts).
+        .executableTarget(name: "bff-metal-soup",
                           dependencies: ["BFFMetal", "BFFOracle"]),
         // Platform-independent app core; the SwiftUI shell stays view-only.
         .target(name: "SoupScopeCore", dependencies: ["BFFOracle"]),

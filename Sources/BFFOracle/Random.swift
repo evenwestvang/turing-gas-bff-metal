@@ -65,18 +65,29 @@ public enum BFFRandom {
     /// replacement is the low 8 bits of a second draw at index `i ^ 0x80000000`.
     /// The replacement is uniform over 0–255 and may be 0 or a command byte.
     /// `mutationP32 == 0` is a supported mode and leaves the soup untouched.
+    ///
+    /// Returns the number of bytes whose mutation predicate fired — i.e. draws
+    /// that satisfied `< mutationP32`, counted whether or not the replacement byte
+    /// happened to equal the original. This is the single source of truth for the
+    /// "mutation count" epoch diagnostic; it is intrinsic to the draw stream and
+    /// adds no new randomness. (`@discardableResult` so existing callers that only
+    /// want the in-place effect are unaffected.)
+    @discardableResult
     public static func mutate(
         soup: inout [UInt8], seed: UInt32, epoch: UInt32, mutationP32: UInt32
-    ) {
-        guard mutationP32 > 0 else { return }
+    ) -> Int {
+        guard mutationP32 > 0 else { return 0 }
         let s = stream(epoch: epoch, pass: .mutate)
+        var mutated = 0
         for i in 0..<soup.count {
             let idx = UInt32(i)
             if rng3(seed: seed, stream: s, index: idx) < mutationP32 {
                 soup[i] = UInt8(truncatingIfNeeded:
                     rng3(seed: seed, stream: s, index: idx ^ 0x8000_0000))
+                mutated += 1
             }
         }
+        return mutated
     }
 
     // MARK: - Pairing

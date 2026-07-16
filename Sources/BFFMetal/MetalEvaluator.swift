@@ -219,4 +219,8 @@ public final class MetalBFFEvaluator {
         return outcomes
     }
 }
+
+/// The Metal host already exposes exactly the `PairEvaluator` signature, so the
+/// GPU is a drop-in evaluator for `SoupRunner` (empty conformance).
+extension MetalBFFEvaluator: PairEvaluator {}
 #endif
