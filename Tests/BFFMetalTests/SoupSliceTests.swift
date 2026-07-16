@@ -156,8 +156,75 @@ final class SoupSliceTests: XCTestCase {
         XCTAssertEqual(c.interactions, 8)
         XCTAssertEqual(c.haltBudget + c.haltPCOut + c.haltUnmatched, 8,
                        "every interaction halts with exactly one reason")
+        // The normative CPU evaluator never emits an out-of-contract halt code, so
+        // the unknown bucket is empty and the full four-bucket invariant reduces to
+        // the three-bucket one here.
+        XCTAssertEqual(c.haltUnknown, 0)
+        XCTAssertEqual(c.haltAccounted, c.interactions,
+                       "known + unknown halt counts equal interactions")
         XCTAssertEqual(c.totalCommandSteps, c.totalRawSteps - c.totalNoopSteps)
         XCTAssertGreaterThan(c.totalRawSteps, 0)
+    }
+
+    // MARK: - Unknown halt codes are surfaced globally
+
+    /// A `PairEvaluator` that returns structurally valid outcomes but stamps a
+    /// chosen out-of-contract raw halt code on every interaction. It echoes each
+    /// input tape unchanged so scatter stays well-formed; only the halt byte is
+    /// off-contract. This models an evaluator emitting a halt code the host does
+    /// not recognize, without touching the real GPU/shared ABI.
+    private struct UnknownHaltEvaluator: PairEvaluator {
+        let haltCode: UInt32
+        func evaluate(pairTapes: [[UInt8]], variant: BFFVariant,
+                      stepBudget: Int) -> [GPUPairOutcome] {
+            pairTapes.map { tape in
+                GPUPairOutcome(finalTape: tape, steps: 1, noopSteps: 0,
+                               copyWrites: 0, loopOps: 0, halt: haltCode)
+            }
+        }
+    }
+
+    func testUnknownHaltCodesAreCountedInReductionAndInvariantHolds() {
+        let tape = [UInt8](repeating: 0, count: BFF.pairTapeSize)
+        func outcome(_ halt: UInt32) -> GPUPairOutcome {
+            GPUPairOutcome(finalTape: tape, steps: 1, noopSteps: 0,
+                           copyWrites: 0, loopOps: 0, halt: halt)
+        }
+        // Two known reasons and two DISTINCT out-of-contract codes: 0 (the reserved
+        // "never used" value) and 99 (arbitrary garbage). Both must land in unknown.
+        let outcomes = [
+            outcome(UInt32(HaltReason.budget.rawValue)),
+            outcome(UInt32(HaltReason.unmatched.rawValue)),
+            outcome(0),
+            outcome(99),
+        ]
+        let c = EpochCounters.reduce(epoch: 5, mutationCount: 0, outcomes: outcomes)
+        XCTAssertEqual(c.haltBudget, 1)
+        XCTAssertEqual(c.haltPCOut, 0)
+        XCTAssertEqual(c.haltUnmatched, 1)
+        XCTAssertEqual(c.haltUnknown, 2, "codes 0 and 99 are both out-of-contract")
+        XCTAssertEqual(c.haltAccounted, 4)
+        XCTAssertEqual(c.haltAccounted, c.interactions,
+                       "known + unknown halt counts equal interactions")
+    }
+
+    /// The whole point of the global bucket: unknown halt codes are counted even
+    /// when CPU-shadow sampling is disabled, so the divergence is never invisible.
+    func testUnknownHaltCountedGloballyEvenWithShadowDisabled() throws {
+        let cfg = try config(shadow: 0) // shadow sampling explicitly off
+        var runner = SoupRunner(config: cfg)
+        // Every interaction gets halt code 0, which is out-of-contract.
+        let report = try runner.runEpoch(using: UnknownHaltEvaluator(haltCode: 0))
+        XCTAssertEqual(report.shadowChecked, 0, "no pair was shadow-checked")
+        XCTAssertEqual(report.shadowMismatches, [], "the shadow saw nothing")
+        let c = report.counters
+        XCTAssertEqual(c.interactions, 8)
+        XCTAssertEqual(c.haltBudget, 0)
+        XCTAssertEqual(c.haltPCOut, 0)
+        XCTAssertEqual(c.haltUnmatched, 0)
+        XCTAssertEqual(c.haltUnknown, 8,
+                       "all interactions counted as unknown despite no shadowing")
+        XCTAssertEqual(c.haltAccounted, c.interactions)
     }
 
     func testCounterReductionOverSyntheticOutcomes() {

@@ -130,11 +130,26 @@ public struct EpochCounters: Equatable, Sendable, Codable {
     public var totalLoopOps: Int
     /// Cross-half `.`/`,` executions summed.
     public var totalCopyWrites: Int
-    /// Halt-reason histogram (01 §3): budget / pc-out / unmatched. The three
-    /// buckets sum to `interactions` (the evaluator always halts with one of them).
+    /// Halt-reason histogram (01 §3): budget / pc-out / unmatched. Normatively the
+    /// evaluator always halts with one of these three, but a byte read off the
+    /// shared buffer is untyped, so an out-of-contract raw halt value is possible.
     public var haltBudget: Int
     public var haltPCOut: Int
     public var haltUnmatched: Int
+    /// Interactions whose raw halt code was none of the three known reasons. This
+    /// is normatively zero; it is counted (not silently dropped) so that every
+    /// interaction lands in exactly one halt bucket regardless of whether the
+    /// CPU-shadow sampled it. A nonzero value is a global signal that the evaluator
+    /// emitted a halt code outside the contract — the shadow catches it only if it
+    /// happened to sample that pair, but this count sees it unconditionally.
+    public var haltUnknown: Int
+
+    /// Total interactions attributed across all halt buckets (the three known
+    /// reasons plus unknown). Invariant, enforced by `reduce`: this equals
+    /// `interactions`, because the switch below has no drop-through branch.
+    public var haltAccounted: Int {
+        haltBudget + haltPCOut + haltUnmatched + haltUnknown
+    }
 
     /// Reduce per-interaction GPU outcomes into one epoch's totals.
     public static func reduce(epoch: Int, mutationCount: Int,
@@ -143,7 +158,7 @@ public struct EpochCounters: Equatable, Sendable, Codable {
             epoch: epoch, interactions: outcomes.count, mutationCount: mutationCount,
             totalRawSteps: 0, totalNoopSteps: 0, totalCommandSteps: 0,
             totalLoopOps: 0, totalCopyWrites: 0,
-            haltBudget: 0, haltPCOut: 0, haltUnmatched: 0)
+            haltBudget: 0, haltPCOut: 0, haltUnmatched: 0, haltUnknown: 0)
         for o in outcomes {
             c.totalRawSteps += Int(o.steps)
             c.totalNoopSteps += Int(o.noopSteps)
@@ -153,7 +168,7 @@ public struct EpochCounters: Equatable, Sendable, Codable {
             case UInt32(HaltReason.budget.rawValue): c.haltBudget += 1
             case UInt32(HaltReason.pcOut.rawValue): c.haltPCOut += 1
             case UInt32(HaltReason.unmatched.rawValue): c.haltUnmatched += 1
-            default: break // an out-of-contract halt code is a divergence the shadow catches
+            default: c.haltUnknown += 1 // out-of-contract: surfaced globally, not dropped
             }
         }
         c.totalCommandSteps = c.totalRawSteps - c.totalNoopSteps
