@@ -6,9 +6,11 @@ import Foundation
 /// configuration (seed, population, budget, mutation, variant, bracket semantics),
 /// the RNG contract, the checkpoint epoch, the exact soup bytes, and the global
 /// byte histogram. Fixtures may come from this oracle (self-consistency / GPU
-/// diffing, 01 §7.2) or — once the grounding work of 01 §7.1 is done — from an
-/// instrumented cubff run. **No genuine cubff fixture exists yet**; see
-/// `Docs/GoldenVectors.md` for the import procedure and the parity caveats.
+/// diffing, 01 §7.2) or — if the optional whole-soup `cubffCompat` work of 01 §7.1
+/// ever lands — from an instrumented cubff run. Genuine cubff fixtures DO exist, but
+/// in a separate evaluator-level format (`CubffFixtureFile`, no RNG involved); this
+/// simulation-level format remains oracle-only. See `Docs/GoldenVectors.md` and
+/// `Docs/CubffGrounding.md` for the exact parity claims.
 public struct GoldenFixture: Codable, Equatable, Sendable {
     public static let currentFormatVersion = 1
 

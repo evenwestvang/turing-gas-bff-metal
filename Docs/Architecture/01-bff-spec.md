@@ -3,8 +3,10 @@
 Source of truth: Agüera y Arcas et al., *Computational Life*, arXiv:2406.19108, and the
 reference implementation `github.com/paradigms-of-intelligence/cubff` (authoritative where the
 paper is vague). This document is written to be sufficient to implement the interpreter without
-consulting either — but every "**verify vs cubff**" tag marks a detail an implementer should
-diff against the reference before trusting long experiments.
+consulting either. The former "**verify vs cubff**" tags have been resolved: all six
+alignment points are confirmed (one corrected) against cubff source at pinned commit
+`f212e849027c98fcf4b242eccfb5fed435223e23` — citations, fixtures, and the precise parity
+claim live in [../CubffGrounding.md](../CubffGrounding.md).
 
 ## 1. Constants
 
@@ -60,10 +62,11 @@ CommandRepr `"[]+-.,<>{}"` corresponds to:
 #define BFF_OP_END  0x5D  // ']'
 ```
 
-**Verify vs cubff** that the reference maps commands to these ASCII values rather than to an
-arbitrary internal table. The choice subtly matters (e.g. under ASCII, `+` applied twice turns
-`[` (0x5B) into `]` (0x5D)), so exact reproduction of published runs requires the same table.
-Keep it a single constant table in the shared header so it is swappable.
+**Confirmed vs cubff** (`bff.inc.h` `GetOpKind`, pinned in [../CubffGrounding.md](../CubffGrounding.md) §1):
+the reference dispatches on exactly these ASCII values; byte 0 is null, all other values are
+no-ops. The choice subtly matters (e.g. under ASCII, `+` applied twice turns `[` (0x5B) into
+`]` (0x5D)), so exact reproduction of published runs requires the same table. Keep it a single
+constant table in the shared header so it is swappable.
 
 ## 3. Interaction: two programs, one tape
 
@@ -89,7 +92,7 @@ Head moves **wrap mod 128** (`head &= 127`). The pc does *not* wrap — see halt
 | Variant | Initial state |
 |---|---|
 | **bff_noheads** (cubff repo default; **our default**) | `pc = 0`, `head0 = 0`, `head1 = 0` |
-| bff (paper's original) | `head0 = headpos(tape[0])`, `head1 = headpos(tape[1])`, `pc = 2` — the first two tape bytes seed the head positions (`headpos(b) = b % 128`; **verify vs cubff**) |
+| bff (paper's original) | `head0 = headpos(tape[0])`, `head1 = headpos(tape[1])`, `pc = 2` — the first two tape bytes seed the head positions (`headpos(b) = b % 128`; **confirmed vs cubff** `bff.inc.h` `InitialState`/`headpos`, [../CubffGrounding.md](../CubffGrounding.md) §2) |
 
 Implement `bff_noheads` first; the variant is a per-run config enum. All downstream design
 (02–05) is variant-agnostic.
@@ -129,16 +132,19 @@ moves past/into it"):
   (The `[` itself is not re-executed — its condition was logically just tested by `]`.)
 - **Every executed op costs exactly 1 step**, including no-ops and non-taken brackets.
   Bracket *scanning* cost is an implementation detail (jump table vs dynamic scan, see 02);
-  the step count is defined as op executions. **Verify vs cubff** (if the reference counts
-  scan iterations as steps, our `steps` metric will read lower; dynamics are unaffected).
+  the step count is defined as op executions. **Confirmed vs cubff** (`bff.inc.h` `Evaluate`
+  budget loop; [../CubffGrounding.md](../CubffGrounding.md) §4): the reference never counts
+  scan iterations. Refinement adopted: cubff's *reported* op count subtracts executed
+  null/non-command "comment" bytes (`i - nskip`); the oracle exposes that as
+  `InteractionResult.commandSteps` while `steps` keeps the budget-accounting meaning.
 - **Unmatched bracket** on a *taken* branch = hard halt: cubff implements this by setting pc
   out of range; we record it as a distinct halt reason `UNMATCHED` (it is the same event).
   **Canonical timing**: the halting bracket is still a fully executed op — it consumes
   **exactly one step** and the shared `pc += 1` runs **once** before the halt is recorded
   (in the pseudocode above, the UNMATCHED flag is checked *after* `pc += 1; steps += 1`).
-  **Verify vs cubff** — this is the *assumed* answer, extending alignment tag 4 (§7.4) to
-  the unmatched case; it still needs golden confirmation. A reference that halts before
-  charging the step would read one step lower on every UNMATCHED interaction.
+  **Confirmed vs cubff** ([../CubffGrounding.md](../CubffGrounding.md) §4/§5, plus the
+  `unmatched-*` golden fixtures): the failed scan parks pc at 128/−1 and the loop still
+  charges the step before breaking.
   A non-taken unmatched bracket is harmless (falls through as no-op + condition test).
 
 ### Bracket matching (normative)
@@ -189,8 +195,12 @@ for epoch = 0, 1, 2, ...:
 ```
 
 Ordering note: mutate-then-run within an epoch. Mutation is frozen during step 3 (a GPU-pass
-boundary makes this natural). **Verify vs cubff** whether the reference mutates before or after
-the run — it changes nothing qualitative, but bit-exact reproduction needs the same order.
+boundary makes this natural). **Confirmed vs cubff, with a retained order difference**
+([../CubffGrounding.md](../CubffGrounding.md) §3): the reference shuffles first and mutates the
+*concatenated pair tape* just before evaluating it (pair → mutate → run). Because every program
+is in exactly one pair and mutation never happens mid-run in either scheme, the per-epoch
+composition is identical; only the RNG stream indexing differs, which is subsumed by the
+deliberate RNG-contract difference (`counter-pcg-v1` vs cubff's SplitMix64 counters).
 
 ### Spatial 2-D variant (opt-in)
 
@@ -220,12 +230,17 @@ true spatial map (replicator fronts, waves).
   visualization (03 defines where each is computed).
 - **Self-replicator check** (cubff `CheckSelfRep`, run on demand / every 128 epochs on the
   top-k most active programs): pair the candidate with a fresh 64-byte noise program, run the
-  interaction, take the output half as the next candidate, repeat for 4 generations; do this
-  for 13 independent noise seeds; count bytes of the original reliably reproduced across
-  seeds/generations; classify as self-replicator if ≥ 5 bytes are reliably reproduced.
-  **Verify vs cubff** the exact accounting (which half is fed forward, and how "reliably
-  reproduced" aggregates over the 13 seeds). Implemented as a small GPU batch (13 × 4
-  interactions is nothing); v1.5 feature, not needed to observe the transition.
+  interaction, then feed the **offspring half** (`tape[64..127]`) forward as the next
+  candidate with the *same* noise refilled behind it, for 4 extra generations; do this for
+  13 independent noise trials. Score: a byte position qualifies if some trial value at that
+  position is shared by ≥ 4 of the 13 trials (first-half positions must also equal the
+  original program byte); the score is min(first-half count, second-half count), and the
+  program classifies as a self-replicator at score ≥ 5.
+  **Confirmed vs cubff** (`common_language.h` `CheckSelfRep`;
+  [../CubffGrounding.md](../CubffGrounding.md) §6 — which also corrects this spec's two
+  earlier wrong assumptions: the offspring half feeds forward, and agreement is ≥ 4-of-13,
+  not all-13). Implemented as a small GPU batch (13 × 5 evaluations is nothing); v1.5
+  feature, not needed to observe the transition.
 
 Expected timeline (well-mixed, defaults): transition onset around ~10³ epochs; readable as (a)
 compressed-size cliff, (b) mean-steps spike toward budget, (c) halt-mix flip to BUDGET, (d) the
@@ -240,19 +255,28 @@ Given (seed, config), a run is bit-reproducible:
   PCG-hash (02 §7) on GPU; the same function in Swift for CPU-side shuffles.
 - Pair execution is order-independent (disjoint tape ranges), so GPU scheduling cannot change
   results. Profiling counters use atomics but never feed back into simulation state.
-- Reproducibility does **not** extend to bit-exact parity with cubff unless the "verify vs
-  cubff" items above are confirmed; that parity is an explicit non-goal for v1 (the goal is
-  reproducing the *phenomenon*, same statistics — not the same trajectory). The one place we
-  *do* demand bit-exactness against cubff is the one-time grounding run of §7.1, which is what
-  turns the "verify vs cubff" tags from open questions into checked facts.
+- Reproducibility does **not** extend to fixed-seed *trajectory* parity with cubff: the RNG
+  contracts deliberately differ, and that parity is an explicit non-goal for v1 (the goal is
+  reproducing the *phenomenon*, same statistics — not the same trajectory). What *is*
+  bit-exact against cubff is per-interaction evaluator behavior, proven by the §7.1 grounding
+  fixtures ([../CubffGrounding.md](../CubffGrounding.md)).
 
 ## 7. Validation chain (golden vectors; resolves 06 D1/D2)
 
-Three links. Link 1 runs **once** (grounding); links 2–3 run **continuously** (CI, and after
-every kernel optimization). This section is the concrete plan the "verify vs cubff" tags refer
-to, and it is the decision procedure for 06 D1 (jump table vs dynamic scan).
+Three links. Link 1 runs **once** (grounding — performed, see §7.1 status); links 2–3 run
+**continuously** (CI, and after every kernel optimization). This section is the concrete plan
+behind the §7.4 alignment tags, and it is the decision procedure for 06 D1 (jump table vs
+dynamic scan).
 
 ### 7.1 Link 1 — cubff → CPU oracle (one-time grounding)
+
+> **Status (2026-07): grounding performed at the evaluator level.** The six §7.4 tags are
+> confirmed (tag 6 corrected) directly from cubff source at pinned commit
+> `f212e849027c98fcf4b242eccfb5fed435223e23`, and 59 genuine fixtures generated by executing
+> the unmodified pinned evaluator pin the oracle's interaction semantics exactly —
+> see [../CubffGrounding.md](../CubffGrounding.md). The whole-soup `cubffCompat` replay
+> described below remains optional future work; it is the only part of link 1 still open,
+> and it gates nothing (evaluator semantics, where five of the six tags live, are grounded).
 
 Build cubff at a pinned commit; run the `bff_noheads` variant at default parameters
 (N = 131,072, T = 64, budget 8,192, mutation 1/4096) with a fixed, recorded seed. Dump at
@@ -312,21 +336,23 @@ rebuild is tightened to re-scan only on writes to bracket bytes). If remap event
 never change outcomes, jumpTable stays the default and the measured remap rate is recorded in
 06 D1.
 
-### 7.4 The six cubff-alignment tags, pinned
+### 7.4 The six cubff-alignment tags — CONFIRMED
 
-For each: the **assumed answer we implement now**, to be confirmed against cubff source during
-link 1 (mismatches are corrected in the oracle first, then propagated to MSL).
+All six tags were verified directly against cubff source at pinned commit
+`f212e849027c98fcf4b242eccfb5fed435223e23`; exact file/line citations and the golden fixtures
+that pin each behavior live in [../CubffGrounding.md](../CubffGrounding.md).
 
-| # | Tag | Assumed answer (implement this) | Confirm in cubff at |
+| # | Tag | Verified answer | Status |
 |---|---|---|---|
-| 1 | Opcode byte values | ASCII table of §2 (`"[]+-.,<>{}"`) | CommandRepr / instruction decode |
-| 2 | Initial pc/heads | `noheads`: pc = h0 = h1 = 0. `bff`: h0 = tape[0] & 127, h1 = tape[1] & 127, pc = 2 | variant setup code |
-| 3 | Mutate-vs-run order | mutate → pair → run, within an epoch; no mutation mid-run | epoch loop |
-| 4 | Step counting | every executed op = 1 step, incl. no-ops, non-taken brackets, **and the taken-but-unmatched bracket that halts UNMATCHED** (it still gets the shared `pc += 1; steps += 1`, §3); bracket-scan iterations do **not** count | main interpreter loop |
-| 5 | Loop re-entry landing | taken `]` lands **on** the matching `[`; the shared `pc += 1` re-enters the body; the `[` is **not** re-executed (its condition is not re-tested) | bracket handling |
-| 6 | CheckSelfRep accounting | the candidate's half (`tape[0..63]`) feeds forward; "reliably reproduced" = byte equal across all 13 seeds; classify at ≥ 5 bytes | CheckSelfRep |
+| 1 | Opcode byte values | ASCII table of §2 (`"[]+-.,<>{}"`); byte 0 null, all else no-op | **Confirmed** (`bff.inc.h` `GetOpKind`/`CommandRepr`) |
+| 2 | Initial pc/heads | `noheads`: pc = h0 = h1 = 0 (cubff writes 128, masked to 0 before first use). `bff`: h0 = tape[0] % 128, h1 = tape[1] % 128, pc = 2 | **Confirmed** (`bff.inc.h` `InitialState`/`headpos`) |
+| 3 | Mutate-vs-run order | cubff: pair → mutate concatenated tape → run; no mutation mid-run. Oracle keeps mutate → pair → run — identical per-epoch composition, different RNG indexing (subsumed by the RNG-contract difference) | **Confirmed, order difference retained** (`common_language.h` `MutateAndRunPrograms`) |
+| 4 | Step counting | every executed op = 1 step incl. no-ops, non-taken brackets, and the halting taken-unmatched bracket; scan iterations never count. cubff's *reported* ops = steps − comment steps (oracle: `commandSteps`) | **Confirmed + refinement adopted** (`bff.inc.h` `Evaluate`) |
+| 5 | Loop re-entry landing | taken `]` lands **on** the matching `[`; the shared `pc += 1` re-enters the body; the `[` is **not** re-executed. Scans always read the live tape (cubff has no jump table) | **Confirmed** (`bff.inc.h` `EvaluateOne`) |
+| 6 | CheckSelfRep accounting | the **offspring** half (`tape[64..127]`) feeds forward with the same noise refilled; byte qualifies at ≥ 4-of-13 trial agreement (first half must also equal the original); score = min(halves); classify at ≥ 5 | **Confirmed — two spec assumptions corrected** (`common_language.h` `CheckSelfRep`) |
 
 Tag 5 is the one most entangled with self-modification: whether the `[` is re-executed
 determines whether a `[` byte rewritten mid-loop gets re-tested on re-entry — it changes
-replicator behavior directly, so it must be settled **before** the §7.3 experiment is
-meaningful.
+replicator behavior directly, so it had to be settled **before** the §7.3 experiment is
+meaningful. It now is: cubff does not re-execute the `[`, and every taken bracket re-scans
+the live tape.

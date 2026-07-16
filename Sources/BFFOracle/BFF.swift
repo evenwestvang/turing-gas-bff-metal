@@ -1,8 +1,11 @@
 /// Core constants and types for the BFF interpreter.
 ///
-/// Normative source: `Docs/Architecture/01-bff-spec.md`. Where the spec tags a detail
-/// "verify vs cubff", this implementation uses the *assumed answer* pinned in 01 §7.4.
-/// No cubff parity is claimed until the one-time grounding run (01 §7.1) has been performed.
+/// Normative source: `Docs/Architecture/01-bff-spec.md`, grounded against cubff at
+/// commit `f212e849027c98fcf4b242eccfb5fed435223e23` (see `Docs/CubffGrounding.md`).
+/// Evaluator-level parity with cubff is proven by the fixtures in
+/// `Tests/BFFOracleTests/Fixtures/cubff-evaluator-v1.json`; simulation-level (RNG,
+/// shuffle, mutation-stream) parity is intentionally NOT claimed — the oracle keeps
+/// its own `counter-pcg-v1` contract.
 
 /// Fixed sizes and defaults (01 §1).
 public enum BFF {
@@ -24,8 +27,9 @@ public enum BFF {
 /// commands test against — are inert no-ops when executed.
 ///
 /// The exact byte values matter dynamically: e.g. under ASCII, `+` applied twice turns
-/// `[` (0x5B) into `]` (0x5D). This is alignment tag 1 of 01 §7.4 (assumed, not yet
-/// confirmed against cubff source).
+/// `[` (0x5B) into `]` (0x5D). This is alignment tag 1 of 01 §7.4 — CONFIRMED against
+/// cubff `bff.inc.h` `GetOpKind` (ASCII case labels; byte 0 is `kNull`, everything
+/// else `kNoop`). See Docs/CubffGrounding.md §1.
 public enum BFFOp {
     public static let head0Left: UInt8 = 0x3C   // '<'  head0 -= 1
     public static let head0Right: UInt8 = 0x3E  // '>'  head0 += 1
@@ -63,7 +67,8 @@ public enum BFFVariant: String, Codable, Equatable, Sendable, CaseIterable {
     case noheads
     /// The paper's original `bff`: the first two tape bytes seed the head positions —
     /// `head0 = tape[0] % 128`, `head1 = tape[1] % 128`, `pc = 2`.
-    /// Alignment tag 2 of 01 §7.4 (assumed, not yet confirmed against cubff).
+    /// Alignment tag 2 of 01 §7.4 — CONFIRMED against cubff `bff.inc.h`
+    /// `InitialState` (BFF_HEADS) and `headpos`. See Docs/CubffGrounding.md §2.
     case seededHeads = "bff"
 }
 
@@ -85,8 +90,9 @@ public struct InteractionResult: Equatable, Sendable {
     public var tape: [UInt8]
     /// Executed-op count. Every executed op costs exactly 1 step, including no-ops,
     /// non-taken brackets, and the taken-but-unmatched bracket that halts the run
-    /// (matching the GPU kernel of 02 §6, where `pc++; steps++` runs after the halt
-    /// flag is set). Bracket *scanning* never counts (alignment tag 4).
+    /// (matching cubff `bff.inc.h` `Evaluate`, where the loop counter `i` ticks for
+    /// every executed byte and the halting iteration runs `i++` before breaking).
+    /// Bracket *scanning* never counts (alignment tag 4, confirmed).
     public var steps: Int
     public var halt: HaltReason
     /// `.`/`,` executions whose heads were in different 64-byte halves.
@@ -98,4 +104,13 @@ public struct InteractionResult: Equatable, Sendable {
     /// both bracket modes; only in `.jumpTable` mode does a remap actually alter
     /// execution.
     public var remapEvents: Int
+    /// Executed steps that were "comments" in cubff terms: byte 0 and every
+    /// non-command byte (cubff `EvaluateOne` returning false, counted as `nskip`).
+    /// They consume step budget but are excluded from cubff's reported op count.
+    public var noopSteps: Int
+
+    /// cubff's observable op count: `Evaluate`'s return value `i - nskip`
+    /// (`bff.inc.h`) — executed command bytes only, including non-taken brackets
+    /// and the taken-but-unmatched bracket that halts the run.
+    public var commandSteps: Int { steps - noopSteps }
 }

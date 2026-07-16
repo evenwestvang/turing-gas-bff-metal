@@ -118,7 +118,8 @@ public enum BFFInterpreter {
             pc = 0; h0 = 0; h1 = 0
         case .seededHeads:
             // headpos(b) = b % 128; the first two bytes are consumed as seeds, and
-            // execution starts past them (alignment tag 2 — assumed vs cubff).
+            // execution starts past them (alignment tag 2 — CONFIRMED vs cubff
+            // bff.inc.h InitialState/headpos; see Docs/CubffGrounding.md §2).
             h0 = Int(tape[0]) & 127
             h1 = Int(tape[1]) & 127
             pc = 2
@@ -128,6 +129,7 @@ public enum BFFInterpreter {
         var copyWrites = 0
         var loopOps = 0
         var remapEvents = 0
+        var noopSteps = 0
         var halt: HaltReason
 
         runLoop: while true {
@@ -137,8 +139,11 @@ public enum BFFInterpreter {
             // `unmatchedHalt` is deferred so the halting bracket consumes exactly one
             // step and advances pc once before `.unmatched` is recorded — the canonical
             // rule of 01 §3, mirroring the GPU kernel's load-bearing fall-through to
-            // `pc++; steps++` (02 §6). Assumed cubff behavior (alignment tag 4 extended
-            // to the unmatched case); still needs golden confirmation.
+            // `pc++; steps++` (02 §6). CONFIRMED cubff behavior (alignment tag 4
+            // extended to the unmatched case): in bff.inc.h Evaluate, a failed scan
+            // parks pc at 128 / -1, EvaluateOne returns true, and the loop still runs
+            // `i++` before breaking. Grounded by the unmatched-* fixtures
+            // (Docs/CubffGrounding.md §4/§5).
             var unmatchedHalt = false
             let op = tape[pc]
             switch op {
@@ -173,7 +178,9 @@ public enum BFFInterpreter {
                     if target == jumpTableUnmatched { unmatchedHalt = true } else { pc = target }
                 }
             default:
-                break // byte 0 and all other data values: no-op
+                // Byte 0 and all other data values: no-op. cubff counts these as
+                // `nskip` and excludes them from Evaluate's returned op count.
+                noopSteps += 1
             }
             // Shared advance: a taken `[` landed *on* its `]` and now moves past it;
             // a taken `]` landed *on* its `[` and now re-enters the body without
@@ -185,7 +192,8 @@ public enum BFFInterpreter {
 
         return InteractionResult(
             tape: tape, steps: steps, halt: halt,
-            copyWrites: copyWrites, loopOps: loopOps, remapEvents: remapEvents)
+            copyWrites: copyWrites, loopOps: loopOps, remapEvents: remapEvents,
+            noopSteps: noopSteps)
     }
 
     /// Convenience: run a pair of 64-byte programs (concatenated per 01 §3) and

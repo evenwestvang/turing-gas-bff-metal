@@ -5,20 +5,23 @@ This document covers the versioned golden-fixture format implemented by the CPU 
 eventually — imported from cubff. It is the practical companion to the validation chain of
 [Architecture/01-bff-spec.md](Architecture/01-bff-spec.md) §7.
 
-## Status: no cubff fixture ships yet, and no parity is claimed
+## Status: evaluator-level cubff grounding done; simulation fixtures stay oracle-sourced
 
-**Everything under `Tests/` and everything this repo can currently generate is
-oracle-sourced.** The one-time cubff grounding run of 01 §7.1 has **not** been performed:
+Two fixture families now exist, with different provenance and different claims:
 
-- No fixture in this repository was produced by cubff.
-- The oracle's randomness is the counter-based PCG contract of 02 §4 (`counter-pcg-v1`),
-  which is deliberately **not** cubff's RNG. A `cubffCompat` mode (port of cubff's RNG,
-  soup init, mutation draw order, and pairing shuffle) does not exist yet.
-- The six cubff-alignment tags of 01 §7.4 (opcode byte values, initial pc/heads,
-  mutate-vs-run order, step counting, loop re-entry landing, CheckSelfRep accounting) are
-  implemented as their *assumed* answers. None has been confirmed against cubff source.
-- Consequently, current fixtures ground **oracle self-consistency and the future
-  oracle↔GPU diff (01 §7.2)** — they do not ground the oracle against the paper.
+- **Genuine cubff evaluator fixtures**
+  (`Tests/BFFOracleTests/Fixtures/cubff-evaluator-v1.json`, format documented in
+  [CubffGrounding.md](CubffGrounding.md)): produced by *executing the unmodified cubff
+  evaluator* at pinned commit `f212e849027c98fcf4b242eccfb5fed435223e23` via
+  `Tools/cubff-grounding/generate.sh`. They pin per-interaction semantics — final tape and
+  op count for fixed 128-byte inputs, both variants — and `CubffFixtureTests` proves the
+  oracle matches every observable exactly. The six alignment tags of 01 §7.4 are confirmed.
+- **`GoldenFixture` simulation fixtures** (this document's format): still entirely
+  oracle-sourced under the counter-based PCG contract of 02 §4 (`counter-pcg-v1`), which is
+  deliberately **not** cubff's RNG. A `cubffCompat` mode (port of cubff's SplitMix64 counter
+  RNG, soup init, pair-indexed mutation draws, and shuffle) does not exist; therefore **no
+  fixed-seed whole-soup cubff parity is claimed**, and these fixtures ground oracle
+  self-consistency and the future oracle↔GPU diff (01 §7.2) only.
 
 ## Fixture format (`formatVersion` 1)
 
@@ -62,9 +65,12 @@ Comparison reports are exact and located: differing byte count, first divergent 
 index with both values, the set of divergent histogram bins, and stats deltas. This is
 the diagnosis path of 01 §7.1 ("find the first checkpoint whose histogram diverges…").
 
-## Importing cubff vectors (future work, 01 §7.1)
+## Importing cubff simulation vectors (optional future work, 01 §7.1)
 
-When the grounding run happens, the procedure is:
+Evaluator-level cubff fixtures are already imported and enforced (see
+[CubffGrounding.md](CubffGrounding.md) — that path needs no RNG port because inputs are
+fixed). What remains optional is whole-soup *simulation* import; if it ever happens, the
+procedure is:
 
 1. Build cubff at a pinned commit; run `bff_noheads` at defaults
    (N = 131,072, T = 64, budget 8,192, mutation 1/4096) with a fixed, recorded seed.
@@ -78,8 +84,10 @@ When the grounding run happens, the procedure is:
    The comparison harness already refuses to replay a fixture whose `rngContract` the
    oracle does not implement, so checked-in cubff fixtures are inert until that mode
    lands rather than silently mis-comparing.
-5. Reproduce all three checkpoints bit-identically, once; record each of the six 01 §7.4
-   tags as confirmed or corrected in 06 D2. Only after that may any parity claim be made.
+5. Reproduce all three checkpoints bit-identically, once. Only after that may any
+   *simulation-level* parity claim be made.
 
-Until step 5 completes, treat every fixture here as an internal regression anchor, not
-as evidence of alignment with the published experiments.
+Until step 5 completes, treat every fixture in THIS format as an internal regression
+anchor. Evaluator-level alignment with cubff is already established separately
+([CubffGrounding.md](CubffGrounding.md)); the six 01 §7.4 tags are confirmed from source
+and enforced by `CubffFixtureTests`.

@@ -13,6 +13,10 @@ let package = Package(
     targets: [
         .target(name: "BFFOracle"),
         .executableTarget(name: "bff-oracle", dependencies: ["BFFOracle"]),
-        .testTarget(name: "BFFOracleTests", dependencies: ["BFFOracle"]),
+        .testTarget(
+            name: "BFFOracleTests",
+            dependencies: ["BFFOracle"],
+            resources: [.copy("Fixtures")]
+        ),
     ]
 )
