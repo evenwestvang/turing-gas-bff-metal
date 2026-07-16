@@ -11,14 +11,24 @@ Scripts/package-soupscope-app.sh          # -> build/SoupScope.app (release, ad-
 macOS + Metal only. The script needs `swift`, `codesign`, and `plutil`. It is
 deterministic: the same commit and toolchain produce the same bundle layout.
 
-Determinism is enforced, not assumed. The script packages **exactly** the two
-shaders below, each resolved from its explicit, pinned SwiftPM per-target resource
-bundle for the current build (`BFFOracle_BFFMetal.bundle`,
-`BFFOracle_SoupScopeApp.bundle`), requiring exactly one unambiguous source per
-basename. It aborts if the build's `.metal` set is anything other than those two
-(missing, extra, duplicate, or stale copies), and — after copying — re-checks that
-`Contents/Resources` holds precisely those two files and no SwiftPM resource
-bundle. The pure resolution/verification helpers are covered on any host by
+Determinism and provenance are enforced, not assumed. Each invocation builds into a
+fresh, dedicated SwiftPM scratch path (`swift build --scratch-path <tmp>`) rather
+than the repository `.build` or any prior artifact, so the packaged shaders can only
+have come from *this* build; the scratch path is removed on both success and failure
+via a scoped trap, and the caller's default `.build` is left untouched.
+
+The script packages **exactly** the two shaders below, each resolved from its
+explicit, pinned SwiftPM per-target resource bundle in that fresh build
+(`BFFOracle_BFFMetal.bundle`, `BFFOracle_SoupScopeApp.bundle`), requiring exactly one
+unambiguous source per basename, and each required to be **byte-identical to its
+explicit repository source** (`Sources/BFFMetal/Shaders/BFFEvaluate.metal`,
+`Sources/SoupScopeApp/Shaders/SoupRender.metal`) before it is copied. It aborts if
+the build's `.metal` set is anything other than those two (missing, extra,
+duplicate, or stale copies), if a built resource's bytes drift from its repository
+source, and — after copying — re-checks that `Contents/Resources` holds precisely
+those two files and no SwiftPM resource bundle. The pure resolution/verification
+helpers (including the byte-identity gate that rejects stale content under a
+correctly named path) are covered on any host by
 `Scripts/tests/package-soupscope-app-tests.sh` (portable; no Metal toolchain
 needed).
 

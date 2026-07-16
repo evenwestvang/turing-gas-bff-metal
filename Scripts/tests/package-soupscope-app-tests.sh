@@ -151,6 +151,52 @@ mkdir -p "$resd/Extra.metal"
 expect_fail "rejects a subdirectory in Contents/Resources" \
     verify_packaged_resources "$resd"
 
+echo "verify_source_identity"
+idroot=$(mktemp -d)
+printf 'evaluate\n' > "$idroot/repo-BFFEvaluate.metal"
+printf 'evaluate\n' > "$idroot/built-BFFEvaluate.metal"
+expect_ok "accepts a byte-identical built resource" \
+    verify_source_identity "BFFEvaluate.metal" \
+        "$idroot/repo-BFFEvaluate.metal" "$idroot/built-BFFEvaluate.metal"
+
+# Same name, drifted bytes.
+printf 'evaluate-DRIFTED\n' > "$idroot/built-BFFEvaluate.metal"
+expect_fail "rejects a built resource whose bytes differ from the repo source" \
+    verify_source_identity "BFFEvaluate.metal" \
+        "$idroot/repo-BFFEvaluate.metal" "$idroot/built-BFFEvaluate.metal"
+
+# Missing repository source / missing built resource.
+expect_fail "rejects a missing repository source" \
+    verify_source_identity "BFFEvaluate.metal" \
+        "$idroot/does-not-exist.metal" "$idroot/repo-BFFEvaluate.metal"
+expect_fail "rejects a missing built resource" \
+    verify_source_identity "BFFEvaluate.metal" \
+        "$idroot/repo-BFFEvaluate.metal" "$idroot/does-not-exist.metal"
+
+echo "stale content in a correctly named expected bundle"
+# A bundle that is correctly named and structured — resolve_shader_source finds it
+# without complaint — but whose shader bytes are stale relative to the repository
+# source. Name/layout checks pass; only the byte-identity gate rejects it.
+stalebin=$(make_good_bindir)
+reposrc=$(mktemp -d)
+printf 'evaluate\n' > "$reposrc/BFFEvaluate.metal"
+stalefile="$stalebin/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources/BFFEvaluate.metal"
+
+expect_ok "correctly named bundle still resolves and its build set is valid" \
+    verify_build_metal_set "$stalebin"
+expect_stdout "resolve still succeeds for the correctly named shader" \
+    "$stalefile" resolve_shader_source "BFFEvaluate.metal" "BFFMetal" "$stalebin"
+
+printf 'evaluate-STALE\n' > "$stalefile"
+resolved=$(resolve_shader_source "BFFEvaluate.metal" "BFFMetal" "$stalebin")
+expect_fail "stale bytes under a correct name are rejected by the identity gate" \
+    verify_source_identity "BFFEvaluate.metal" "$reposrc/BFFEvaluate.metal" "$resolved"
+
+printf 'evaluate\n' > "$stalefile"
+resolved=$(resolve_shader_source "BFFEvaluate.metal" "BFFMetal" "$stalebin")
+expect_ok "restoring byte-identical content passes the identity gate" \
+    verify_source_identity "BFFEvaluate.metal" "$reposrc/BFFEvaluate.metal" "$resolved"
+
 echo
 echo "passed: $pass   failed: $fail"
 [[ "$fail" -eq 0 ]]

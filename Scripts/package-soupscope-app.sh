@@ -14,12 +14,18 @@
 # metrics, LOD, HUD, and scheduling are all unchanged — this only relocates two
 # verbatim .metal resources into the conventional place and seals them.
 #
-# Determinism is enforced, not assumed. Exactly the two shaders below are packaged,
-# each resolved from an explicit, pinned SwiftPM per-target resource bundle path for
-# the *current* build. Packaging aborts on a missing, duplicated, basename-colliding,
-# stale, or extra .metal file — on the build side (unexpected set under the bin dir)
-# and on the bundle side (Contents/Resources must end up as exactly those two files
-# and no SwiftPM resource bundle). Same inputs -> same layout.
+# Determinism and provenance are enforced, not assumed. Each invocation builds into
+# a fresh, dedicated SwiftPM scratch path (never the repository .build or any prior
+# artifact), so the packaged shaders can only have come from *this* build. Exactly
+# the two shaders below are packaged, each resolved from an explicit, pinned SwiftPM
+# per-target resource bundle path under that fresh scratch build, and each required
+# to be byte-identical to its explicit repository source before it is copied.
+# Packaging aborts on a missing, duplicated, basename-colliding, stale, or extra
+# .metal file — on the build side (unexpected set under the bin dir), on provenance
+# (a built resource whose bytes drift from its repository source), and on the bundle
+# side (Contents/Resources must end up as exactly those two files and no SwiftPM
+# resource bundle). Same inputs -> same layout. The scratch path is removed on both
+# success and failure via a scoped trap.
 #
 # The bundle is ad-hoc code-signed and the signature is verified. No quarantine
 # attribute is touched. Command-line arguments still flow through:
@@ -48,12 +54,15 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 PACKAGE_NAME="BFFOracle"
 
-# Exactly the shaders to package, as "basename:owning-SwiftPM-target". Distinct
-# basenames — one .copy resource per target. Bash 3.2 has no associative arrays,
-# so this is a parallel-encoded list parsed with ${entry%%:*} / ${entry##*:}.
+# Exactly the shaders to package, as "basename:owning-SwiftPM-target:repo-source".
+# Distinct basenames — one .copy resource per target. The repo-source field is the
+# explicit, repository-relative path of the canonical shader source, so provenance
+# is pinned rather than derived. Bash 3.2 has no associative arrays, so this is a
+# parallel-encoded list; parse it with the ${entry%%:*} / ${rest#*:} idiom below
+# (three colon-separated fields; the repo path itself contains no colon).
 REQUIRED_SHADERS=(
-    "BFFEvaluate.metal:BFFMetal"
-    "SoupRender.metal:SoupScopeApp"
+    "BFFEvaluate.metal:BFFMetal:Sources/BFFMetal/Shaders/BFFEvaluate.metal"
+    "SoupRender.metal:SoupScopeApp:Sources/SoupScopeApp/Shaders/SoupRender.metal"
 )
 
 # Sorted, newline-separated required basenames — the exact expected set on both
@@ -121,6 +130,31 @@ resolve_shader_source() {
     esac
 }
 
+# Assert a built resource is byte-identical to its explicit repository source, so
+# what gets sealed into the bundle provably matches the committed shader (rejects
+# stale content sitting under a correctly named path). Both files must exist.
+# Args: <basename> <repo_source> <built_source>. Returns non-zero on any mismatch.
+verify_source_identity() {
+    local base="$1" repo_src="$2" built_src="$3"
+    if [[ ! -f "$repo_src" ]]; then
+        echo "error: repository source for '$base' not found: $repo_src" >&2
+        return 1
+    fi
+    if [[ ! -f "$built_src" ]]; then
+        echo "error: built resource for '$base' not found: $built_src" >&2
+        return 1
+    fi
+    if ! cmp -s "$repo_src" "$built_src"; then
+        {
+            echo "error: built resource for '$base' is not byte-identical to its"
+            echo "       repository source — stale or drifted content, refusing to package."
+            echo "         repo source:    $repo_src"
+            echo "         built resource: $built_src"
+        } >&2
+        return 1
+    fi
+}
+
 # Assert a Contents/Resources directory holds *exactly* the required shader files
 # and nothing else — no extra file, no subdirectory, and specifically no leaked
 # SwiftPM resource bundle. Args: <resources_dir>. Returns non-zero on mismatch.
@@ -157,6 +191,20 @@ verify_packaged_resources() {
 # ---------------------------------------------------------------------------
 # macOS packaging pipeline.
 # ---------------------------------------------------------------------------
+
+# Dedicated SwiftPM scratch path for the current invocation (empty until main
+# creates it). A script global so the EXIT trap resolves it after main returns.
+PACKAGE_SCRATCH_DIR=""
+
+# Remove the dedicated scratch path, if any. Safe to call when it was never set
+# and idempotent; never fails the trap.
+_cleanup_scratch() {
+    if [[ -n "${PACKAGE_SCRATCH_DIR:-}" && -d "$PACKAGE_SCRATCH_DIR" ]]; then
+        rm -rf "$PACKAGE_SCRATCH_DIR"
+    fi
+    return 0
+}
+
 main() {
     local APP_NAME="SoupScope"
     local CONFIG="${CONFIG:-release}"
@@ -173,13 +221,18 @@ main() {
     repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
     cd "$repo_root"
 
-    # 1. Build the product. This also compiles the two `.copy` shader resources
-    #    into per-target resource bundles under the SwiftPM bin directory.
-    echo "==> swift build -c $CONFIG --product $APP_NAME"
-    swift build -c "$CONFIG" --product "$APP_NAME"
+    # 1. Build into a fresh, dedicated SwiftPM scratch path — never the repository
+    #    .build or any prior artifact — so the packaged shaders can only have come
+    #    from this build. PACKAGE_SCRATCH_DIR is a script global (not a function
+    #    local) so the EXIT trap can remove it on both success and failure; the
+    #    caller's default .build is left untouched.
+    PACKAGE_SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/soupscope-package.XXXXXX")
+    trap _cleanup_scratch EXIT
+    echo "==> swift build -c $CONFIG --product $APP_NAME --scratch-path <scratch>"
+    swift build -c "$CONFIG" --product "$APP_NAME" --scratch-path "$PACKAGE_SCRATCH_DIR"
 
     local bin_dir exe
-    bin_dir=$(swift build -c "$CONFIG" --show-bin-path)
+    bin_dir=$(swift build -c "$CONFIG" --scratch-path "$PACKAGE_SCRATCH_DIR" --show-bin-path)
     exe="$bin_dir/$APP_NAME"
     [[ -x "$exe" ]] || { echo "error: built executable not found at $exe" >&2; exit 1; }
 
@@ -196,13 +249,20 @@ main() {
     cp "$exe" "$app/Contents/MacOS/$APP_NAME"
 
     # 5. Shaders FLAT into Contents/Resources, each resolved from its explicit
-    #    expected per-target bundle (exactly one source per basename), refusing
-    #    any destination basename collision.
-    local entry base target src dst
+    #    expected per-target bundle in the fresh scratch build (exactly one source
+    #    per basename), required to be byte-identical to its explicit repository
+    #    source, and refusing any destination basename collision.
+    local entry base rest target repo_rel repo_src src dst
     for entry in "${REQUIRED_SHADERS[@]}"; do
         base="${entry%%:*}"
-        target="${entry##*:}"
+        rest="${entry#*:}"
+        target="${rest%%:*}"
+        repo_rel="${rest#*:}"
+        repo_src="$repo_root/$repo_rel"
         if ! src=$(resolve_shader_source "$base" "$target" "$bin_dir"); then
+            exit 1
+        fi
+        if ! verify_source_identity "$base" "$repo_src" "$src"; then
             exit 1
         fi
         dst="$app/Contents/Resources/$base"
@@ -211,7 +271,7 @@ main() {
             exit 1
         fi
         cp "$src" "$dst"
-        echo "    resource: $base  <-  ${src#$repo_root/}"
+        echo "    resource: $base  <-  $repo_rel"
     done
 
     # 6. Assert the sealed result: exactly the two shaders, no SwiftPM bundle.
