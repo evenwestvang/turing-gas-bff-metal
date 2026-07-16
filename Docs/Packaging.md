@@ -11,6 +11,17 @@ Scripts/package-soupscope-app.sh          # -> build/SoupScope.app (release, ad-
 macOS + Metal only. The script needs `swift`, `codesign`, and `plutil`. It is
 deterministic: the same commit and toolchain produce the same bundle layout.
 
+Determinism is enforced, not assumed. The script packages **exactly** the two
+shaders below, each resolved from its explicit, pinned SwiftPM per-target resource
+bundle for the current build (`BFFOracle_BFFMetal.bundle`,
+`BFFOracle_SoupScopeApp.bundle`), requiring exactly one unambiguous source per
+basename. It aborts if the build's `.metal` set is anything other than those two
+(missing, extra, duplicate, or stale copies), and — after copying — re-checks that
+`Contents/Resources` holds precisely those two files and no SwiftPM resource
+bundle. The pure resolution/verification helpers are covered on any host by
+`Scripts/tests/package-soupscope-app-tests.sh` (portable; no Metal toolchain
+needed).
+
 ## What it produces
 
 A conventional bundle — executable in `Contents/MacOS`, resources **flat** in
