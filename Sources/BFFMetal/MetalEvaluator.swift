@@ -57,13 +57,29 @@ public final class MetalBFFEvaluator {
 
     public var deviceName: String { device.name }
 
-    public init() throws {
+    /// The device and command queue this evaluator uses — exposed so a host can
+    /// build ONE shared Metal context (device + queue) and hand the same queue to
+    /// both the evaluator and a renderer (REQUIRED 1). Serial command encoding on
+    /// one queue keeps ownership understandable and avoids hidden multi-queue work.
+    public var metalDevice: MTLDevice { device }
+    public var commandQueue: MTLCommandQueue { queue }
+
+    /// Convenience: create a fresh system-default device and its own queue. Used by
+    /// the headless CLIs and existing tests; the deterministic evaluate path is
+    /// unchanged.
+    public convenience init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw EvaluatorError.noDevice
         }
         guard let queue = device.makeCommandQueue() else {
             throw EvaluatorError.gpuExecutionFailed("could not create command queue")
         }
+        try self.init(device: device, queue: queue)
+    }
+
+    /// Designated init against an injected device and command queue, so the soup
+    /// evaluator and the app renderer share one `MTLDevice` and one queue.
+    public init(device: MTLDevice, queue: MTLCommandQueue) throws {
         self.device = device
         self.queue = queue
 

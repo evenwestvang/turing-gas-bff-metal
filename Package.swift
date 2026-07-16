@@ -20,6 +20,9 @@ let package = Package(
         // Shared CPU/MSL byte layouts: one C header, compile-time asserted on
         // every platform (see Sources/CBFFShared/include/BFFShared.h).
         .target(name: "CBFFShared"),
+        // Shared host/MSL layout of the render uniform block; same C-header
+        // pattern so its layout asserts are checked on every platform.
+        .target(name: "CSoupRender"),
         // Metal evaluator host + platform-independent fixture planning/checking.
         // Builds everywhere; the Metal dispatch paths are #if canImport(Metal).
         .target(
@@ -33,10 +36,20 @@ let package = Package(
         // Headless small-soup epoch runner (exits 2 on non-Metal hosts).
         .executableTarget(name: "bff-metal-soup",
                           dependencies: ["BFFMetal", "BFFOracle"]),
-        // Platform-independent app core; the SwiftUI shell stays view-only.
-        .target(name: "SoupScopeCore", dependencies: ["BFFOracle"]),
-        // SwiftUI shell on macOS; a stub entry point elsewhere so Linux CI builds it.
-        .executableTarget(name: "SoupScopeApp", dependencies: ["SoupScopeCore"]),
+        // Platform-independent app core: grid/camera/LOD/normalization/opcode/
+        // batcher/HUD/snapshot pure models + launch-option parsing. Depends on
+        // BFFMetal for the soup runner and epoch types; builds and is tested on
+        // Linux. The SwiftUI/Metal shell stays view-only.
+        .target(name: "SoupScopeCore",
+                dependencies: ["BFFOracle", "BFFMetal", "CSoupRender"]),
+        // SwiftUI + Metal shell on macOS; a stub entry point elsewhere so Linux CI
+        // builds it. The render shader is bundled as source and compiled at runtime
+        // (same pattern as BFFMetal's evaluator — no committed metallib).
+        .executableTarget(
+            name: "SoupScopeApp",
+            dependencies: ["SoupScopeCore", "BFFMetal", "BFFOracle", "CSoupRender"],
+            resources: [.copy("Shaders/SoupRender.metal")]
+        ),
         .testTarget(
             name: "BFFOracleTests",
             dependencies: ["BFFOracle"],
@@ -44,7 +57,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SoupScopeCoreTests",
-            dependencies: ["SoupScopeCore"]
+            dependencies: ["SoupScopeCore", "BFFOracle", "BFFMetal", "CSoupRender"]
         ),
         .testTarget(
             name: "BFFMetalTests",

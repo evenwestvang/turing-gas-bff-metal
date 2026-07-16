@@ -1,0 +1,52 @@
+#if canImport(SwiftUI) && canImport(MetalKit)
+import SwiftUI
+import SoupScopeCore
+
+/// Compact, diagnostic HUD overlay (REQUIRED 6). Monospaced text only — no charts,
+/// no profiling UI. Reads the published `HUDModel`.
+struct HUDView: View {
+    let hud: HUDModel
+    let metricChannel: UInt32
+    let running: Bool
+
+    private func f(_ x: Double, _ p: Int = 3) -> String {
+        String(format: "%.\(p)f", x)
+    }
+
+    private var channelName: String {
+        switch metricChannel {
+        case 0: return "activity"
+        case 1: return "entropy"
+        default: return "life"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("SoupScope  epoch \(hud.epoch)\(running ? "" : "  [PAUSED]")")
+                .fontWeight(.semibold)
+            Text("batch \(hud.lastBatchEpochs) ep in \(f(hud.lastBatchMs)) ms "
+                 + "(\(f(hud.msPerEpoch, 4)) ms/ep)")
+            Text("steps raw \(hud.rawSteps)  noop \(hud.noopSteps)  cmd \(hud.commandSteps)")
+            Text("halt  budget \(hud.haltBudget)  pcOut \(hud.haltPCOut)  "
+                 + "unmatched \(hud.haltUnmatched)  unknown \(hud.haltUnknown)")
+            Text("copyWrites \(hud.copyWrites)   channel \(channelName)")
+            Text("shadow checked \(hud.shadowChecked)  mismatch \(hud.shadowMismatch)")
+            Text("programs \(hud.programCount)   \(hud.deviceName)")
+            if let error = hud.errorState {
+                Text("ERROR: \(error)")
+                    .foregroundColor(.red)
+                    .fontWeight(.bold)
+            }
+            Text("drag pan · scroll/pinch zoom · space pause · f fit · m channel")
+                .foregroundColor(.secondary)
+        }
+        .font(.system(size: 11, design: .monospaced))
+        .foregroundColor(.white)
+        .padding(8)
+        .background(Color.black.opacity(0.55))
+        .cornerRadius(6)
+        .padding(10)
+    }
+}
+#endif
