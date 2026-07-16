@@ -6,7 +6,19 @@ The simulation uses Swift and Metal to run a large population of interacting, se
 
 ## Status
 
-Architecture and validation design are in progress. Implementation has not started.
+The CPU oracle (`BFFOracle` library, `bff-oracle` CLI, golden fixtures) is implemented and grounded against cubff. The macOS app (`SoupScope`) exists as a placeholder scaffold; the Metal simulation and renderer are not implemented.
+
+## Building
+
+Everything is one Swift package with no external dependencies (Swift 6 toolchain required).
+
+```sh
+swift test            # all tests — runs on macOS and Linux
+swift run bff-oracle  # headless CPU oracle CLI
+swift run SoupScope   # macOS only: opens the static placeholder window
+```
+
+On non-macOS platforms `SoupScope` builds as a stub executable that prints its wiring line, so `swift build`/`swift test` cover the whole package on Linux CI.
 
 ## References
 
