@@ -15,7 +15,7 @@ untouched.
 
 ```
 SoupScopeCore (platform-independent, Linux-tested pure models)
-  ProgramGrid            deterministic row-major 2-D layout; padded cells guarded
+  ProgramGrid            canonical 512×256 row-major layout; padded cells guarded
   Camera / CameraGeometry continuous pan/zoom transform (byte space ↔ pixels)
   LODModel               smoothstep macro↔micro and glyph blends (one source of truth)
   MetricNormalization    fixed, replay-stable activity/entropy → [0,1]
@@ -65,9 +65,15 @@ nondeterministic): activity ÷ `stepBudget` clamped to `[0,1]`; entropy ÷ 6 cla
 (6 bits/byte is the hard maximum for a 64-byte window). Boundaries pinned by
 `testNormalizationFixedBoundsAndClamping`.
 
-**Pan/zoom and LOD (REQUIRED 4).** Program layout is a deterministic row-major grid sized
-`width = ⌈√N⌉`, `height = ⌈N/width⌉`, handling non-square counts; padded cells render as
-background. Drag pans; scroll/pinch zoom is exponential and cursor-anchored. `bytePx` (pixels
+**Pan/zoom and LOD (REQUIRED 4).** Program layout is the architecture's canonical **512×256
+program coordinate canvas** (03 §1): stable program ID `i` maps to cell
+`(column: i mod 512, row: i div 512)`, a fixed byte grid of 4096×2048 independent of the program
+count. Configured modest soups fill the first row-major cells; every remaining cell through
+512×256 is padding/background and never indexes the soup or the metric field (the renderer and
+shader guard on `programCount`). Program counts above 512×256 (131072) are rejected at launch/
+config validation. Camera fit/reset frames the *populated* extent (columns `0..<min(N,512)`,
+rows `0..<⌈N/512⌉`) while the coordinates themselves stay canonical. Drag pans; scroll/pinch
+zoom is exponential and cursor-anchored. `bytePx` (pixels
 per byte cell) is the single LOD variable, clamped to `[minBytePx (fit), 96]`; the origin is
 re-clamped so the soup stays within an overscroll margin. Every transform is finite (non-finite
 gesture inputs are ignored). LOD is a continuous `smoothstep` crossfade — macro metric field
@@ -107,7 +113,7 @@ Launch arguments (all optional; defaults are a modest soup for interactive launc
 
 ```
 --seed N               run seed (default 45071)
---programs EVEN        soup size, positive & even (default 16384, a 128×128 grid)
+--programs EVEN        soup size, positive & even, ≤ 131072 (default 1024)
 --budget N             per-interaction step budget (default 8192)
 --mutation-p32 N       mutate iff a uint32 draw < N; 0 disables
 --variant noheads|bff  initial-state variant (default noheads)
@@ -133,7 +139,7 @@ swift test --filter MetalSoupEpochTests
 # bounded validation launch below (SharedMetalContext.init runs the probe).
 
 # Bounded reproducible validation run: renders live for N seconds, prints one diagnostic line,
-# exits 0 (clean) / 1 (shadow mismatch or error) / 2 (no Metal):
+# exits 0 (clean) / 1 (error, shadow mismatch, or no draw progress) / 2 (no Metal):
 swift run SoupScope --validation-seconds 8
 swift run SoupScope --programs 4096 --shadow-sample 16 --validation-seconds 8
 
@@ -142,9 +148,23 @@ swift run SoupScope
 ```
 
 The `--validation-seconds` run advances/renders many live epochs, then prints e.g.
-`validation seconds=8.0 epochs=… lastBatchEpochs=… msPerEpoch=… halt[…] copyWrites=… `
-`shadowChecked=… shadowMismatch=0 programs=16384 device="…" error=none`. Verify multiple live
-epochs, growing HUD counters, `shadowMismatch=0`, and no Metal validation/runtime errors.
+`validation outcome=ok requestedSeconds=8.0 completedDraws=… epochs=… lastBatchEpochs=… `
+`msPerEpoch=… halt[…] copyWrites=… shadowChecked=… shadowMismatch=0 programs=1024 device="…" `
+`error=none`. Verify multiple live epochs, growing HUD counters, `completedDraws` ≥ 1,
+`shadowMismatch=0`, and no Metal validation/runtime errors.
+
+**Finite even without a drawable.** Validation *requires* a window/drawable to succeed —
+`outcome=ok` is reported only after the requested duration has elapsed **and** at least one
+render command buffer has actually completed, and it is triggered from that buffer's completion
+handler so the process never exits with a submission still in flight. It never hangs when a
+drawable is unavailable: a one-shot, display-independent watchdog on the main run loop is the
+finite backstop. If no render lands within `requestedSeconds + 2 s` (the grace deadline), the run
+prints one deterministic line with `outcome=noDrawProgress` and exits nonzero rather than
+blocking on a display callback that never comes. The watchdog is a validation-only timeout — it
+advances no epochs and schedules no rendering, and it adds no extra queue, fence, or background
+loop. An error or CPU-shadow mismatch fails immediately (`outcome=error` / `outcome=shadowMismatch`,
+exit 1); no Metal device yields `outcome=noMetal`, exit 2. Watchdog and frame completion race into
+exactly one diagnostic line and one termination path (the run latches its first verdict).
 
 **Status: the GPU render/epoch path has NOT been exercised in-tree** (no Metal device or Swift
 toolchain in the build environment). The commands above must be run on the Metal device to

@@ -23,7 +23,7 @@ public struct AppLaunchOptions: Equatable, Sendable {
     public var validationSeconds: Double?
 
     public init(seed: UInt32 = 0xB00F,
-                programCount: Int = 16_384,
+                programCount: Int = 1_024,
                 stepBudget: Int = BFF.stepBudget,
                 mutationP32: UInt32 = BFF.defaultMutationP32,
                 variant: BFFVariant = .noheads,
@@ -44,6 +44,8 @@ public struct AppLaunchOptions: Equatable, Sendable {
         case notANumber(flag: String, value: String)
         case unknownVariant(String)
         case unknownFlag(String)
+        /// `--programs` above the 512×256 canonical canvas capacity (131072).
+        case programCountExceedsCanvas(count: Int, capacity: Int)
 
         public var description: String {
             switch self {
@@ -52,6 +54,8 @@ public struct AppLaunchOptions: Equatable, Sendable {
             case .notANumber(let f, let v): return "\(f) requires a number, got '\(v)'"
             case .unknownVariant(let v): return "unknown variant '\(v)' (use 'noheads' or 'bff')"
             case .unknownFlag(let f): return "unknown argument '\(f)'"
+            case .programCountExceedsCanvas(let n, let cap):
+                return "program count \(n) exceeds the 512×256 canonical canvas capacity \(cap)"
             }
         }
     }
@@ -59,7 +63,7 @@ public struct AppLaunchOptions: Equatable, Sendable {
     public static let usage = """
     SoupScope launch arguments:
       --seed N               run seed (default 45071)
-      --programs EVEN        soup size, positive & even (default 16384)
+      --programs EVEN        soup size, positive & even, ≤ 131072 (default 1024)
       --budget N             per-interaction step budget (default \(BFF.stepBudget))
       --mutation-p32 N       mutate iff a uint32 draw < N; 0 disables
       --variant noheads|bff  initial-state variant (default noheads)
@@ -122,8 +126,15 @@ public struct AppLaunchOptions: Equatable, Sendable {
     }
 
     /// Build the validated `SoupConfig` (clamps an over-large shadow sample to the
-    /// pair count so `--shadow-sample all` on any size is always in range).
+    /// pair count so `--shadow-sample all` on any size is always in range). Rejects
+    /// program counts above the 512×256 canonical canvas capacity — the canvas is a
+    /// visualization constraint, so this gate lives in the app launch/config path
+    /// and not in the headless `SoupConfig` used by the CLIs.
     public func soupConfig() throws -> SoupConfig {
+        guard programCount <= ProgramGrid.capacity else {
+            throw ParseError.programCountExceedsCanvas(count: programCount,
+                                                       capacity: ProgramGrid.capacity)
+        }
         let pairs = programCount / 2
         let clampedSample = max(0, min(shadowSampleCount, max(pairs, 0)))
         return try SoupConfig(seed: seed, programCount: programCount,

@@ -41,6 +41,10 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     @MainActor
     private func renderFrame(in view: MTKView) {
+        // Once a validation verdict has been reached, stop submitting new work so no
+        // buffer is torn down while the pending exit waits on the last one.
+        if appModel.validationFinished { return }
+
         let snapshot = appModel.stepFrame()
 
         guard let descriptor = view.currentRenderPassDescriptor,
@@ -62,6 +66,16 @@ final class Renderer: NSObject, MTKViewDelegate {
         // With no snapshot the pass still clears to the background color.
         encoder.endEncoding()
         commandBuffer.present(drawable)
+
+        // Validation success is counted only from an actually-completed submission,
+        // so the run finishes after real render progress — never mid-flight.
+        if appModel.validationActive {
+            let appModel = self.appModel
+            appModel.noteRenderSubmitted(commandBuffer)
+            commandBuffer.addCompletedHandler { _ in
+                Task { @MainActor in appModel.noteDrawCompleted() }
+            }
+        }
         commandBuffer.commit()
     }
 

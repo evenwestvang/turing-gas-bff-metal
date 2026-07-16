@@ -7,9 +7,9 @@
 /// shader): pixel origin is top-left, `+y` points down. The gesture layer converts
 /// AppKit's bottom-left mouse coordinates into this convention before calling.
 public struct CameraGeometry: Equatable, Sendable {
-    /// Soup width in byte cells (`grid.byteWidth`).
+    /// Soup width in byte cells to frame (the populated extent, `grid.populatedByteWidth`).
     public var soupByteWidth: Double
-    /// Soup height in byte cells (`grid.byteHeight`).
+    /// Soup height in byte cells to frame (the populated extent, `grid.populatedByteHeight`).
     public var soupByteHeight: Double
     /// Drawable width in pixels (`drawableSize.width`, already backing-scaled).
     public var viewPxWidth: Double

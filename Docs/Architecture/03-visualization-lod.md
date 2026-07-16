@@ -17,7 +17,11 @@ neighborhood meaning. We still need a 2-D layout; the design position is:
   `(i mod 512, i div 512)` on a 512×256 program grid (defaults; general: `W = 2^⌈log2(√N)⌉`,
   `H = N/W`). Each program renders as an **8×8 block of byte cells** (byte `j` at in-block
   `(j mod 8, j div 8)`, reading order = tape order), giving a global **byte grid of
-  4096×2048**.
+  4096×2048**. The metal slice pins this canonical 512×256 canvas exactly and *independently of
+  the program count*: program IDs `0..<N` fill the first row-major cells, every remaining cell
+  through 512×256 is padding/background, and `N > 131072` is rejected at launch/config
+  validation. Camera fit frames the populated extent (`0..<min(N,512)` × `0..<⌈N/512⌉`) while the
+  coordinates stay canonical.
 - Why fixed: stable identity. You can watch *this* program cell over minutes — see it get
   overwritten, see a replicator's copies appear at scattered fixed cells like popcorn. Any
   re-sorting per epoch would destroy temporal readability (everything would shimmer).

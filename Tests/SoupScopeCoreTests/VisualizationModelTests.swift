@@ -7,43 +7,89 @@ import BFFOracle
 /// controller, the render snapshot, and the render-uniform host layout.
 final class VisualizationModelTests: XCTestCase {
 
-    // MARK: - ProgramGrid: dimensions, index mapping, padded cells
+    // MARK: - ProgramGrid: canonical 512×256 coordinates, mapping, padded cells
 
-    func testGridDimensionsCoverProgramsWithMinimalPadding() {
-        // Perfect square: no padding.
-        let square = ProgramGrid(programCount: 1024)
-        XCTAssertEqual(square.width, 32)
-        XCTAssertEqual(square.height, 32)
-        XCTAssertEqual(square.cellCount, 1024)
-        XCTAssertEqual(square.paddedCellCount, 0)
-        XCTAssertEqual(square.byteWidth, 32 * 8)
-        XCTAssertEqual(square.byteHeight, 32 * 8)
-
-        // Non-square modest count: width² ≥ N, height covers, some padding.
-        let g = ProgramGrid(programCount: 1000)
-        XCTAssertEqual(g.width, 32)
-        XCTAssertEqual(g.height, 32)
-        XCTAssertGreaterThanOrEqual(g.cellCount, 1000)
-        XCTAssertEqual(g.paddedCellCount, g.cellCount - 1000)
+    func testGridIsAlwaysTheCanonical512x256Canvas() {
+        // Dimensions are fixed regardless of the program count (03 §1).
+        for n in [2, 8, 1024, 16_384, ProgramGrid.capacity] {
+            let g = ProgramGrid(programCount: n)
+            XCTAssertEqual(g.width, 512)
+            XCTAssertEqual(g.height, 256)
+            XCTAssertEqual(g.cellCount, 512 * 256)
+            XCTAssertEqual(g.byteWidth, 512 * 8)      // 4096
+            XCTAssertEqual(g.byteHeight, 256 * 8)     // 2048
+            XCTAssertEqual(g.paddedCellCount, 512 * 256 - n)
+        }
+        XCTAssertEqual(ProgramGrid.capacity, 131_072)
     }
 
-    func testGridIndexMappingAndPaddedCellsReturnNil() {
-        let g = ProgramGrid(programCount: 8)   // width 3, height 3 → 1 padded cell
-        XCTAssertEqual(g.width, 3)
-        XCTAssertEqual(g.height, 3)
-        XCTAssertEqual(g.paddedCellCount, 1)
+    func testStableIDMapsToCanonicalColumnRow() {
+        let g = ProgramGrid(programCount: ProgramGrid.capacity)
+        // Program i → (i % 512, i / 512), checked around the row boundaries.
+        XCTAssertEqual(g.cell(of: 0).col, 0)
+        XCTAssertEqual(g.cell(of: 0).row, 0)
+        XCTAssertEqual(g.cell(of: 511).col, 511)   // last cell of row 0
+        XCTAssertEqual(g.cell(of: 511).row, 0)
+        XCTAssertEqual(g.cell(of: 512).col, 0)     // first cell of row 1
+        XCTAssertEqual(g.cell(of: 512).row, 1)
+        XCTAssertEqual(g.cell(of: 513).col, 1)
+        XCTAssertEqual(g.cell(of: 513).row, 1)
 
-        // Every real program round-trips through cell ↔ index.
-        for id in 0 ..< 8 {
+        // Last valid ID sits at the bottom-right canonical cell (511, 255).
+        let last = ProgramGrid.capacity - 1                 // 131071
+        XCTAssertEqual(g.cell(of: last).col, 511)
+        XCTAssertEqual(g.cell(of: last).row, 255)
+
+        // cell ↔ programIndex round-trips for every boundary ID.
+        for id in [0, 511, 512, 513, last] {
             let c = g.cell(of: id)
             XCTAssertEqual(g.programIndex(col: c.col, row: c.row), id)
         }
-        // The trailing cell (2,2) = index 8 is padding — must not index the soup.
-        XCTAssertNil(g.programIndex(col: 2, row: 2))
-        // Out-of-grid cells are nil, never a wild index.
-        XCTAssertNil(g.programIndex(col: 3, row: 0))
-        XCTAssertNil(g.programIndex(col: 0, row: 3))
+    }
+
+    func testPaddedAndOutOfCanvasCellsNeverIndexTheSoup() {
+        let g = ProgramGrid(programCount: 1000)             // occupies IDs 0..<1000
+        // ID 999 is the last real program at (999 % 512, 999 / 512) = (487, 1).
+        XCTAssertEqual(g.cell(of: 999).col, 487)
+        XCTAssertEqual(g.cell(of: 999).row, 1)
+        XCTAssertEqual(g.programIndex(col: 487, row: 1), 999)
+
+        // The next cell (488, 1) = index 1000 is padding — must return nil.
+        XCTAssertNil(g.programIndex(col: 488, row: 1))
+        // A cell deep in the empty canvas is padding, not a wild index.
+        XCTAssertNil(g.programIndex(col: 0, row: 100))
+        XCTAssertNil(g.programIndex(col: 511, row: 255))
+        // Out-of-canvas cells are nil.
+        XCTAssertNil(g.programIndex(col: 512, row: 0))
+        XCTAssertNil(g.programIndex(col: 0, row: 256))
         XCTAssertNil(g.programIndex(col: -1, row: 0))
+    }
+
+    func testPopulatedExtentFramesOccupiedCellsOnly() {
+        // Single partial row: extent is N columns × 1 row.
+        let small = ProgramGrid(programCount: 300)
+        XCTAssertEqual(small.populatedColumns, 300)
+        XCTAssertEqual(small.populatedRows, 1)
+        XCTAssertEqual(small.populatedByteWidth, 300 * 8)
+        XCTAssertEqual(small.populatedByteHeight, 8)
+
+        // Exactly one full row.
+        let oneRow = ProgramGrid(programCount: 512)
+        XCTAssertEqual(oneRow.populatedColumns, 512)
+        XCTAssertEqual(oneRow.populatedRows, 1)
+
+        // Full rows plus a partial one: columns cap at 512, rows = ⌈N/512⌉.
+        let modest = ProgramGrid(programCount: 1024)         // exactly 2 rows
+        XCTAssertEqual(modest.populatedColumns, 512)
+        XCTAssertEqual(modest.populatedRows, 2)
+        let ragged = ProgramGrid(programCount: 1025)         // 2 full + 1 cell → 3 rows
+        XCTAssertEqual(ragged.populatedColumns, 512)
+        XCTAssertEqual(ragged.populatedRows, 3)
+
+        // Full canvas fills every row.
+        let full = ProgramGrid(programCount: ProgramGrid.capacity)
+        XCTAssertEqual(full.populatedColumns, 512)
+        XCTAssertEqual(full.populatedRows, 256)
     }
 
     func testByteOffsetIsTapeReadingOrder() {
@@ -289,7 +335,7 @@ final class VisualizationModelTests: XCTestCase {
 
     func testLaunchOptionDefaultsAndParsing() throws {
         let defaults = try AppLaunchOptions.parse([])
-        XCTAssertEqual(defaults.programCount, 16_384)
+        XCTAssertEqual(defaults.programCount, 1_024)      // modest interactive default
         XCTAssertNil(defaults.validationSeconds)
 
         let parsed = try AppLaunchOptions.parse(
@@ -308,5 +354,98 @@ final class VisualizationModelTests: XCTestCase {
 
         // A valid config is produced from the defaults.
         XCTAssertNoThrow(try defaults.soupConfig())
+    }
+
+    func testProgramCountAboveCanvasCapacityIsRejected() throws {
+        // At capacity is fine; one program above the 512×256 canvas is rejected.
+        var atCapacity = AppLaunchOptions()
+        atCapacity.programCount = ProgramGrid.capacity
+        XCTAssertNoThrow(try atCapacity.soupConfig())
+
+        var over = AppLaunchOptions()
+        over.programCount = ProgramGrid.capacity + 2       // still even, still over
+        XCTAssertThrowsError(try over.soupConfig()) { error in
+            XCTAssertEqual(error as? AppLaunchOptions.ParseError,
+                           .programCountExceedsCanvas(count: ProgramGrid.capacity + 2,
+                                                      capacity: ProgramGrid.capacity))
+        }
+
+        // Parsing the flag still succeeds (deterministic parse); rejection is at
+        // config validation.
+        let parsed = try AppLaunchOptions.parse(["--programs", "200000"])
+        XCTAssertEqual(parsed.programCount, 200_000)
+        XCTAssertThrowsError(try parsed.soupConfig())
+    }
+
+    // MARK: - Bounded native validation state machine
+
+    private func inputs(_ elapsed: Double, draws: Int, error: Bool = false,
+                        mismatch: Int = 0) -> ValidationInputs {
+        ValidationInputs(elapsedSeconds: elapsed, completedDraws: draws,
+                         hasError: error, shadowMismatch: mismatch)
+    }
+
+    func testValidationSuccessNeedsDurationAndRealDrawProgress() {
+        let policy = ValidationPolicy(requestedSeconds: 5, graceSeconds: 2, metalAvailable: true)
+        // Time elapsed but no completed draw yet → still pending (before grace).
+        XCTAssertEqual(policy.evaluate(inputs(5, draws: 0)), .pending)
+        // A draw landed but the duration has not elapsed → pending.
+        XCTAssertEqual(policy.evaluate(inputs(4.9, draws: 3)), .pending)
+        // Duration elapsed AND at least one completed draw → success.
+        XCTAssertEqual(policy.evaluate(inputs(5, draws: 1)), .success)
+        XCTAssertEqual(policy.evaluate(inputs(9, draws: 42)), .success)
+    }
+
+    func testValidationNoProgressTimesOutFinitely() {
+        let policy = ValidationPolicy(requestedSeconds: 5, graceSeconds: 2, metalAvailable: true)
+        XCTAssertEqual(policy.graceDeadline, 7)
+        // Before the grace deadline with no draw → keep waiting.
+        XCTAssertEqual(policy.evaluate(inputs(6.9, draws: 0)), .pending)
+        // At/after the grace deadline with no completed draw → finite failure.
+        XCTAssertEqual(policy.evaluate(inputs(7, draws: 0)), .failure(.noDrawProgress))
+        XCTAssertEqual(policy.evaluate(inputs(100, draws: 0)), .failure(.noDrawProgress))
+        // A single draw before the deadline rescues it into success at duration.
+        XCTAssertEqual(policy.evaluate(inputs(7, draws: 1)), .success)
+    }
+
+    func testValidationErrorAndMismatchFailRegardlessOfTiming() {
+        let policy = ValidationPolicy(requestedSeconds: 5, metalAvailable: true)
+        // Hard stops win even with plenty of successful draws and elapsed time.
+        XCTAssertEqual(policy.evaluate(inputs(9, draws: 10, mismatch: 1)),
+                       .failure(.shadowMismatch))
+        XCTAssertEqual(policy.evaluate(inputs(9, draws: 10, error: true)),
+                       .failure(.error))
+        // Mismatch takes precedence over a bare error.
+        XCTAssertEqual(policy.evaluate(inputs(1, draws: 0, error: true, mismatch: 2)),
+                       .failure(.shadowMismatch))
+        // No Metal fails immediately, before any timing consideration.
+        let noMetal = ValidationPolicy(requestedSeconds: 5, metalAvailable: false)
+        XCTAssertEqual(noMetal.evaluate(inputs(0, draws: 0)), .failure(.noMetal))
+    }
+
+    func testValidationExitCodes() {
+        XCTAssertEqual(ValidationOutcome.success.exitCode, 0)
+        XCTAssertEqual(ValidationOutcome.failure(.error).exitCode, 1)
+        XCTAssertEqual(ValidationOutcome.failure(.shadowMismatch).exitCode, 1)
+        XCTAssertEqual(ValidationOutcome.failure(.noDrawProgress).exitCode, 1)
+        XCTAssertEqual(ValidationOutcome.failure(.noMetal).exitCode, 2)
+    }
+
+    func testValidationRunCompletesExactlyOnce() {
+        var run = ValidationRun(policy: ValidationPolicy(requestedSeconds: 5,
+                                                         graceSeconds: 2,
+                                                         metalAvailable: true))
+        // Pending steps do not latch.
+        XCTAssertNil(run.step(inputs(1, draws: 0)))
+        XCTAssertNil(run.step(inputs(4, draws: 1)))
+        XCTAssertFalse(run.finished)
+        // First terminal verdict is returned once and latched.
+        XCTAssertEqual(run.step(inputs(5, draws: 1)), .success)
+        XCTAssertTrue(run.finished)
+        XCTAssertEqual(run.outcome, .success)
+        // A racing watchdog step afterwards yields nil — single completion.
+        XCTAssertNil(run.step(inputs(7, draws: 0)))
+        XCTAssertNil(run.step(inputs(9, draws: 9, mismatch: 5)))
+        XCTAssertEqual(run.outcome, .success)   // outcome never changes after latch
     }
 }

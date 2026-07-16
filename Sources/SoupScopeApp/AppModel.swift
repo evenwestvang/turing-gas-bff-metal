@@ -38,9 +38,18 @@ final class AppModel: ObservableObject {
     private var drawablePxH: Double = 0
     private var didFit = false
 
-    // Bounded-validation state.
+    // Bounded-validation state (the verdict logic lives in the pure
+    // `ValidationRun`/`ValidationPolicy` state machine in SoupScopeCore).
+    private var validationRun: ValidationRun?
     private var validationStart: CFAbsoluteTime?
-    private var validationFinished = false
+    private var validationTimer: Timer?
+    private var completedDraws = 0
+    private var lastCommandBuffer: MTLCommandBuffer?
+    /// True once a terminal validation verdict is reached; the renderer then stops
+    /// submitting new work so no buffer is torn down while an exit is pending.
+    private(set) var validationFinished = false
+    /// Whether a validation run is active and not yet finished.
+    var validationActive: Bool { options.validationSeconds != nil && !validationFinished }
 
     init(arguments: [String]) {
         // Parse launch options; on error, fall back to interactive defaults and
@@ -85,6 +94,10 @@ final class AppModel: ObservableObject {
 
         self.lastSnapshot = try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
                                                         soup: runner.soup)
+
+        // Arm the display-independent validation watchdog (no-op for interactive
+        // launch, which omits --validation-seconds).
+        beginValidationIfNeeded()
     }
 
     // MARK: - Frame driving
@@ -94,7 +107,6 @@ final class AppModel: ObservableObject {
     /// error visible (never spins/retries). Returns the latest snapshot regardless
     /// so the last good frame stays on screen.
     func stepFrame() -> RenderSnapshot? {
-        maybeFinishValidation()
         guard validationFinished == false else { return lastSnapshot }
         guard hud.errorState == nil, isRunning, let evaluator = context?.evaluator else {
             return lastSnapshot
@@ -150,9 +162,12 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Camera geometry frames the *populated* extent (columns `0..<min(N,512)`,
+    /// rows `0..<⌈N/512⌉`) even though the coordinates themselves stay canonical —
+    /// so fit/reset never centers on the mostly-empty 512×256 canvas.
     func cameraGeometry() -> CameraGeometry {
-        CameraGeometry(soupByteWidth: Double(grid.byteWidth),
-                       soupByteHeight: Double(grid.byteHeight),
+        CameraGeometry(soupByteWidth: Double(grid.populatedByteWidth),
+                       soupByteHeight: Double(grid.populatedByteHeight),
                        viewPxWidth: drawablePxW, viewPxHeight: drawablePxH)
     }
 
@@ -183,41 +198,89 @@ final class AppModel: ObservableObject {
     }
 
     // MARK: - Bounded native validation
+    //
+    // `--validation-seconds` must terminate finitely even if the MTKView never gets
+    // a drawable or a display callback. Two display-independent inputs drive the pure
+    // `ValidationRun`: completed render submissions (the success path, from the
+    // command buffer's completion handler) and a one-shot main-run-loop watchdog (the
+    // finite backstop). Neither advances epochs. The run latches its first terminal
+    // verdict, so `finishValidation` runs exactly once even under a race.
 
-    private func maybeFinishValidation() {
-        guard let seconds = options.validationSeconds, !validationFinished else { return }
-        let now = CFAbsoluteTimeGetCurrent()
-        if validationStart == nil {
-            validationStart = now
-            // If Metal never came up, there is nothing to validate — report and exit.
-            if context == nil { finishValidation(seconds: seconds); }
-            return
+    /// Arm the one-shot, display-independent watchdog on the main run loop. Called
+    /// once at launch. If Metal never came up there is nothing to validate, so the
+    /// deadline is immediate; otherwise it is the grace deadline — the backstop for a
+    /// run that produces no drawable within `requestedSeconds + grace`.
+    private func beginValidationIfNeeded() {
+        guard let seconds = options.validationSeconds, validationRun == nil else { return }
+        let policy = ValidationPolicy(requestedSeconds: seconds, metalAvailable: context != nil)
+        validationRun = ValidationRun(policy: policy)
+        validationStart = CFAbsoluteTimeGetCurrent()
+        let deadline = policy.metalAvailable ? policy.graceDeadline : 0
+        let timer = Timer(timeInterval: max(0, deadline), repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.evaluateValidation() }
         }
-        if now - validationStart! >= seconds {
-            finishValidation(seconds: seconds)
+        RunLoop.main.add(timer, forMode: .common)
+        validationTimer = timer
+    }
+
+    /// Record the frame's submitted command buffer so a pending exit can wait on it.
+    func noteRenderSubmitted(_ buffer: MTLCommandBuffer) {
+        guard validationActive else { return }
+        lastCommandBuffer = buffer
+    }
+
+    /// One completed render submission (from the command buffer's completion handler)
+    /// — the success path, so a run finishes only after a real render has landed.
+    func noteDrawCompleted() {
+        guard validationActive else { return }
+        completedDraws += 1
+        evaluateValidation()
+    }
+
+    /// Feed the current display-independent facts to the run's state machine and, if
+    /// it reaches a terminal verdict, finish exactly once.
+    private func evaluateValidation() {
+        guard let start = validationStart, validationRun != nil, !validationFinished else { return }
+        let inputs = ValidationInputs(
+            elapsedSeconds: CFAbsoluteTimeGetCurrent() - start,
+            completedDraws: completedDraws,
+            hasError: hud.errorState != nil,
+            shadowMismatch: hud.shadowMismatch)
+        if let outcome = validationRun!.step(inputs) {
+            finishValidation(outcome)
         }
     }
 
-    private func finishValidation(seconds: Double) {
+    /// Print exactly one deterministic diagnostic line and terminate — the single
+    /// termination path, guarded by `validationFinished` and the run's latch. Before
+    /// exiting it waits on the last submitted buffer so we never tear down a render
+    /// command buffer that is still in flight (in the completion-handler path that
+    /// buffer is already done, so the wait returns immediately).
+    private func finishValidation(_ outcome: ValidationOutcome) {
         guard !validationFinished else { return }
         validationFinished = true
+        validationTimer?.invalidate()
+        validationTimer = nil
+
+        if let cb = lastCommandBuffer, cb.status != .completed {
+            cb.waitUntilCompleted()
+        }
+
         let h = hud
-        let mismatch = h.shadowMismatch
-        let hasError = h.errorState != nil
-        let line = "validation seconds=\(seconds) epochs=\(h.epoch) "
+        let line = "validation outcome=\(outcome.statusToken) "
+            + "requestedSeconds=\(options.validationSeconds ?? 0) "
+            + "completedDraws=\(completedDraws) epochs=\(h.epoch) "
             + "lastBatchEpochs=\(h.lastBatchEpochs) "
             + String(format: "lastBatchMs=%.3f msPerEpoch=%.4f ", h.lastBatchMs, h.msPerEpoch)
             + "halt[budget=\(h.haltBudget),pcOut=\(h.haltPCOut),"
             + "unmatched=\(h.haltUnmatched),unknown=\(h.haltUnknown)] "
             + "copyWrites=\(h.copyWrites) "
-            + "shadowChecked=\(h.shadowChecked) shadowMismatch=\(mismatch) "
+            + "shadowChecked=\(h.shadowChecked) shadowMismatch=\(h.shadowMismatch) "
             + "programs=\(h.programCount) device=\"\(h.deviceName)\" "
             + "error=\(h.errorState ?? "none")"
         print(line)
-        // Clean termination (C `exit` flushes stdio): 0 on success, 1 on any
-        // mismatch/error, 2 if Metal never came up.
-        let code: Int32 = context == nil ? 2 : ((mismatch > 0 || hasError) ? 1 : 0)
-        exit(code)
+        // C `exit` flushes stdio: 0 success, 1 error/mismatch/no-progress, 2 no Metal.
+        exit(outcome.exitCode)
     }
 }
 #endif
