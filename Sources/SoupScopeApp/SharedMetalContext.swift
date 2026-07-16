@@ -33,7 +33,7 @@ final class SharedMetalContext {
             switch self {
             case .noDevice: return "no Metal device available"
             case .queueCreationFailed: return "could not create the shared command queue"
-            case .shaderSourceMissing: return "SoupRender.metal missing from the app bundle"
+            case .shaderSourceMissing: return "SoupRender.metal not found in the app bundle or the SoupScope resource bundle"
             case .compileFailed(let d): return "render shader compile failed: \(d)"
             case .functionMissing(let n): return "render function '\(n)' not found"
             case .pipelineFailed(let d): return "render pipeline creation failed: \(d)"
@@ -55,7 +55,9 @@ final class SharedMetalContext {
         // The evaluator shares this exact device and queue.
         self.evaluator = try MetalBFFEvaluator(device: device, queue: queue)
 
-        guard let url = Bundle.module.url(forResource: "SoupRender", withExtension: "metal") else {
+        guard let url = ShaderResourceLocator.url(forResource: "SoupRender",
+                                                  withExtension: "metal",
+                                                  moduleBundle: .module) else {
             throw ContextError.shaderSourceMissing
         }
         let source = try String(contentsOf: url, encoding: .utf8)

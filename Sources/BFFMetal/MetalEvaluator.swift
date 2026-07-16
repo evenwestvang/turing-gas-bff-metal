@@ -34,7 +34,7 @@ public final class MetalBFFEvaluator {
             case .noDevice:
                 return "no Metal device available"
             case .shaderSourceMissing:
-                return "BFFEvaluate.metal missing from the BFFMetal resource bundle"
+                return "BFFEvaluate.metal not found in the app bundle or the BFFMetal resource bundle"
             case .compileFailed(let detail):
                 return "Metal shader compile failed: \(detail)"
             case .kernelMissing(let name):
@@ -83,8 +83,9 @@ public final class MetalBFFEvaluator {
         self.device = device
         self.queue = queue
 
-        guard let sourceURL = Bundle.module.url(forResource: "BFFEvaluate",
-                                                withExtension: "metal") else {
+        guard let sourceURL = ShaderResourceLocator.url(forResource: "BFFEvaluate",
+                                                        withExtension: "metal",
+                                                        moduleBundle: .module) else {
             throw EvaluatorError.shaderSourceMissing
         }
         let source = try String(contentsOf: sourceURL, encoding: .utf8)

@@ -125,6 +125,13 @@ Interactive controls: **drag** = pan · **scroll / pinch** = zoom (cursor-anchor
 **space** = pause/resume · **f** = fit whole soup · **m** = cycle metric channel
 (life / activity / entropy).
 
+To ship a double-clickable, ad-hoc-signed macOS bundle (conventional layout:
+executable in `Contents/MacOS`, shaders flat in `Contents/Resources`), run
+`Scripts/package-soupscope-app.sh`. Launch arguments still flow through
+`open build/SoupScope.app --args …`. See **Docs/Packaging.md** for the layout,
+signing, and how resource lookup stays correct both inside the `.app` (via
+`Bundle.main`) and under `swift run`/`swift test` (via `Bundle.module`).
+
 ## Native validation (owning persona, on the Metal device)
 
 `swift test` on Linux validates every pure model and the epoch orchestration (with the CPU
