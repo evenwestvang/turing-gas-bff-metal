@@ -55,6 +55,18 @@ public final class MetalBFFEvaluator {
     private let queue: MTLCommandQueue
     private let evaluatePipeline: MTLComputePipelineState
 
+    /// GPU-side execution time of the LAST `evaluate` command buffer, in seconds, or
+    /// `nil` if the hardware did not report usable timestamps for it.
+    ///
+    /// This is `MTLCommandBuffer.gpuEndTime - gpuStartTime`: the interval the command
+    /// buffer was actually executing on the GPU. It is *command-buffer time*, honestly
+    /// labeled — not a per-kernel or per-encoder breakdown, and not a CPU profile.
+    /// `evaluate` sets it after `waitUntilCompleted`; it never influences the returned
+    /// outcomes, so deterministic outputs are unaffected. One epoch dispatches exactly
+    /// one command buffer, so a caller can read this immediately after `SoupRunner`
+    /// runs an epoch to attribute that epoch's GPU time.
+    public private(set) var lastGPUCommandBufferSeconds: Double?
+
     public var deviceName: String { device.name }
 
     /// The device and command queue this evaluator uses — exposed so a host can
@@ -217,6 +229,13 @@ public final class MetalBFFEvaluator {
         if let error = commandBuffer.error {
             throw EvaluatorError.gpuExecutionFailed("\(error)")
         }
+
+        // Honest command-buffer GPU time. `gpuStartTime`/`gpuEndTime` are valid only
+        // after completion; treat a non-positive or non-increasing interval as "no
+        // usable timestamp" (nil) rather than reporting a bogus 0, so the benchmark
+        // harness can fail clearly instead of silently trusting a fake number.
+        let span = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+        lastGPUCommandBufferSeconds = (commandBuffer.gpuStartTime > 0 && span > 0) ? span : nil
 
         var outcomes: [GPUPairOutcome] = []
         outcomes.reserveCapacity(count)

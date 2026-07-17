@@ -58,6 +58,41 @@ public enum BFFRandom {
         return soup
     }
 
+    /// A soup of `programs * 64` bytes all equal to `byte` (default 0). A fully
+    /// ordered, zero-Shannon-entropy starting state. Additive and independent of the
+    /// uniform `initialSoup` path — it does not touch the RNG streams, so choosing it
+    /// cannot perturb any subsequent mutation/pairing draw. Intended for measuring
+    /// entropy *increase* from a known floor; with `byte == 0` the soup is inert
+    /// (every byte is a no-op) and dynamics are driven purely by mutation.
+    public static func constantSoup(programs: Int, byte: UInt8 = 0) -> [UInt8] {
+        precondition(programs > 0)
+        return [UInt8](repeating: byte, count: programs * BFF.tapeSize)
+    }
+
+    /// A reproducible low-entropy soup drawn from a small alphabet (default: the ten
+    /// BFF opcode bytes, `BFFOp.all`). Byte `i` is `alphabet[draw % alphabet.count]`
+    /// where `draw` is the SAME `.soupInit` counter draw the uniform path uses — so it
+    /// is deterministic under `counter-pcg-v1`, reproducible across machines, and adds
+    /// no new RNG. Unlike an all-zero soup this seeds the soup with *executable*
+    /// opcodes, so interactions do real work from epoch 0 while the order-0 Shannon
+    /// entropy still starts low (≤ log2(alphabet.count) bits/byte) — the intended
+    /// regime for observing entropy growth. The uniform `initialSoup` is unchanged and
+    /// remains the default.
+    public static func opcodeSoup(programs: Int, seed: UInt32,
+                                  alphabet: [UInt8] = BFFOp.all) -> [UInt8] {
+        precondition(programs > 0)
+        precondition(!alphabet.isEmpty, "alphabet must be non-empty")
+        let byteCount = programs * BFF.tapeSize
+        var soup = [UInt8](repeating: 0, count: byteCount)
+        let s = stream(epoch: 0, pass: .soupInit)
+        let n = UInt32(alphabet.count)
+        for i in 0..<byteCount {
+            let draw = rng3(seed: seed, stream: s, index: UInt32(i))
+            soup[i] = alphabet[Int(draw % n)]
+        }
+        return soup
+    }
+
     // MARK: - Mutation
 
     /// Exact per-byte Bernoulli mutation, verbatim port of `bff_mutate` (02 §7):

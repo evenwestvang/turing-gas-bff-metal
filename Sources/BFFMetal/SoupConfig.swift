@@ -17,6 +17,20 @@ import BFFOracle
 /// nonzero on a bad configuration instead of trapping. All bounds that feed a GPU
 /// ABI conversion (`pairCount`, `stepBudget` → `uint32`) are checked here.
 public struct SoupConfig: Equatable, Sendable {
+    /// How the epoch-0 soup is filled. Additive: `.uniform` is the default and is
+    /// the existing `BFFRandom.initialSoup` path *verbatim*, so every pinned default
+    /// digest is unchanged. The two low-entropy modes exist for measuring entropy
+    /// *increase* from a known floor and never alter the uniform path.
+    public enum InitMode: String, Equatable, Sendable, CaseIterable, Codable {
+        /// Uniform random bytes (`BFFRandom.initialSoup`). Default; digests pinned.
+        case uniform
+        /// Every byte 0 — an inert, ordered, H≈0 floor (`BFFRandom.constantSoup`).
+        case constant
+        /// Small-alphabet draw over the ten BFF opcodes (`BFFRandom.opcodeSoup`):
+        /// low entropy but *executable* from epoch 0.
+        case opcode
+    }
+
     /// Run seed — the sole entropy source together with the fields below.
     public var seed: UInt32
     /// Number of 64-byte programs in the soup. Must be positive and even.
@@ -33,6 +47,8 @@ public struct SoupConfig: Equatable, Sendable {
     /// compare against the GPU. 0 disables shadowing explicitly; `pairCount`
     /// (or more, clamped in validation) shadows every pair.
     public var shadowSampleCount: Int
+    /// Epoch-0 soup fill. Default `.uniform` reproduces the pinned digests exactly.
+    public var initMode: InitMode
 
     /// Interactions per epoch — one paired 128-byte tape per pair.
     public var pairCount: Int { programCount / 2 }
@@ -71,7 +87,8 @@ public struct SoupConfig: Equatable, Sendable {
         stepBudget: Int = BFF.stepBudget,
         mutationP32: UInt32 = BFF.defaultMutationP32,
         variant: BFFVariant = .noheads,
-        shadowSampleCount: Int? = nil
+        shadowSampleCount: Int? = nil,
+        initMode: InitMode = .uniform
     ) throws {
         guard programCount > 0, programCount % 2 == 0 else {
             throw ConfigError.programCountNotPositiveEven(programCount)
@@ -100,6 +117,7 @@ public struct SoupConfig: Equatable, Sendable {
         self.mutationP32 = mutationP32
         self.variant = variant
         self.shadowSampleCount = sample
+        self.initMode = initMode
     }
 }
 

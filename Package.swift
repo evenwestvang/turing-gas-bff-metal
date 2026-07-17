@@ -12,6 +12,7 @@ let package = Package(
         .executable(name: "bff-oracle", targets: ["bff-oracle"]),
         .executable(name: "bff-metal-parity", targets: ["bff-metal-parity"]),
         .executable(name: "bff-metal-soup", targets: ["bff-metal-soup"]),
+        .executable(name: "bff-metal-bench", targets: ["bff-metal-bench"]),
         .executable(name: "SoupScope", targets: ["SoupScopeApp"]),
     ],
     targets: [
@@ -35,6 +36,10 @@ let package = Package(
                           dependencies: ["BFFMetal", "BFFOracle"]),
         // Headless small-soup epoch runner (exits 2 on non-Metal hosts).
         .executableTarget(name: "bff-metal-soup",
+                          dependencies: ["BFFMetal", "BFFOracle"]),
+        // Headless measurement-first benchmark harness / matrix runner sized for
+        // native M4 Max runs (exits 2 on non-Metal hosts).
+        .executableTarget(name: "bff-metal-bench",
                           dependencies: ["BFFMetal", "BFFOracle"]),
         // Platform-independent app core: grid/camera/LOD/normalization/opcode/
         // batcher/HUD/snapshot pure models + launch-option parsing. Depends on

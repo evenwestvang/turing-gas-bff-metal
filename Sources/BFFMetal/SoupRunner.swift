@@ -102,7 +102,16 @@ public struct SoupRunner: Sendable {
 
     public init(config: SoupConfig) {
         self.config = config
-        self.soup = BFFRandom.initialSoup(programs: config.programCount, seed: config.seed)
+        // `.uniform` is the existing default path, byte-for-byte; the low-entropy
+        // modes are additive and only chosen when explicitly configured.
+        switch config.initMode {
+        case .uniform:
+            self.soup = BFFRandom.initialSoup(programs: config.programCount, seed: config.seed)
+        case .constant:
+            self.soup = BFFRandom.constantSoup(programs: config.programCount)
+        case .opcode:
+            self.soup = BFFRandom.opcodeSoup(programs: config.programCount, seed: config.seed)
+        }
         self.epoch = 0
     }
 
