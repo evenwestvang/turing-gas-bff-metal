@@ -11,15 +11,18 @@ import BFFOracle
 /// - `gpuSecondsAfterEpoch` reads the evaluator's last command-buffer GPU time
 ///   (Metal in the CLI; `nil` for the CPU reference);
 /// - `measureSignals` computes soup signals — and is invoked ONLY when
-///   `options.analyzeSignals` is true. Under `--no-samples` (`analyzeSignals ==
+///   `options.analyzeSignals` is true AND the epoch is on the signal-measurement
+///   cadence (`options.signalInterval`). Under `--no-samples` (`analyzeSignals ==
 ///   false`) it is never called, so no entropy scan, transition scan, or LZ proxy
-///   runs and there is no hidden host analysis cost. Tests inject a counting closure
-///   to prove exactly that.
+///   runs and there is no hidden host analysis cost. Under a sparse
+///   `signalInterval > 1` it is called only at epoch 0, every `N`th completed epoch,
+///   and the final completed epoch — never on the intervening epochs. Tests inject a
+///   counting closure to prove exactly that cadence.
 public enum BenchmarkRunner {
 
     /// Controls for sample-only metric analysis. Both flags are off in throughput
-    /// mode; `includeCompression` is meaningless (and ignored) when
-    /// `analyzeSignals == false`.
+    /// mode; `includeCompression` and `signalInterval` are meaningless (and ignored)
+    /// when `analyzeSignals == false`.
     public struct Options: Sendable, Equatable {
         /// Master switch for ALL sample-only metric analysis (entropy scans,
         /// adjacent-transition rate, LZ proxy, kinetics). `false` under `--no-samples`.
@@ -27,10 +30,22 @@ public enum BenchmarkRunner {
         /// Opt-in for the O(n·window) LZ compression proxy. Even when true, the proxy
         /// is only computed on sampled epochs + the final epoch (bounded cost).
         public var includeCompression: Bool
+        /// Signal-measurement cadence. `1` (the default) measures signals every epoch —
+        /// the exact per-epoch entropy trajectory that ΔH thresholds require. `N > 1`
+        /// is cadence-only / sparse analysis: signals are measured at epoch 0 (the
+        /// pre-run reference, always), at every `N`th completed epoch, and at the final
+        /// completed epoch (even when it is not divisible by `N`), and *nowhere else*.
+        /// It is a pure measurement gate: skipping a measurement never touches the
+        /// evaluator, the RNG, the soup, the counters, or the digest — only whether
+        /// that epoch carries a `SoupSignals` reading. Clamped to `>= 1`. Ignored when
+        /// `analyzeSignals == false`.
+        public var signalInterval: Int
 
-        public init(analyzeSignals: Bool, includeCompression: Bool) {
+        public init(analyzeSignals: Bool, includeCompression: Bool,
+                    signalInterval: Int = 1) {
             self.analyzeSignals = analyzeSignals
             self.includeCompression = includeCompression
+            self.signalInterval = Swift.max(1, signalInterval)
         }
 
         /// Pure throughput: no signal analysis at all.
@@ -84,7 +99,17 @@ public enum BenchmarkRunner {
         for e in 0..<config.totalEpochs {
             let isWarmup = e < config.warmupEpochs
             let completed = e + 1
+            // JSON emission cadence (`--sample-interval`): which measured epochs the
+            // aggregator emits as `EpochSample`s, and — for compression — which epochs
+            // may carry the O(n·window) LZ proxy. Unchanged by sparse analysis.
             let isSamplePoint = (completed % config.sampleInterval == 0)
+                || completed == config.totalEpochs
+            // Signal-measurement cadence (`--signal-interval`): whether signals are
+            // measured *at all* this epoch. `1` (default) => every epoch. `N > 1` =>
+            // only every `N`th completed epoch plus the final epoch (epoch 0's
+            // reference is measured before the loop). This gates measurement only; it
+            // never affects the epoch execution below.
+            let isSignalPoint = (completed % options.signalInterval == 0)
                 || completed == config.totalEpochs
 
             // --- Epoch execution wall: runEpoch only ---
@@ -101,9 +126,14 @@ public enum BenchmarkRunner {
             let gpu = gpuSecondsAfterEpoch()
 
             // --- Sampled signal/metric analysis: outside the epoch wall ---
+            // Measured only on the signal cadence. The LZ proxy stays bounded to the
+            // *emission* cadence (`isSamplePoint`) exactly as documented, so under a
+            // sparse signal interval it runs only where a measurement AND a sample
+            // point coincide — never more often than dense analysis would (the final
+            // epoch, always both, still carries it when `--compression` is on).
             var signals: SoupSignals? = nil
             var analysisSeconds: Double? = nil
-            if options.analyzeSignals {
+            if options.analyzeSignals && isSignalPoint {
                 let a0 = now()
                 let includeComp = options.includeCompression && isSamplePoint
                 signals = measureSignals(runner.soup, includeComp)

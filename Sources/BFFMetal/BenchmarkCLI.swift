@@ -48,6 +48,45 @@ public enum EvaluatorInitOutcome: Equatable {
     }
 }
 
+// MARK: - Signal-analysis cadence
+
+/// Why a `--signal-interval` value is incompatible with the rest of the invocation.
+/// Kept in the library (not `main.swift`) so the exit-code policy is unit-testable
+/// without a Metal device.
+public enum SignalCadenceError: Error, Equatable, CustomStringConvertible {
+    /// ΔH thresholds need the exact per-epoch entropy trajectory, which a sparse
+    /// (`> 1`) signal interval does not measure. Rejected as a usage error rather than
+    /// silently reporting threshold epochs that could only ever land on cadence points.
+    case thresholdsRequirePerEpochSignals(signalInterval: Int)
+
+    public var description: String {
+        switch self {
+        case .thresholdsRequirePerEpochSignals(let n):
+            return "--delta-h-thresholds requires per-epoch signal analysis, but "
+                + "--signal-interval \(n) measures signals only every \(n) epochs "
+                + "(plus epoch 0 and the final epoch), so exact ΔH-threshold epochs "
+                + "cannot be resolved from that sparse trajectory. Use --signal-interval 1 "
+                + "(the default) for ΔH thresholds, or drop --delta-h-thresholds for "
+                + "cadence-only signal analysis."
+        }
+    }
+}
+
+/// Validate the signal-analysis cadence against the requested ΔH thresholds.
+///
+/// A sparse signal interval (`> 1`) is cadence-only: it measures entropy at epoch 0,
+/// every `N`th completed epoch, and the final epoch, and nowhere else. Exact
+/// ΔH-threshold crossings need the *per-epoch* trajectory, so a sparse interval is
+/// rejected whenever any threshold is requested. `signalInterval == 1` (per-epoch, the
+/// default) is always allowed. No threshold requested is always allowed.
+public func validateSignalCadence(signalInterval: Int,
+                                  deltaHThresholdCount: Int) throws {
+    if signalInterval > 1 && deltaHThresholdCount > 0 {
+        throw SignalCadenceError.thresholdsRequirePerEpochSignals(
+            signalInterval: signalInterval)
+    }
+}
+
 // MARK: - Strict seed parsing
 
 /// Why a `--seeds`/`--seed` token was rejected. Each case is a distinct, testable

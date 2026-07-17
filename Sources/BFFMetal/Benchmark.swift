@@ -138,11 +138,14 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
 /// - `gpuSeconds` is `nil` when the hardware reported no usable command-buffer
 ///   timestamp; the aggregator then marks GPU timing unavailable rather than
 ///   inventing a number.
-/// - `signals` is `nil` when sample-only metric analysis was skipped (`--no-samples`);
-///   the aggregator then reports entropy kinetics as not computed rather than faking
-///   a zero.
+/// - `signals` is `nil` when no signal reading was taken for this epoch: either
+///   sample-only metric analysis was skipped entirely (`--no-samples`), or a sparse
+///   `--signal-interval N` did not place a measurement on this epoch. The aggregator
+///   folds only the epochs that *do* carry signals into the kinetics/samples and
+///   reports "not computed" (rather than faking a zero) when none were taken.
 /// - `analysisSeconds` is the host wall spent computing `signals` for this epoch,
-///   measured *outside* `wallSeconds`; `nil` when no analysis ran.
+///   measured *outside* `wallSeconds`; `nil` when no analysis ran (skipped or off-cadence),
+///   so `signalAnalysisMsTotal` sums only measurements actually performed.
 public struct EpochObservation: Sendable {
     public var epoch: Int
     public var isWarmup: Bool
@@ -436,7 +439,11 @@ public enum BenchmarkAggregator {
     ///   folded into `signalAnalysisMsTotal` alongside the per-epoch analysis time.
     /// - Timing/throughput use measured (non-warmup) epochs only, and derive solely
     ///   from the epoch execution wall — signal analysis is never mixed in.
-    /// - Threshold crossings and kinetics use every epoch in order.
+    /// - Threshold crossings and kinetics fold every epoch that carries signals, in
+    ///   order; epochs without a reading (off a sparse `--signal-interval` cadence)
+    ///   are skipped. ΔH thresholds are only ever requested with per-epoch signals
+    ///   (the CLI rejects thresholds under a sparse interval), so their epochs stay
+    ///   exact.
     public static func aggregate(config: BenchmarkConfig,
                                  deviceName: String?,
                                  initialSignals: SoupSignals?,
@@ -444,11 +451,17 @@ public enum BenchmarkAggregator {
                                  finalDigestHex: String,
                                  maxRSSBytes: Int?,
                                  initialAnalysisSeconds: Double? = nil) -> BenchmarkResult {
-        // Signal analysis is "available" only when we have both the initial reference
-        // and a signal for every epoch — i.e. it was not skipped by `--no-samples`.
+        // Signal analysis is "available" (kinetics were computed) when we have the
+        // epoch-0 reference and at least one epoch carries signals — i.e. it was not
+        // skipped by `--no-samples`. The dense default (`--signal-interval 1`) measures
+        // every epoch, so `contains` and the former `allSatisfy` agree there and the
+        // default result is unchanged. Under a sparse `--signal-interval N` only the
+        // cadence epochs (plus epoch 0 and the final epoch) carry signals, so requiring
+        // *some* — not every — observation to have them is what admits cadence-only
+        // kinetics while still reporting `false` under `--no-samples`.
         let signalsAnalyzed = initialSignals != nil
             && !observations.isEmpty
-            && observations.allSatisfy { $0.signals != nil }
+            && observations.contains { $0.signals != nil }
         let initialH = initialSignals?.entropyBitsPerByte
         let measured = observations.filter { !$0.isWarmup }
 

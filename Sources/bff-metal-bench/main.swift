@@ -54,6 +54,9 @@ var initMode: SoupConfig.InitMode = .uniform
 var shadowSampleArg: String? = nil     // nil => 0 (throughput mode)
 var deltaHThresholds: [Double] = []
 var sampleInterval = 1
+// Signal-measurement cadence (distinct from `--sample-interval`, which is the JSON
+// emission cadence). `1` = per-epoch (default); `N > 1` = cadence-only signal analysis.
+var signalInterval = 1
 var allowMissingGPUTiming = false
 // `--no-samples` disables ALL sample-only metric analysis (entropy/transition/LZ/
 // kinetics), not merely JSON emission — the throughput-only mode. `--compression`
@@ -118,6 +121,7 @@ while cursor < arguments.count {
     case "--shadow-sample": shadowSampleArg = nextValue(argument)
     case "--delta-h-thresholds": deltaHThresholds = doubleList(argument, nextValue(argument))
     case "--sample-interval": sampleInterval = intArg(argument, nextValue(argument))
+    case "--signal-interval": signalInterval = intArg(argument, nextValue(argument))
     case "--allow-missing-gpu-timing": allowMissingGPUTiming = true
     case "--no-samples": analyzeSignals = false
     case "--compression": includeCompression = true
@@ -146,12 +150,22 @@ while cursor < arguments.count {
           --variant V             noheads | bff (default noheads)
           --init MODE             uniform | constant | opcode (default uniform)
           --shadow-sample N|all   pairs CPU-shadowed per epoch; 0/omit = throughput mode
-          --delta-h-thresholds L  comma bits/byte ΔH levels to time (e.g. 0.25,0.5,1.0)
-          --sample-interval N     emit a kinetics sample every N epochs (default 1)
+          --delta-h-thresholds L  comma bits/byte ΔH levels to time (e.g. 0.25,0.5,1.0);
+                                  requires per-epoch signals (--signal-interval 1)
+          --sample-interval N     JSON emission cadence: emit a kinetics sample every N
+                                  epochs (+ the final epoch) (default 1)
+          --signal-interval N     signal-MEASUREMENT cadence (distinct from
+                                  --sample-interval). 1 (default) measures entropy every
+                                  epoch. N>1 is cadence-only analysis: measure at epoch 0,
+                                  every Nth completed epoch, and the final epoch only.
+                                  Incompatible with --delta-h-thresholds (usage error).
+                                  A sample is emitted only where an emission point and a
+                                  measured epoch coincide. Ignored under --no-samples.
           --no-samples            throughput mode: skip ALL sample-only metric analysis
                                   (entropy/transition/LZ/kinetics), not just JSON output
           --compression           opt in to the O(n·window) LZ proxy (sampled epochs
-                                  only; off by default; ignored under --no-samples)
+                                  only, and only where signals are measured; off by
+                                  default; ignored under --no-samples)
           --allow-missing-gpu-timing  exit 0 even if GPU timestamps are unavailable
         Seeds are strict unsigned decimals in 0...\(UInt32.max); malformed/overflowing
         tokens are a usage error (exit \(BenchmarkExitCode.usage)), never truncated.
@@ -167,8 +181,23 @@ guard measuredEpochs >= 0, warmupEpochs >= 0 else {
     fail("epochs and warmup must be >= 0", exitCode: usageExit)
 }
 guard sampleInterval >= 1 else { fail("--sample-interval must be >= 1", exitCode: usageExit) }
+guard signalInterval >= 1 else { fail("--signal-interval must be >= 1", exitCode: usageExit) }
+// Exact ΔH thresholds require the per-epoch trajectory; a sparse signal interval is
+// cadence-only. Reject the combination as a usage error (validated in the library so
+// the policy is unit-tested without Metal).
+do {
+    try validateSignalCadence(signalInterval: signalInterval,
+                              deltaHThresholdCount: deltaHThresholds.count)
+} catch let e as SignalCadenceError {
+    fail(e.description, exitCode: usageExit)
+} catch {
+    fail("\(error)", exitCode: usageExit)
+}
 if includeCompression && !analyzeSignals {
     warn("--compression is ignored under --no-samples (no signal analysis runs)")
+}
+if signalInterval > 1 && !analyzeSignals {
+    warn("--signal-interval is ignored under --no-samples (no signal analysis runs)")
 }
 
 // Build the matrix (programs outer, seeds inner) and validate every cell up front so
@@ -262,7 +291,8 @@ do {
 }
 
 let runOptions = BenchmarkRunner.Options(analyzeSignals: analyzeSignals,
-                                         includeCompression: includeCompression)
+                                         includeCompression: includeCompression,
+                                         signalInterval: signalInterval)
 
 var results: [BenchmarkResult] = []
 var anyShadowMismatch = false
@@ -327,6 +357,7 @@ for config in configs {
          + "budget=\(config.stepBudget) init=\(config.initMode.rawValue) "
          + "variant=\(config.variant.rawValue) shadowSample=\(config.shadowSampleCount) "
          + "analyzeSignals=\(analyzeSignals) compression=\(includeCompression) "
+         + "sampleInterval=\(config.sampleInterval) signalInterval=\(signalInterval) "
          + "rng=\(BFFRandom.contractID)")
 }
 emit([])

@@ -68,8 +68,9 @@ work. The low-entropy modes are additive and only chosen when requested.
 Order-0 Shannon entropy is order-blind. Two structure-sensitive signals accompany it:
 
 - **`transitionRate`** — fraction of adjacent bytes that differ, `[0,1]`. Falls when runs
-  / copied regions appear even while entropy stays high. O(n), computed on the analysis
-  cadence (every sampled epoch), never under `--no-samples`.
+  / copied regions appear even while entropy stays high. O(n), computed on the
+  signal-measurement cadence (every epoch by default; only the `--signal-interval` epochs
+  when sparse), never under `--no-samples`.
 - **`compressionProxyRatio`** — a finite-window greedy LZ77 **token count ÷ byte count**,
   `(0,1]`; lower ⇒ more repetition. It is a reproducible *proxy* for compressibility, not
   a real codec's ratio and **not Kolmogorov complexity** (which is uncomputable). It is
@@ -103,6 +104,11 @@ Read all three as relative, same-alphabet, same-length signals.
   an invocation counter proving the scan is genuinely skipped).
 - **`--compression`** opts the LZ proxy in; bounded to the sample cadence so it stays
   affordable even at 131072 programs. Ignored (with a stderr note) under `--no-samples`.
+  Under a sparse `--signal-interval` it stays independent and never broadens: the LZ
+  proxy runs only where an emission point (`--sample-interval`) and a measured epoch
+  (`--signal-interval`) coincide — i.e. a subset of what a per-epoch run would compute —
+  and never on an epoch where signals were not measured at all. The final epoch is always
+  both, so `finalCompressionProxyRatio` is still populated when `--compression` is on.
 
 ## Entropy kinetics
 
@@ -111,6 +117,40 @@ existing per-program mean), ΔH from the initial soup, and — for each `--delta
 level — the **epoch** and **wall/GPU ms** at which ΔH first reached it (epoch is the
 deterministic figure; the ms includes warmup). `--sample-interval N` emits a per-epoch
 kinetics sample every `N` epochs (plus the final), bounding output at large soups.
+
+### Two independent cadences: `--sample-interval` vs `--signal-interval`
+
+These are **distinct** knobs and are not interchangeable:
+
+- **`--sample-interval N`** — *JSON emission* cadence. A per-epoch kinetics `samples[]`
+  entry is written every `N` epochs (plus the final epoch). It only decides which
+  measured epochs are *reported*; it does not change what is measured. Default `1`.
+- **`--signal-interval N`** — *signal-measurement* cadence (cadence-only signal
+  analysis). It decides at which epochs the entropy/transition (and, when `--compression`
+  is on, LZ) signals are **measured at all**. Default `1` = every epoch, the exact
+  per-epoch trajectory. With `N > 1` signals are measured at, and only at:
+  1. **epoch 0**, before any mutation/evaluation (the ΔH reference — always measured);
+  2. **every `N`th completed epoch**;
+  3. **the final completed epoch**, even when the total is not divisible by `N`.
+
+  It is a pure measurement gate: skipping a measurement never touches the evaluator, the
+  RNG, the soup, the counters, or the digest — a sparse run's `finalDigest` and all
+  counters are byte-for-byte identical to a per-epoch or `--no-samples` run. It is
+  ignored under `--no-samples` (nothing is measured then) with a stderr note.
+
+**Interaction.** A `samples[]` entry is emitted for an epoch only when it is *both* an
+emission point (`--sample-interval`) *and* an epoch that carries a measurement
+(`--signal-interval`). With a sparse signal interval the reported samples are therefore
+the intersection — always including epoch-0's reference kinetics and the final epoch.
+The signal cadence is a **CLI-only** control: it changes which epochs carry samples but
+adds **no** JSON key (the schema-2 key set, including `config.sampleInterval`, is
+unchanged).
+
+**ΔH thresholds require per-epoch signals.** Exact ΔH-threshold epochs can only be
+resolved from the full per-epoch trajectory, so `--delta-h-thresholds` is **incompatible
+with a sparse `--signal-interval` (`> 1`)** and the combination is rejected as a usage
+error (exit `64`) with a message naming both options. Use `--signal-interval 1` (the
+default) for ΔH thresholds, or drop `--delta-h-thresholds` for cadence-only analysis.
 
 ## Native commands (Apple M4 Max)
 
@@ -167,6 +207,17 @@ swift run -c release bff-metal-bench \
   --programs 65536 --seed 1 --warmup 2 --epochs 200 \
   --init constant --delta-h-thresholds 0.25,0.5,1.0 --sample-interval 10 \
   > kinetics-constant.json
+```
+
+Cadence-only signal analysis at a very large soup: measure entropy only every 25 epochs
+(plus epoch 0 and the final epoch) to bound host analysis cost, with no ΔH thresholds
+(they need per-epoch signals and are rejected under a sparse `--signal-interval`):
+
+```sh
+swift run -c release bff-metal-bench \
+  --programs 131072 --seed 1 --warmup 2 --epochs 200 \
+  --init opcode --signal-interval 25 \
+  > kinetics-sparse.json
 ```
 
 ### Shadow-on correctness spot checks

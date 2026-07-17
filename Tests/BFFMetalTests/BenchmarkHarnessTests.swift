@@ -327,6 +327,242 @@ final class BenchmarkHarnessTests: XCTestCase {
         XCTAssertNotNil(result.finalCompressionProxyRatio)
     }
 
+    // MARK: - Sparse signal-analysis cadence (--signal-interval)
+
+    /// Build a runner invocation over the CPU reference that records, per epoch, whether
+    /// signals were measured. Returns (result, epochsMeasured, compressionEpochs) where
+    /// the epoch lists are the *completed* epoch indices at which the closure ran /
+    /// requested compression. The epoch-0 (initial) measurement is counted separately
+    /// via `initialMeasured`.
+    private struct CadenceProbe {
+        var result: BenchmarkResult
+        var totalCalls: Int
+        var initialMeasured: Bool
+        var perEpochSignalEpochs: [Int]     // sample epochs that carried signals
+        var compressionCalls: Int
+    }
+
+    /// Drive the real `BenchmarkRunner` with a synthetic clock and a probe closure.
+    /// `sampleInterval == 1` so every measured epoch that carries signals surfaces as a
+    /// sample, letting the test read the measurement cadence off `result.samples`.
+    private func runCadence(seed: UInt32 = 11, programCount: Int = 24,
+                            warmup: Int, measured: Int,
+                            signalInterval: Int, sampleInterval: Int = 1,
+                            thresholds: [Double] = [],
+                            compression: Bool = false) throws -> CadenceProbe {
+        let cfg = BenchmarkConfig(seed: seed, programCount: programCount,
+                                  mutationP32: 1 << 22, initMode: .opcode,
+                                  warmupEpochs: warmup, measuredEpochs: measured,
+                                  deltaHThresholds: thresholds,
+                                  sampleInterval: sampleInterval)
+        let soupConfig = try cfg.soupConfig()
+        var totalCalls = 0
+        var compressionCalls = 0
+        var clock = 0.0
+        let result = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil,
+            options: .init(analyzeSignals: true, includeCompression: compression,
+                           signalInterval: signalInterval),
+            readMaxRSSBytes: { nil },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                totalCalls += 1
+                if includeComp { compressionCalls += 1 }
+                return SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                           includeCompression: includeComp)
+            })
+        return CadenceProbe(result: result, totalCalls: totalCalls,
+                            initialMeasured: result.initialEntropyBitsPerByte != nil,
+                            perEpochSignalEpochs: result.samples.map(\.epoch),
+                            compressionCalls: compressionCalls)
+    }
+
+    /// Signals are measured at exactly: epoch 0 (initial), every Nth completed epoch,
+    /// and the final completed epoch — and nowhere else.
+    func testSignalIntervalMeasuresExactCadence() throws {
+        // warmup 1 + measured 8 = 9 total, N = 4: completed 4, 8, then 9 (final).
+        let p = try runCadence(warmup: 1, measured: 8, signalInterval: 4)
+        XCTAssertTrue(p.initialMeasured, "epoch-0 reference is always measured")
+        XCTAssertEqual(p.perEpochSignalEpochs, [4, 8, 9],
+                       "measured at every 4th completed epoch plus the final epoch")
+        // Total closure calls = initial (1) + the three cadence epochs.
+        XCTAssertEqual(p.totalCalls, 1 + 3)
+        XCTAssertTrue(p.result.signalsAnalyzed, "sparse cadence still counts as analyzed")
+    }
+
+    /// Epoch 0 is captured before any mutation/evaluation: the initial reference equals
+    /// a direct measurement of the un-evolved opcode soup.
+    func testSignalIntervalCapturesEpochZeroBeforeMutation() throws {
+        let cfg = BenchmarkConfig(seed: 7, programCount: 16, mutationP32: 1 << 22,
+                                  initMode: .opcode, warmupEpochs: 0, measuredEpochs: 5,
+                                  sampleInterval: 1)
+        let soupConfig = try cfg.soupConfig()
+        let pristine = SoupRunner(config: soupConfig).soup
+        let expectedInitialH = SoupSignals.measure(
+            soup: pristine, programCount: cfg.programCount,
+            includeCompression: false).entropyBitsPerByte
+
+        var clock = 0.0
+        let result = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil,
+            options: .init(analyzeSignals: true, includeCompression: false,
+                           signalInterval: 3),
+            readMaxRSSBytes: { nil },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                    includeCompression: includeComp)
+            })
+        XCTAssertEqual(result.initialEntropyBitsPerByte!, expectedInitialH, accuracy: 1e-12,
+                       "epoch-0 reference is the pre-mutation soup, measured before the loop")
+    }
+
+    /// The final completed epoch is always measured even when the total is not divisible
+    /// by the signal interval.
+    func testSignalIntervalCapturesFinalEpochWhenNotDivisible() throws {
+        // warmup 0 + measured 10 = 10 total, N = 4: completed 4, 8, then 10 (final,
+        // 10 % 4 != 0 but still captured).
+        let p = try runCadence(warmup: 0, measured: 10, signalInterval: 4)
+        XCTAssertEqual(p.perEpochSignalEpochs, [4, 8, 10])
+        XCTAssertEqual(p.perEpochSignalEpochs.last, 10, "final epoch captured off-cadence")
+        XCTAssertNotNil(p.result.finalEntropyBitsPerByte)
+        XCTAssertNotNil(p.result.finalDeltaH)
+    }
+
+    /// ΔH thresholds require the per-epoch trajectory; a sparse interval is rejected as
+    /// a usage error, while per-epoch (interval 1) and no-threshold cases are allowed.
+    func testValidateSignalCadenceRejectsSparseWithThresholds() {
+        XCTAssertThrowsError(try validateSignalCadence(signalInterval: 10,
+                                                       deltaHThresholdCount: 2)) { error in
+            XCTAssertEqual(error as? SignalCadenceError,
+                           .thresholdsRequirePerEpochSignals(signalInterval: 10))
+        }
+        // Per-epoch signals + thresholds: allowed.
+        XCTAssertNoThrow(try validateSignalCadence(signalInterval: 1,
+                                                   deltaHThresholdCount: 2))
+        // Sparse interval, no thresholds: allowed (cadence-only analysis).
+        XCTAssertNoThrow(try validateSignalCadence(signalInterval: 10,
+                                                   deltaHThresholdCount: 0))
+    }
+
+    /// A sparse trajectory equals the corresponding points of a per-epoch trajectory for
+    /// the same deterministic run: signal measurement is a read-only side computation,
+    /// so the soup evolution — and thus every measured value at a shared epoch — is
+    /// identical. (Compression off to isolate the entropy/transition trajectory.)
+    func testSparseTrajectoryMatchesPerEpochAtSharedEpochs() throws {
+        let dense = try runCadence(warmup: 1, measured: 12, signalInterval: 1)
+        let sparse = try runCadence(warmup: 1, measured: 12, signalInterval: 5)
+
+        // Same run => identical soup fingerprint regardless of measurement cadence.
+        XCTAssertEqual(dense.result.finalDigest, sparse.result.finalDigest)
+
+        let denseByEpoch = Dictionary(uniqueKeysWithValues:
+            dense.result.samples.map { ($0.epoch, $0) })
+        XCTAssertFalse(sparse.result.samples.isEmpty)
+        // Sparse epochs are a strict subset of the dense (every-epoch) sample epochs.
+        for s in sparse.result.samples {
+            guard let d = denseByEpoch[s.epoch] else {
+                return XCTFail("sparse epoch \(s.epoch) missing from the per-epoch run")
+            }
+            XCTAssertEqual(s.entropyBitsPerByte, d.entropyBitsPerByte, accuracy: 1e-12,
+                           "entropy at epoch \(s.epoch) must match the per-epoch value")
+            XCTAssertEqual(s.meanProgramEntropyBitsPerByte,
+                           d.meanProgramEntropyBitsPerByte, accuracy: 1e-12)
+            XCTAssertEqual(s.deltaHFromInitial, d.deltaHFromInitial, accuracy: 1e-12)
+            XCTAssertEqual(s.transitionRate, d.transitionRate, accuracy: 1e-12)
+        }
+        // Sparse initial/final kinetics equal the per-epoch ones (both measure epoch 0
+        // and the final epoch).
+        XCTAssertEqual(sparse.result.initialEntropyBitsPerByte!,
+                       dense.result.initialEntropyBitsPerByte!, accuracy: 1e-12)
+        XCTAssertEqual(sparse.result.finalEntropyBitsPerByte!,
+                       dense.result.finalEntropyBitsPerByte!, accuracy: 1e-12)
+        XCTAssertEqual(sparse.result.finalDeltaH!, dense.result.finalDeltaH!,
+                       accuracy: 1e-12)
+    }
+
+    /// The soup fingerprint, aggregate counters, and throughput denominators are
+    /// byte-for-byte identical across the default (per-epoch), sparse, and disabled
+    /// (`--no-samples`) analysis policies: signal analysis never perturbs the simulation.
+    func testDigestAndCountersIdenticalAcrossAnalysisPolicies() throws {
+        let cfg = BenchmarkConfig(seed: 21, programCount: 32, mutationP32: 1 << 22,
+                                  initMode: .opcode, warmupEpochs: 1, measuredEpochs: 9,
+                                  sampleInterval: 1)
+        let soupConfig = try cfg.soupConfig()
+
+        func run(_ options: BenchmarkRunner.Options) throws -> BenchmarkResult {
+            var clock = 0.0
+            return try BenchmarkRunner.run(
+                config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+                deviceName: nil, options: options, readMaxRSSBytes: { nil },
+                now: { clock += 0.001; return clock },
+                gpuSecondsAfterEpoch: { nil },
+                measureSignals: { soup, includeComp in
+                    SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                        includeCompression: includeComp)
+                })
+        }
+
+        let dense = try run(.init(analyzeSignals: true, includeCompression: false,
+                                  signalInterval: 1))
+        let sparse = try run(.init(analyzeSignals: true, includeCompression: false,
+                                   signalInterval: 4))
+        let disabled = try run(.throughputOnly)
+
+        for other in [sparse, disabled] {
+            XCTAssertEqual(dense.finalDigest, other.finalDigest, "digest must match")
+            XCTAssertEqual(dense.totalPairs, other.totalPairs)
+            XCTAssertEqual(dense.totalRawSteps, other.totalRawSteps)
+            XCTAssertEqual(dense.totalCommandSteps, other.totalCommandSteps)
+            XCTAssertEqual(dense.totalCopyWrites, other.totalCopyWrites)
+            XCTAssertEqual(dense.haltBudget, other.haltBudget)
+            XCTAssertEqual(dense.haltPCOut, other.haltPCOut)
+            XCTAssertEqual(dense.haltUnmatched, other.haltUnmatched)
+            XCTAssertEqual(dense.haltUnknown, other.haltUnknown)
+            XCTAssertEqual(dense.measuredEpochs, other.measuredEpochs)
+        }
+        // Policies differ only in whether/where kinetics were computed.
+        XCTAssertTrue(dense.signalsAnalyzed)
+        XCTAssertTrue(sparse.signalsAnalyzed)
+        XCTAssertFalse(disabled.signalsAnalyzed)
+    }
+
+    /// Compression stays independent of the signal cadence and never broadens: with a
+    /// sparse interval the LZ proxy runs only where an emission point and a measured
+    /// epoch coincide, so it runs no more often than a per-epoch run would — and never
+    /// on an epoch where signals were not measured at all.
+    func testCompressionIndependentAndBoundedUnderSparseSignals() throws {
+        // warmup 0 + measured 12, signalInterval 4 => signals at 4, 8, 12(final).
+        // sampleInterval 1 => every measured epoch is an emission point, so compression
+        // is requested at each signal epoch (+ the initial reference).
+        let sparse = try runCadence(warmup: 0, measured: 12, signalInterval: 4,
+                                    sampleInterval: 1, compression: true)
+        XCTAssertEqual(sparse.perEpochSignalEpochs, [4, 8, 12])
+        // Compression calls: initial (1) + the three measured signal epochs = 4.
+        XCTAssertEqual(sparse.compressionCalls, 1 + 3)
+        // Never exceeds total measurements (LZ is a strict subset of measurements).
+        XCTAssertLessThanOrEqual(sparse.compressionCalls, sparse.totalCalls)
+        XCTAssertNotNil(sparse.result.finalCompressionProxyRatio,
+                        "the final epoch is always both a signal point and a sample point")
+
+        // A per-epoch run with the SAME emission cadence computes LZ at least as often —
+        // sparse never broadens LZ work.
+        let dense = try runCadence(warmup: 0, measured: 12, signalInterval: 1,
+                                   sampleInterval: 1, compression: true)
+        XCTAssertGreaterThanOrEqual(dense.compressionCalls, sparse.compressionCalls,
+                                    "sparse analysis must not run LZ more than per-epoch does")
+
+        // And compression truly stays opt-in: with it off, the proxy is never requested.
+        let noComp = try runCadence(warmup: 0, measured: 12, signalInterval: 4,
+                                    sampleInterval: 1, compression: false)
+        XCTAssertEqual(noComp.compressionCalls, 0, "LZ proxy never runs without --compression")
+        XCTAssertNil(noComp.result.finalCompressionProxyRatio)
+    }
+
     // MARK: - Machine-readable contract
 
     /// The JSON must carry every field the benchmark spec requires, and encode
@@ -360,6 +596,30 @@ final class BenchmarkHarnessTests: XCTestCase {
                     "\"finalDigest\"", "\"samples\""] {
             XCTAssertTrue(json.contains(key), "missing \(key) in result JSON")
         }
+    }
+
+    /// The signal-measurement cadence is a CLI-only control: it must NOT add a JSON key
+    /// anywhere in the machine-readable result (schema 2 key set is frozen). The nested
+    /// `config` object in particular must not gain a `signalInterval` field.
+    func testSignalIntervalAddsNoJSONKey() throws {
+        let one = [outcome(steps: 10, noop: 2, halt: .budget, copy: 1)]
+        let obs = [observation(epoch: 1, warmup: false, wall: 0.1, gpu: 0.05,
+                               outcomes: one, h: 2.0, analysis: 0.002)]
+        let cfg = BenchmarkConfig(seed: 1, programCount: 2, warmupEpochs: 0,
+                                  measuredEpochs: 1)
+        let initial = SoupSignals(entropyBitsPerByte: 1.5,
+                                  meanProgramEntropyBitsPerByte: 1.5,
+                                  transitionRate: 0.4, compressionProxyRatio: 0.8)
+        let r = BenchmarkAggregator.aggregate(config: cfg, deviceName: "dev",
+                                              initialSignals: initial, observations: obs,
+                                              finalDigestHex: "00", maxRSSBytes: 42)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let json = String(decoding: try encoder.encode(r), as: UTF8.self)
+        XCTAssertFalse(json.contains("signalInterval"),
+                       "the signal cadence must not appear in the JSON schema")
+        // The documented emission-cadence key `sampleInterval` is unchanged/present.
+        XCTAssertTrue(json.contains("\"sampleInterval\""))
     }
 
     // MARK: - End-to-end over the CPU reference (no GPU)

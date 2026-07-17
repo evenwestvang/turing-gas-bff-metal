@@ -130,6 +130,64 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         XCTAssertEqual(ignored.status, 2)
         #endif
     }
+
+    // MARK: - --signal-interval cadence: parsing, propagation, exit-code policy
+
+    /// A sparse `--signal-interval` combined with `--delta-h-thresholds` is a usage
+    /// error (exit 64), decided during argument validation — before any Metal work — on
+    /// every platform. Per-epoch `--signal-interval 1` with thresholds is accepted.
+    func testSignalIntervalWithThresholdsIsUsageError64() throws {
+        let bad = try runBench(["--programs", "2", "--seed", "1",
+                                "--warmup", "0", "--epochs", "4",
+                                "--signal-interval", "2",
+                                "--delta-h-thresholds", "0.1,0.5"])
+        XCTAssertEqual(bad.status, 64, "sparse signals + ΔH thresholds must be a usage error")
+        XCTAssertTrue(bad.stderr.contains("--delta-h-thresholds")
+                      && bad.stderr.contains("--signal-interval"),
+                      "usage error names both incompatible options")
+
+        // Non-positive interval is also a usage error.
+        let zero = try runBench(["--programs", "2", "--seed", "1",
+                                 "--warmup", "0", "--epochs", "1",
+                                 "--signal-interval", "0"])
+        XCTAssertEqual(zero.status, 64)
+
+        // Per-epoch signals + thresholds: NOT a usage error (accepted).
+        let ok = try runBench(["--programs", "2", "--seed", "1",
+                               "--warmup", "0", "--epochs", "4",
+                               "--signal-interval", "1",
+                               "--delta-h-thresholds", "0.1"])
+        XCTAssertNotEqual(ok.status, 64, "per-epoch signals with thresholds is allowed")
+    }
+
+    /// Cadence-only signal analysis (sparse interval, no thresholds) is accepted and the
+    /// resolved interval is propagated. On a non-Metal host the would-run echo carries it.
+    func testSignalIntervalPropagatesWhenCadenceOnly() throws {
+        let r = try runBench(["--programs", "2", "--seed", "1",
+                              "--warmup", "0", "--epochs", "6",
+                              "--signal-interval", "3"])
+        #if canImport(Metal)
+        let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2)
+        XCTAssertNotEqual(r.status, 64, "cadence-only analysis is not a usage error")
+        #else
+        XCTAssertEqual(r.status, 2, "cadence-only signal analysis does not change the exit code")
+        XCTAssertTrue(r.stderr.contains("signalInterval=3"),
+                      "--signal-interval propagated to the resolved config")
+        #endif
+    }
+
+    /// `--signal-interval` under `--no-samples` is accepted but explicitly ignored.
+    func testSignalIntervalIgnoredUnderNoSamples() throws {
+        let r = try runBench(["--programs", "2", "--seed", "1",
+                              "--warmup", "0", "--epochs", "4",
+                              "--no-samples", "--signal-interval", "2"])
+        XCTAssertTrue(r.stderr.contains("--signal-interval is ignored under --no-samples"),
+                      "signal-interval-under-no-samples emits the documented note")
+        #if !canImport(Metal)
+        XCTAssertEqual(r.status, 2)
+        #endif
+    }
 }
 
 /// Local mirror of the documented exit codes, so the Metal-host branch above can name
