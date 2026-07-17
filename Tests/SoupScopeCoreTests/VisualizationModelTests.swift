@@ -187,6 +187,61 @@ final class VisualizationModelTests: XCTestCase {
         XCTAssertEqual(LODModel.smoothstep(0, 1, .nan), 0)
     }
 
+    // MARK: - LOD readout: the values the HUD displays, at the transition endpoints
+
+    func testLODReadoutBlendsAtTransitionEndpoints() {
+        let lod = LODModel()
+        func readout(_ px: Double) -> LODReadout {
+            LODReadout(camera: Camera(bytePx: px), lod: lod)
+        }
+        // Macro↔micro crossfade endpoints: fully macro at macroStart, fully micro at
+        // macroEnd, and exactly half-and-half at the smoothstep midpoint.
+        let atMacroStart = readout(lod.macroStart)
+        XCTAssertEqual(atMacroStart.microBlend, 0, accuracy: 1e-9)
+        XCTAssertEqual(atMacroStart.macroBlend, 1, accuracy: 1e-9)
+        let atMacroEnd = readout(lod.macroEnd)
+        XCTAssertEqual(atMacroEnd.microBlend, 1, accuracy: 1e-9)
+        XCTAssertEqual(atMacroEnd.macroBlend, 0, accuracy: 1e-9)
+        let atMacroMid = readout((lod.macroStart + lod.macroEnd) / 2)
+        XCTAssertEqual(atMacroMid.microBlend, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(atMacroMid.macroBlend, 0.5, accuracy: 1e-9)
+
+        // Glyph overlay endpoints: invisible at glyphStart, opaque at glyphEnd,
+        // partial in between.
+        XCTAssertEqual(readout(lod.glyphStart).glyphBlend, 0, accuracy: 1e-9)
+        XCTAssertEqual(readout(lod.glyphEnd).glyphBlend, 1, accuracy: 1e-9)
+        let glyphMid = readout((lod.glyphStart + lod.glyphEnd) / 2).glyphBlend
+        XCTAssertGreaterThan(glyphMid, 0)
+        XCTAssertLessThan(glyphMid, 1)
+
+        // bytePx is the camera's, verbatim; macro is exactly the complement of micro
+        // across the whole range, including the endpoints above.
+        for px in [0.1, lod.macroStart, 1.0, lod.macroEnd, 5, lod.glyphStart, 15,
+                   lod.glyphEnd, 96] {
+            let r = readout(px)
+            XCTAssertEqual(r.bytePx, px)
+            XCTAssertEqual(r.macroBlend, 1 - r.microBlend, accuracy: 1e-12)
+        }
+    }
+
+    func testLODReadoutMatchesTheRenderUniformStateAtBoundaries() {
+        // The HUD readout and the shader's uniforms are one evaluation of the shared
+        // LODModel at the camera's bytePx: the displayed values are byte-for-byte the
+        // uploaded ones, so the HUD can never drift from what is rendered.
+        let lod = LODModel()
+        let grid = ProgramGrid(programCount: 1024)
+        for px in [lod.macroStart, lod.macroEnd, lod.glyphStart, lod.glyphEnd, 1.0, 15.0] {
+            let camera = Camera(bytePx: px)
+            let readout = LODReadout(camera: camera, lod: lod)
+            let u = VizLayout.makeUniforms(camera: camera, grid: grid, lod: lod,
+                                           metricChannel: 2,
+                                           viewPxWidth: 800, viewPxHeight: 600)
+            XCTAssertEqual(u.bytePx, Float(readout.bytePx))
+            XCTAssertEqual(u.microBlend, Float(readout.microBlend))
+            XCTAssertEqual(u.glyphBlend, Float(readout.glyphBlend))
+        }
+    }
+
     // MARK: - Metric normalization boundaries
 
     func testNormalizationFixedBoundsAndClamping() {

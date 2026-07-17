@@ -11,6 +11,7 @@ struct ContentView: View {
             SoupMetalView(appModel: appModel)
                 .ignoresSafeArea()
             HUDView(hud: appModel.hud,
+                    lod: appModel.lodReadout,
                     metricChannel: appModel.metricChannel,
                     running: appModel.isRunning)
         }

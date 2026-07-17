@@ -6,6 +6,7 @@ import SoupScopeCore
 /// no profiling UI. Reads the published `HUDModel`.
 struct HUDView: View {
     let hud: HUDModel
+    let lod: LODReadout
     let metricChannel: UInt32
     let running: Bool
 
@@ -31,6 +32,9 @@ struct HUDView: View {
             Text("halt  budget \(hud.haltBudget)  pcOut \(hud.haltPCOut)  "
                  + "unmatched \(hud.haltUnmatched)  unknown \(hud.haltUnknown)")
             Text("copyWrites \(hud.copyWrites)   channel \(channelName)")
+            Text("zoom \(f(lod.bytePx, 2)) px/byte   "
+                 + "macro/micro \(f(lod.macroBlend, 2))/\(f(lod.microBlend, 2))   "
+                 + "glyph \(f(lod.glyphBlend, 2))")
             Text("shadow checked \(hud.shadowChecked)  mismatch \(hud.shadowMismatch)")
             Text("programs \(hud.programCount)   \(hud.deviceName)")
             if let error = hud.errorState {

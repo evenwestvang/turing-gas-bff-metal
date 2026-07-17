@@ -42,19 +42,21 @@ public enum VizLayout {
     public static var probeWordCount: Int { 14 }
 
     /// Build the per-frame uniforms from the current transform and layout. The LOD
-    /// blend factors are evaluated here (from the shared `LODModel`) so the shader
-    /// receives the tested values rather than re-deriving thresholds.
+    /// blend factors are evaluated here (from the shared `LODModel`, via `LODReadout`)
+    /// so the shader receives the tested values rather than re-deriving thresholds —
+    /// and the HUD reads the same `LODReadout`, so the two can never disagree.
     public static func makeUniforms(camera: Camera, grid: ProgramGrid, lod: LODModel,
                                     metricChannel: UInt32,
                                     viewPxWidth: Double, viewPxHeight: Double) -> VizUniforms {
-        VizUniforms(
+        let readout = LODReadout(camera: camera, lod: lod)
+        return VizUniforms(
             viewportPxX: Float(viewPxWidth),
             viewportPxY: Float(viewPxHeight),
             originByteX: Float(camera.originByteX),
             originByteY: Float(camera.originByteY),
-            bytePx: Float(camera.bytePx),
-            microBlend: Float(lod.microBlend(bytePx: camera.bytePx)),
-            glyphBlend: Float(lod.glyphBlend(bytePx: camera.bytePx)),
+            bytePx: Float(readout.bytePx),
+            microBlend: Float(readout.microBlend),
+            glyphBlend: Float(readout.glyphBlend),
             gridWidth: UInt32(grid.width),
             gridHeight: UInt32(grid.height),
             programCount: UInt32(grid.programCount),

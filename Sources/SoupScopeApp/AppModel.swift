@@ -197,6 +197,11 @@ final class AppModel: ObservableObject {
                                viewPxWidth: drawablePxW, viewPxHeight: drawablePxH)
     }
 
+    /// The LOD readout for the current frame — the same camera/LOD evaluation
+    /// `makeUniforms` feeds the shader, surfaced for the HUD so the displayed
+    /// zoom/blend values are exactly what is being rendered.
+    var lodReadout: LODReadout { LODReadout(camera: camera, lod: lod) }
+
     // MARK: - Bounded native validation
     //
     // `--validation-seconds` must terminate finitely even if the MTKView never gets
