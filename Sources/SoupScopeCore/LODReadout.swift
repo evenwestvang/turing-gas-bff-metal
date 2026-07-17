@@ -24,4 +24,21 @@ public struct LODReadout: Equatable, Sendable {
         self.microBlend = lod.microBlend(bytePx: px)
         self.glyphBlend = lod.glyphBlend(bytePx: px)
     }
+
+    /// The readout for the frame currently being submitted, paired with whether it
+    /// differs from `current` — the readout the HUD is already showing.
+    ///
+    /// The render path calls this exactly once per frame: the returned `readout`
+    /// feeds the uniforms (`VizLayout.makeUniforms`) *and*, when `changed`, becomes
+    /// the new observable HUD readout. Because it is a single evaluation, the HUD and
+    /// the shader consume the same value and cannot drift. A camera-only zoom/pan —
+    /// which never advances the epoch or touches the published HUD model, e.g. while
+    /// paused — still reports `changed`, so the HUD refreshes; a steady camera reports
+    /// `changed == false`, so the caller publishes nothing and cannot spin a SwiftUI
+    /// update loop.
+    public static func forFrame(camera: Camera, lod: LODModel, current: LODReadout)
+        -> (readout: LODReadout, changed: Bool) {
+        let readout = LODReadout(camera: camera, lod: lod)
+        return (readout, readout != current)
+    }
 }

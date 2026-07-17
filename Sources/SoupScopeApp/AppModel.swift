@@ -29,6 +29,15 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var hud: HUDModel
 
+    /// The LOD readout of the most recently submitted render frame — the exact
+    /// `LODReadout` that fed the shader uniforms, surfaced for the HUD so the
+    /// displayed zoom/blend values are byte-for-byte what is being rendered. It is
+    /// `@Published` (not a computed re-evaluation) so a camera-only zoom/pan, which
+    /// never advances an epoch or mutates `hud`, still refreshes the HUD — including
+    /// while paused. Updated only from `makeUniforms`, and only when the value
+    /// actually changed, so it never spins a redundant SwiftUI update.
+    @Published private(set) var lodReadout: LODReadout
+
     let context: SharedMetalContext?
     private var runner: SoupRunner
     private(set) var lastSnapshot: RenderSnapshot?
@@ -91,6 +100,7 @@ final class AppModel: ObservableObject {
                                   programCount: resolvedConfig.programCount)
         initialHUD.setError(startupError)
         self.hud = initialHUD
+        self.lodReadout = LODReadout(camera: camera, lod: lod)
 
         self.lastSnapshot = try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
                                                         soup: runner.soup)
@@ -190,17 +200,19 @@ final class AppModel: ObservableObject {
         objectWillChange.send()
     }
 
-    /// The uniforms for the current frame.
+    /// The uniforms for the current frame. Evaluates the frame's `LODReadout` once
+    /// (the single source shared with the HUD), publishes it as the observable HUD
+    /// readout when it changed since the last frame, and builds the uniforms from that
+    /// same readout — so the HUD shows exactly what the shader is blending and a
+    /// camera-only change refreshes the HUD even while paused, with no redundant
+    /// SwiftUI update when the camera is steady.
     func makeUniforms() -> VizUniforms {
-        VizLayout.makeUniforms(camera: camera, grid: grid, lod: lod,
-                               metricChannel: metricChannel,
-                               viewPxWidth: drawablePxW, viewPxHeight: drawablePxH)
+        let frame = LODReadout.forFrame(camera: camera, lod: lod, current: lodReadout)
+        if frame.changed { lodReadout = frame.readout }
+        return VizLayout.makeUniforms(readout: frame.readout, camera: camera, grid: grid,
+                                      metricChannel: metricChannel,
+                                      viewPxWidth: drawablePxW, viewPxHeight: drawablePxH)
     }
-
-    /// The LOD readout for the current frame — the same camera/LOD evaluation
-    /// `makeUniforms` feeds the shader, surfaced for the HUD so the displayed
-    /// zoom/blend values are exactly what is being rendered.
-    var lodReadout: LODReadout { LODReadout(camera: camera, lod: lod) }
 
     // MARK: - Bounded native validation
     //

@@ -225,21 +225,66 @@ final class VisualizationModelTests: XCTestCase {
     }
 
     func testLODReadoutMatchesTheRenderUniformStateAtBoundaries() {
-        // The HUD readout and the shader's uniforms are one evaluation of the shared
-        // LODModel at the camera's bytePx: the displayed values are byte-for-byte the
-        // uploaded ones, so the HUD can never drift from what is rendered.
+        // The HUD readout and the shader's uniforms are the SAME `LODReadout`
+        // instance: `makeUniforms` builds the uniform block straight from the readout
+        // it is handed, so every LOD field is byte-for-byte the uploaded one and the
+        // HUD can never drift from what is rendered.
         let lod = LODModel()
         let grid = ProgramGrid(programCount: 1024)
         for px in [lod.macroStart, lod.macroEnd, lod.glyphStart, lod.glyphEnd, 1.0, 15.0] {
             let camera = Camera(bytePx: px)
             let readout = LODReadout(camera: camera, lod: lod)
-            let u = VizLayout.makeUniforms(camera: camera, grid: grid, lod: lod,
+            let u = VizLayout.makeUniforms(readout: readout, camera: camera, grid: grid,
                                            metricChannel: 2,
                                            viewPxWidth: 800, viewPxHeight: 600)
             XCTAssertEqual(u.bytePx, Float(readout.bytePx))
             XCTAssertEqual(u.microBlend, Float(readout.microBlend))
             XCTAssertEqual(u.glyphBlend, Float(readout.glyphBlend))
         }
+    }
+
+    func testRenderUniformPathUpdatesCurrentReadoutOnCameraChange() {
+        // The render-uniform path (`LODReadout.forFrame` + `makeUniforms`) is the one
+        // place the frame's readout is evaluated. It must (a) report a change when the
+        // camera moves — even a camera-only change with nothing else advancing, i.e. a
+        // paused frame — so the observable HUD readout tracks it, (b) feed the uniforms
+        // the exact readout it reports, and (c) report NO change for a steady camera so
+        // the caller never publishes a redundant SwiftUI update.
+        let lod = LODModel()
+        let grid = ProgramGrid(programCount: 1024)
+
+        // Model the AppModel's published state: the readout the HUD currently shows.
+        var current = LODReadout(camera: Camera(bytePx: 1.0), lod: lod)
+
+        // A paused-equivalent, camera-only change: only the camera differs (no epoch
+        // advance, no HUD-model mutation). The path must still see it as changed.
+        let zoomed = Camera(bytePx: 4.0)
+        let frame1 = LODReadout.forFrame(camera: zoomed, lod: lod, current: current)
+        XCTAssertTrue(frame1.changed, "a camera-only zoom must update the HUD readout")
+        XCTAssertEqual(frame1.readout, LODReadout(camera: zoomed, lod: lod))
+        if frame1.changed { current = frame1.readout }        // the publish the caller does
+        XCTAssertEqual(current, LODReadout(camera: zoomed, lod: lod),
+                       "the current/observable readout now equals the submitted frame's")
+
+        // The uniforms for that frame are built from the very readout just reported,
+        // so the HUD's `current` and the uploaded LOD fields are the same evaluation.
+        let u = VizLayout.makeUniforms(readout: frame1.readout, camera: zoomed, grid: grid,
+                                       metricChannel: 2, viewPxWidth: 800, viewPxHeight: 600)
+        XCTAssertEqual(u.bytePx, Float(current.bytePx))
+        XCTAssertEqual(u.microBlend, Float(current.microBlend))
+        XCTAssertEqual(u.glyphBlend, Float(current.glyphBlend))
+
+        // A steady camera on the next frame yields no change, so no redundant publish
+        // (and hence no SwiftUI update loop).
+        let frame2 = LODReadout.forFrame(camera: zoomed, lod: lod, current: current)
+        XCTAssertFalse(frame2.changed, "an unchanged camera must not trigger a HUD update")
+        XCTAssertEqual(frame2.readout, current)
+
+        // A pan-only move that leaves bytePx unchanged does not change the LOD readout
+        // (the readout is a function of zoom, not pan) — again no redundant publish.
+        let panned = Camera(originByteX: 42, originByteY: 7, bytePx: zoomed.bytePx)
+        let frame3 = LODReadout.forFrame(camera: panned, lod: lod, current: current)
+        XCTAssertFalse(frame3.changed, "pan at the same zoom leaves the LOD readout intact")
     }
 
     // MARK: - Metric normalization boundaries
