@@ -51,13 +51,22 @@ public enum BenchmarkRunner {
         evaluator: E,
         deviceName: String?,
         options: Options,
-        maxRSSBytes: Int?,
+        readMaxRSSBytes: () -> Int?,
         now: () -> Double,
         gpuSecondsAfterEpoch: () -> Double?,
         measureSignals: (_ soup: [UInt8], _ includeCompression: Bool) -> SoupSignals,
         onEpoch: (EpochReport) -> Void = { _ in }
     ) throws -> BenchmarkResult {
+        // Process peak (high-water) RSS is sampled at three points and reduced to the
+        // maximum available reading: pre-cell (before any allocation for this cell),
+        // post-allocation (right after the SoupRunner is constructed), and post-cell
+        // (after the measured epochs). The value is the process high-water mark, so it
+        // is cumulative for the whole run/matrix — never cell-exclusive.
+        var rss = PeakRSSSampler()
+        rss.sample(readMaxRSSBytes())                       // pre-cell
+
         var runner = SoupRunner(config: soupConfig)
+        rss.sample(readMaxRSSBytes())                       // post-allocation
 
         // Initial (epoch-0) reference signals — only when analyzing. Timed as host
         // analysis cost, never mixed into any epoch wall.
@@ -79,8 +88,15 @@ public enum BenchmarkRunner {
                 || completed == config.totalEpochs
 
             // --- Epoch execution wall: runEpoch only ---
+            // Per-program metrics are always disabled here: the benchmark never
+            // consumes `EpochReport.metrics`, and in kinetics mode per-program entropy
+            // is measured externally (below) *outside* this wall. So the timed epoch
+            // carries mutation → pairing → packing → GPU dispatch/wait/readback →
+            // scatter → counters → digest → configured shadow, and NOT the per-program
+            // entropy/activity scan. (The FNV-1a digest is the one unavoidable O(N)
+            // timed pass; the counters are O(pairs).)
             let t0 = now()
-            let report = try runner.runEpoch(using: evaluator)
+            let report = try runner.runEpoch(using: evaluator, metrics: .disabled)
             let wall = now() - t0
             let gpu = gpuSecondsAfterEpoch()
 
@@ -103,11 +119,40 @@ public enum BenchmarkRunner {
                 signals: signals, analysisSeconds: analysisSeconds))
         }
 
+        rss.sample(readMaxRSSBytes())                       // post-cell
+
         return BenchmarkAggregator.aggregate(
             config: config, deviceName: deviceName,
             initialSignals: initialSignals, observations: observations,
             finalDigestHex: SoupDigest.hexString(runner.digest),
-            maxRSSBytes: maxRSSBytes,
+            maxRSSBytes: rss.peakBytes,
             initialAnalysisSeconds: initialAnalysisSeconds)
+    }
+}
+
+/// Accumulates process high-water RSS readings taken at several points during a
+/// benchmark cell and reports the maximum *available* one.
+///
+/// The underlying reading (`getrusage(RUSAGE_SELF).ru_maxrss`, unit-normalized by the
+/// caller) is already the process **high-water / peak** RSS — cumulative for the whole
+/// process (and therefore the whole matrix as cells run in sequence), NOT a
+/// cell-exclusive delta and NOT current resident memory. Because the OS mark is
+/// monotonic, sampling it at several points and keeping the maximum is exactly the
+/// peak; folding the samples also makes the report robust to any single reading being
+/// momentarily unavailable: a `nil` sample is ignored, and `peakBytes` is `nil` only
+/// when *every* sample was unavailable.
+public struct PeakRSSSampler: Sendable, Equatable {
+    /// Maximum available reading in bytes so far, or `nil` if none was available.
+    public private(set) var peakBytes: Int?
+
+    public init() { self.peakBytes = nil }
+    /// Seed with a known value (used by tests).
+    public init(peakBytes: Int?) { self.peakBytes = peakBytes }
+
+    /// Fold one high-water reading (bytes; `nil` = unavailable at this point) into the
+    /// running maximum. Unavailable readings never lower the peak.
+    public mutating func sample(_ reading: Int?) {
+        guard let reading else { return }
+        peakBytes = Swift.max(peakBytes ?? reading, reading)
     }
 }

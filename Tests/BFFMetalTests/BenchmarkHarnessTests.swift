@@ -232,7 +232,7 @@ final class BenchmarkHarnessTests: XCTestCase {
         var clock = 0.0
         let result = try BenchmarkRunner.run(
             config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
-            deviceName: nil, options: .throughputOnly, maxRSSBytes: nil,
+            deviceName: nil, options: .throughputOnly, readMaxRSSBytes: { nil },
             now: { clock += 0.001; return clock },
             gpuSecondsAfterEpoch: { nil },
             measureSignals: { soup, includeComp in
@@ -274,7 +274,7 @@ final class BenchmarkHarnessTests: XCTestCase {
             config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
             deviceName: nil,
             options: .init(analyzeSignals: true, includeCompression: false),
-            maxRSSBytes: nil,
+            readMaxRSSBytes: { nil },
             now: { clock += 0.001; return clock },
             gpuSecondsAfterEpoch: { nil },
             measureSignals: { soup, includeComp in
@@ -310,7 +310,7 @@ final class BenchmarkHarnessTests: XCTestCase {
             config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
             deviceName: nil,
             options: .init(analyzeSignals: true, includeCompression: true),
-            maxRSSBytes: nil,
+            readMaxRSSBytes: { nil },
             now: { clock += 0.001; return clock },
             gpuSecondsAfterEpoch: { nil },
             measureSignals: { soup, includeComp in
@@ -380,7 +380,7 @@ final class BenchmarkHarnessTests: XCTestCase {
                 config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
                 deviceName: nil,
                 options: .init(analyzeSignals: true, includeCompression: true),
-                maxRSSBytes: nil,
+                readMaxRSSBytes: { nil },
                 now: { clock += 0.01; return clock },
                 gpuSecondsAfterEpoch: { nil },
                 measureSignals: { soup, includeComp in
@@ -416,6 +416,182 @@ final class BenchmarkHarnessTests: XCTestCase {
         for s in a.samples {
             XCTAssertEqual(s.phase, s.epoch <= cfg.warmupEpochs ? "warmup" : "measured")
         }
+    }
+
+    // MARK: - Process peak RSS policy (blocker 1)
+
+    /// The factored max-aggregation policy: keep the maximum *available* reading;
+    /// ignore unavailable (`nil`) samples; report `nil` only if every sample was
+    /// unavailable. Independent of platform units (the caller normalizes those).
+    func testPeakRSSSamplerKeepsMaxAndIgnoresUnavailable() {
+        var empty = PeakRSSSampler()
+        XCTAssertNil(empty.peakBytes, "no samples -> unavailable")
+        empty.sample(nil)
+        XCTAssertNil(empty.peakBytes, "an unavailable reading stays unavailable")
+
+        var s = PeakRSSSampler()
+        s.sample(100)
+        s.sample(nil)          // unavailable must never lower the peak
+        s.sample(300)
+        s.sample(200)          // a lower reading must never lower the peak
+        XCTAssertEqual(s.peakBytes, 300)
+
+        // First reading unavailable, then a real one: peak is the real one.
+        var late = PeakRSSSampler()
+        late.sample(nil)
+        late.sample(50)
+        XCTAssertEqual(late.peakBytes, 50)
+    }
+
+    /// End-to-end through the real runner: RSS is read at pre-cell, post-allocation,
+    /// and post-cell (exactly three reads), and the reported ceiling is their maximum.
+    func testRunSamplesPeakRSSAtThreePointsAndReportsMax() throws {
+        let cfg = BenchmarkConfig(seed: 7, programCount: 8, warmupEpochs: 1,
+                                  measuredEpochs: 2)
+        let soupConfig = try cfg.soupConfig()
+
+        var readings = [100, 999, 400]      // pre, post-alloc, post-cell
+        var reads = 0
+        var clock = 0.0
+        let result = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil, options: .throughputOnly,
+            readMaxRSSBytes: { defer { reads += 1 }; return readings[reads] },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                    includeCompression: includeComp)
+            })
+        XCTAssertEqual(reads, 3, "RSS sampled exactly pre-cell, post-alloc, post-cell")
+        XCTAssertEqual(result.maxRSSBytes, 999, "reports the max high-water reading")
+
+        // All-unavailable readings collapse to nil (not a fabricated 0).
+        readings = []; reads = 0; clock = 0
+        let none = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil, options: .throughputOnly,
+            readMaxRSSBytes: { nil },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                    includeCompression: includeComp)
+            })
+        XCTAssertNil(none.maxRSSBytes)
+    }
+
+    // MARK: - Raw metrics policy (blocker 2): disabling in-epoch ProgramMetrics
+
+    /// Disabling per-program metric construction must not change the simulation: the
+    /// soup trajectory, digest, and every counter are byte-for-byte identical to a
+    /// metrics-enabled run over the same seed/config/epochs. Only `EpochReport.metrics`
+    /// differs (full vs empty), and the invocation counter proves the scan really was
+    /// skipped — not merely that the array came back empty.
+    func testMetricsDisabledPreservesDigestCountersSoupAndProvesNoScan() throws {
+        let cfg = try SoupConfig(seed: 4242, programCount: 32, mutationP32: 1 << 22,
+                                 initMode: .opcode)
+        var full = SoupRunner(config: cfg)
+        var raw = SoupRunner(config: cfg)
+        let epochs = 5
+
+        for _ in 0..<epochs {
+            let f = try full.runEpoch(using: CPUPairEvaluator(), metrics: .enabled)
+            let r = try raw.runEpoch(using: CPUPairEvaluator(), metrics: .disabled)
+
+            // Identical simulation outputs.
+            XCTAssertEqual(f.counters, r.counters, "counters must match exactly")
+            XCTAssertEqual(f.digest, r.digest, "post-epoch digest must match exactly")
+            XCTAssertEqual(f.shadowChecked, r.shadowChecked)
+            XCTAssertEqual(f.shadowMismatches.count, r.shadowMismatches.count)
+
+            // Metrics: full vs empty, only under the explicit opt-out.
+            XCTAssertEqual(f.metrics.count, cfg.programCount)
+            XCTAssertTrue(r.metrics.isEmpty, "metrics empty only under .disabled")
+        }
+
+        // Soup trajectory identical after the whole run.
+        XCTAssertEqual(full.soup, raw.soup)
+        XCTAssertEqual(full.digest, raw.digest)
+
+        // Invocation-proof seam: the scan ran every epoch when enabled, never when
+        // disabled.
+        XCTAssertEqual(full.programMetricBuildCount, epochs)
+        XCTAssertEqual(raw.programMetricBuildCount, 0,
+                       "no per-program metric construction under .disabled")
+    }
+
+    /// The default `runEpoch` policy is `.enabled`, so every existing app/oracle/CLI
+    /// caller keeps building metrics with no source change.
+    func testRunEpochDefaultsToMetricsEnabled() throws {
+        let cfg = try SoupConfig(seed: 1, programCount: 8)
+        var runner = SoupRunner(config: cfg)
+        let report = try runner.runEpoch(using: CPUPairEvaluator())
+        XCTAssertEqual(report.metrics.count, cfg.programCount)
+        XCTAssertEqual(runner.programMetricBuildCount, 1)
+    }
+
+    // MARK: - Stable schema-2 JSON: explicit nulls, no vanishing keys (blocker 4)
+
+    /// A `--no-samples` (throughput-only) run must still emit EVERY documented optional
+    /// field as an explicit JSON `null` — the keys may not disappear — and empty
+    /// collections must stay explicit `[]`. This is the machine-readable stability
+    /// contract consumers depend on.
+    func testNoSamplesResultEmitsExplicitNullsNotMissingKeys() throws {
+        let cfg = BenchmarkConfig(seed: 9, programCount: 8, warmupEpochs: 1,
+                                  measuredEpochs: 2, deltaHThresholds: [0.1])
+        let soupConfig = try cfg.soupConfig()
+        var clock = 0.0
+        let r = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil, options: .throughputOnly, readMaxRSSBytes: { nil },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                    includeCompression: includeComp)
+            })
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let json = String(decoding: try encoder.encode(r), as: UTF8.self)
+
+        // Every optional field present as an explicit null (not omitted).
+        for nullKey in ["\"gpuMsPerEpoch\":null", "\"hostResidualMsPerEpoch\":null",
+                        "\"gpuBusyFraction\":null", "\"signalAnalysisMsTotal\":null",
+                        "\"initialEntropyBitsPerByte\":null",
+                        "\"finalEntropyBitsPerByte\":null", "\"finalDeltaH\":null",
+                        "\"finalMeanProgramEntropyBitsPerByte\":null",
+                        "\"finalTransitionRate\":null",
+                        "\"finalCompressionProxyRatio\":null",
+                        "\"maxRSSBytes\":null", "\"deviceName\":null"] {
+            XCTAssertTrue(json.contains(nullKey), "expected explicit \(nullKey)")
+        }
+        // Empty collections stay explicit arrays; the always-present flag is false.
+        XCTAssertTrue(json.contains("\"thresholdCrossings\":[]"))
+        XCTAssertTrue(json.contains("\"samples\":[]"))
+        XCTAssertTrue(json.contains("\"signalsAnalyzed\":false"))
+
+        // Round-trips back to a decodable, faithful result.
+        let back = try JSONDecoder().decode(BenchmarkResult.self,
+                                            from: Data(json.utf8))
+        XCTAssertFalse(back.signalsAnalyzed)
+        XCTAssertNil(back.finalDeltaH)
+        XCTAssertNil(back.maxRSSBytes)
+        XCTAssertEqual(back.finalDigest, r.finalDigest)
+    }
+
+    /// A non-crossed ΔH threshold must still serialize its `epoch`/`wallMsToCross`/
+    /// `gpuMsToCross` as explicit nulls inside the array element.
+    func testUncrossedThresholdSerializesExplicitNulls() throws {
+        let c = ThresholdCrossing(deltaH: 5.0, crossed: false, epoch: nil,
+                                  wallMsToCross: nil, gpuMsToCross: nil)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let json = String(decoding: try encoder.encode(c), as: UTF8.self)
+        XCTAssertTrue(json.contains("\"epoch\":null"))
+        XCTAssertTrue(json.contains("\"wallMsToCross\":null"))
+        XCTAssertTrue(json.contains("\"gpuMsToCross\":null"))
     }
 
     // MARK: - Exit-code policy (blocker 5)

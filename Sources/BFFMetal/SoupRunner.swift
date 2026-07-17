@@ -57,10 +57,35 @@ public struct MetricSummary: Equatable, Sendable {
     }
 }
 
+/// Policy for the sample-only, per-program work `runEpoch` does *after* the soup is
+/// committed. It gates ONLY the derived `ProgramMetric` construction (per-program
+/// Shannon entropy + activity); it never touches mutation, pairing, evaluation,
+/// scatter, counters, the CPU shadow, or the digest, so the soup trajectory and every
+/// evaluator output are byte-for-byte identical whether metrics are collected or not.
+public struct MetricsPolicy: Sendable, Equatable {
+    /// Whether per-program `ProgramMetric` (order-0 entropy + activity) is built.
+    public var collectProgramMetrics: Bool
+    public init(collectProgramMetrics: Bool) {
+        self.collectProgramMetrics = collectProgramMetrics
+    }
+    /// Default policy — per-program metrics ON. Every existing app/oracle caller uses
+    /// this (via the `runEpoch` default), so their behavior is unchanged.
+    public static let enabled = MetricsPolicy(collectProgramMetrics: true)
+    /// Raw/throughput policy — skip per-program metric construction entirely. The
+    /// benchmark uses this: it never consumes `EpochReport.metrics`, and in kinetics
+    /// mode per-program entropy is measured externally (`SoupSignals.measure`) outside
+    /// the timed epoch, so the in-epoch scan would only duplicate that work.
+    public static let disabled = MetricsPolicy(collectProgramMetrics: false)
+}
+
 /// Everything one epoch produced: aggregate counters, per-program metrics, the
 /// CPU-shadow outcome, and the post-epoch soup digest.
 public struct EpochReport: Sendable {
     public var counters: EpochCounters
+    /// One `ProgramMetric` per program in stable-ID order. Non-empty for every default
+    /// (`.enabled`) run — the app, oracle, and CLI paths all rely on that. It is empty
+    /// ONLY under an explicit `MetricsPolicy.disabled` opt-out (the raw benchmark),
+    /// where per-program entropy/activity is deliberately not constructed.
     public var metrics: [ProgramMetric]
     /// Number of pairs actually shadow-checked this epoch.
     public var shadowChecked: Int
@@ -99,6 +124,11 @@ public struct SoupRunner: Sendable {
     public private(set) var soup: [UInt8]
     /// Next epoch to run (also the number of epochs completed).
     public private(set) var epoch: Int
+    /// Invocation seam: how many epochs actually built per-program metrics. Lets tests
+    /// PROVE metric construction is skipped under `MetricsPolicy.disabled` (rather than
+    /// merely observe an empty `metrics` array). Purely diagnostic — it never affects
+    /// the soup, the RNG, the counters, or the digest.
+    public private(set) var programMetricBuildCount: Int = 0
 
     public init(config: SoupConfig) {
         self.config = config
@@ -128,8 +158,18 @@ public struct SoupRunner: Sendable {
     /// reduce → metrics → shadow. The soup and epoch counter are committed only
     /// after a successful evaluate + scatter, so a thrown evaluator error leaves
     /// the run untouched.
+    ///
+    /// `metrics` gates ONLY the derived per-program `ProgramMetric` construction. It
+    /// defaults to `.enabled` so every existing caller (app, oracle, CLI) is
+    /// unchanged. Passing `.disabled` (the raw benchmark) skips the per-program
+    /// entropy/activity scan entirely — everything else (mutation, pairing, evaluate,
+    /// scatter, counters, the configured CPU shadow, and the post-epoch digest) runs
+    /// exactly as before, so the committed soup and every counter/digest are identical.
     @discardableResult
-    public mutating func runEpoch<E: PairEvaluator>(using evaluator: E) throws -> EpochReport {
+    public mutating func runEpoch<E: PairEvaluator>(
+        using evaluator: E,
+        metrics policy: MetricsPolicy = .enabled
+    ) throws -> EpochReport {
         let (mutated, plan) = SoupPlanner.plan(soup: soup, config: config, epoch: epoch)
 
         let outcomes = try evaluator.evaluate(pairTapes: plan.inputTapes,
@@ -147,9 +187,18 @@ public struct SoupRunner: Sendable {
         let counters = EpochCounters.reduce(epoch: epoch,
                                             mutationCount: plan.mutationCount,
                                             outcomes: outcomes)
-        let metrics = SoupMetrics.programMetrics(soup: newSoup, plan: plan,
+        // Per-program metrics are the only work gated by policy. Under `.disabled` the
+        // scan (and its O(programCount) entropy computation) is not performed at all;
+        // the report simply carries no per-program metrics. Nothing below depends on it.
+        let metrics: [ProgramMetric]
+        if policy.collectProgramMetrics {
+            metrics = SoupMetrics.programMetrics(soup: newSoup, plan: plan,
                                                  outcomes: outcomes,
                                                  programCount: config.programCount)
+            programMetricBuildCount += 1
+        } else {
+            metrics = []
+        }
 
         // CPU shadow: read-only, never perturbs the soup or its RNG.
         let sample = ShadowSampler.sampleIndices(pairCount: config.pairCount,

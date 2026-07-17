@@ -13,23 +13,28 @@ Everything here uses the full **8192-step** budget by default, exactly as produc
 | Number | Source | Honesty note |
 |---|---|---|
 | **GPU ms/epoch** | `MTLCommandBuffer.gpuEndTime − gpuStartTime` | *Command-buffer* GPU time, one command buffer per epoch. Not a per-kernel or per-encoder breakdown, not a CPU profile. `nil` (and the run fails, exit 3) if the hardware reports no usable timestamp. |
-| **Epoch wall ms/epoch** (`wallMsPerEpoch`) | monotonic clock **strictly enclosing `runEpoch`** | The epoch execution wall, and the sole basis for raw simulation throughput. It encloses mutation, pairing, packing, GPU dispatch + wait, scatter, counter/program-metric reduction, and the CPU shadow (if on). It does **not** include sampled signal analysis — that is timed separately (below). |
+| **Epoch wall ms/epoch** (`wallMsPerEpoch`) | monotonic clock **strictly enclosing `runEpoch`** | The epoch execution wall, and the sole basis for raw simulation throughput. It encloses mutation, pairing, packing, GPU dispatch + wait + readback, scatter, counter reduction, the post-epoch FNV-1a digest, and the CPU shadow (if on). The benchmark runs `runEpoch` with **per-program metric collection disabled** (`MetricsPolicy.disabled`), so the per-program entropy/activity scan is **not** in this wall — in raw mode it is not computed at all, and in kinetics mode per-program entropy comes from the external `SoupSignals.measure` timed separately (below). The digest is the one unavoidable O(N) pass inside the wall; counters are O(pairs). |
 | **Host residual ms/epoch** | `epoch wall − GPU` | *Everything in the epoch wall that is not GPU command-buffer time.* An attribution, **not** a CPU profiler: it is a single lump and does **not** isolate planning, allocation, marshalling, encode, readback, scatter, counter/program-metric reduction, the shadow, or queue latency. |
 | **Signal analysis ms (total)** (`signalAnalysisMsTotal`) | monotonic clock around `SoupSignals.measure`, **outside** the epoch wall | Host analysis cost of the sampled entropy/transition/LZ metrics. Whole-run total. **`null` under `--no-samples`** — that mode computes no signals, so there is nothing to time (honest "not computed", never a fabricated 0). |
 | epochs/s, pairs/s, raw/command steps/s | measured epochs ÷ measured **epoch** wall | Warmup epochs excluded; signal analysis never mixed in. |
 | halt buckets, copy writes | `EpochCounters` reduced from the GPU records | The existing science counters, summed over measured epochs. Reduced inside `runEpoch`, so part of the epoch wall. |
-| max RSS | `getrusage(RUSAGE_SELF).ru_maxrss` | Process high-water mark (bytes; normalized from KiB on Linux). One ceiling for the whole run, best-effort. |
+| max RSS (`maxRSSBytes`) | `getrusage(RUSAGE_SELF).ru_maxrss` | Process **peak / high-water** RSS (bytes; normalized from KiB on Linux, native bytes on Darwin). It is cumulative for the whole process/matrix — **not** cell-exclusive and **not** current resident memory. Sampled at three points per cell (pre-cell, post-`SoupRunner` allocation, post-cell) and reduced to the **maximum available** reading (`PeakRSSSampler`); `null` only if every reading was unavailable. One ceiling for the whole run, best-effort. |
 
 Output is one JSON document `{ "schemaVersion": 2, "results": [ … ] }` on stdout; all
 diagnostics and warnings go to stderr. One `results[]` entry per matrix cell. Pipe to `jq`.
 
 **Schema 2** (from 1): entropy-kinetics fields (`initialEntropyBitsPerByte`,
 `finalEntropyBitsPerByte`, `finalDeltaH`, `finalMeanProgramEntropyBitsPerByte`,
-`finalTransitionRate`, `finalCompressionProxyRatio`) are now **nullable** — under
-`--no-samples` they are *omitted* from the JSON (Swift encodes `nil` optionals as absent
-keys; treat absent as `null`); `thresholdCrossings` is then `[]` and `samples` is `[]`.
-Added `signalsAnalyzed` (always present bool — the reliable "were kinetics computed?"
-flag) and `signalAnalysisMsTotal` (nullable ms, omitted under `--no-samples`).
+`finalTransitionRate`, `finalCompressionProxyRatio`) are **nullable**. Every documented
+optional field is encoded as an **explicit JSON `null`** when unavailable — the keys are
+**always present**, never dropped (a stable key set consumers can rely on). Under
+`--no-samples` those kinetics fields, `signalAnalysisMsTotal`, `deviceName` (if unknown),
+and the GPU-timing fields (`gpuMsPerEpoch`, `hostResidualMsPerEpoch`, `gpuBusyFraction`)
+are `null`; `thresholdCrossings` and `samples` are explicit empty arrays `[]`. Added
+`signalsAnalyzed` (always present bool — the reliable "were kinetics computed?" flag) and
+`signalAnalysisMsTotal` (nullable ms, `null` under `--no-samples`). Nested optionals
+follow the same rule: an un-crossed `thresholdCrossings[]` entry still carries
+`"epoch": null`, `"wallMsToCross": null`, `"gpuMsToCross": null`.
 
 Exit codes: `0` ok · `1` shadow mismatch or generic GPU/runtime error · `2` Metal
 unavailable — **no Metal on the platform *or* no system default device** (nothing ran) ·
@@ -77,15 +82,25 @@ Read all three as relative, same-alphabet, same-length signals.
 ### Metric controls and hidden-cost avoidance
 
 - **`--no-samples`** is throughput mode: it skips **all** sample-only metric computation —
-  the whole-soup and per-program entropy scans, the adjacent-transition scan, and the LZ
-  proxy — not merely their JSON emission. No `SoupSignals.measure` call is made at all, so
-  the epoch wall carries **zero** hidden analysis cost. In this mode the kinetics fields
-  and `signalAnalysisMsTotal` are `null`, `thresholdCrossings`/`samples` are `[]`, and
-  `signalsAnalyzed` is `false`. **Mandatory metrics that remain** in this mode: the
-  per-epoch `EpochCounters` (halt buckets, step/copy counts — reduced inside `runEpoch`
-  from the GPU result records the kernel already returns, so no extra soup scan) and the
-  final `finalDigest` (FNV-1a over the soup, computed inside `runEpoch`). Both are part of
-  the epoch wall by construction and are not sample metrics.
+  the external whole-soup and per-program entropy scans, the adjacent-transition scan, and
+  the LZ proxy (no `SoupSignals.measure` call is made at all) **and** the in-epoch
+  per-program `ProgramMetric` construction (`MetricsPolicy.disabled`) — not merely their
+  JSON emission. So the epoch wall carries **zero** hidden analysis cost. In this mode the
+  kinetics fields and `signalAnalysisMsTotal` are `null`, `thresholdCrossings`/`samples`
+  are `[]`, and `signalsAnalyzed` is `false`. **Mandatory metrics that remain** in this
+  mode: the per-epoch `EpochCounters` (halt buckets, step/copy counts — reduced inside
+  `runEpoch` from the GPU result records the kernel already returns, so no extra soup scan)
+  and the final `finalDigest` (FNV-1a over the soup, computed inside `runEpoch`). Both are
+  part of the epoch wall by construction and are not sample metrics.
+- **In-epoch program metrics.** `SoupRunner.runEpoch(using:metrics:)` gates the derived
+  per-program `ProgramMetric` (order-0 entropy + activity) behind an explicit policy that
+  **defaults to enabled**, so the interactive app, the oracle, and `bff-metal-soup` are
+  unchanged. The benchmark always passes `.disabled` because it never consumes
+  `EpochReport.metrics`; `metrics` is therefore empty **only** under that explicit
+  opt-out. Disabling changes nothing else — the mutation → pair → evaluate → scatter
+  sequence, the counters, the CPU shadow, the committed soup, and the digest are
+  byte-for-byte identical (pinned by a metrics-enabled-vs-disabled equivalence test, with
+  an invocation counter proving the scan is genuinely skipped).
 - **`--compression`** opts the LZ proxy in; bounded to the sample cadence so it stays
   affordable even at 131072 programs. Ignored (with a stderr note) under `--no-samples`.
 

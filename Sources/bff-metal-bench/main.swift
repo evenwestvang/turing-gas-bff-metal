@@ -201,9 +201,12 @@ for programs in programsList {
 
 // MARK: - Host helpers
 
-/// Peak resident set size in bytes, or nil if unobtainable. `ru_maxrss` is bytes on
-/// Darwin and kilobytes on Linux (normalized here). It is the process high-water
-/// mark, not per-config — reported as a single ceiling for the whole run.
+/// One process peak (high-water) RSS reading in bytes, or nil if unobtainable.
+/// `ru_maxrss` is bytes on Darwin and kilobytes on Linux (normalized here). It is the
+/// process high-water mark — cumulative for the whole process, not per-config. The
+/// benchmark runner samples this at several points per cell and keeps the maximum
+/// available reading (see `PeakRSSSampler`); the result is a single process ceiling
+/// for the whole run, never a cell-exclusive figure.
 func maxResidentBytes() -> Int? {
     var usage = rusage()
     #if canImport(Darwin)
@@ -278,7 +281,7 @@ for config in configs {
             evaluator: evaluator,
             deviceName: evaluator.deviceName,
             options: runOptions,
-            maxRSSBytes: maxResidentBytes(),
+            readMaxRSSBytes: maxResidentBytes,
             now: monotonicSeconds,
             gpuSecondsAfterEpoch: { evaluator.lastGPUCommandBufferSeconds },
             measureSignals: { soup, includeComp in

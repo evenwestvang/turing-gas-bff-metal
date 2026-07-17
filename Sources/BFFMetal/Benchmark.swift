@@ -221,6 +221,10 @@ public struct ThresholdTracker {
 // MARK: - Result
 
 /// One per-epoch kinetics sample in the machine-readable output.
+///
+/// Custom `encode(to:)` (below) emits every optional field as an explicit JSON `null`
+/// when absent, so a sample's key set is stable regardless of GPU-timing or
+/// compression availability.
 public struct EpochSample: Equatable, Sendable, Codable {
     public var epoch: Int
     public var phase: String            // "warmup" | "measured"
@@ -312,6 +316,111 @@ public struct BenchmarkResult: Sendable, Codable {
 
     // Final soup fingerprint for cross-machine determinism checks.
     public var finalDigest: String
+}
+
+// MARK: - Stable schema-2 JSON encoding
+
+/// Emit an optional as its value when present, or an explicit JSON `null` when absent —
+/// so the key is ALWAYS written. `encodeIfPresent` (the synthesized default) would drop
+/// the key entirely; a stable machine-readable schema requires every documented field
+/// to appear on every run, `null` standing for "unavailable / not computed".
+private extension KeyedEncodingContainer {
+    mutating func encodeOrNull<T: Encodable>(_ value: T?, forKey key: Key) throws {
+        if let value { try encode(value, forKey: key) }
+        else { try encodeNil(forKey: key) }
+    }
+}
+
+extension ThresholdCrossing {
+    enum CodingKeys: String, CodingKey {
+        case deltaH, crossed, epoch, wallMsToCross, gpuMsToCross
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(deltaH, forKey: .deltaH)
+        try c.encode(crossed, forKey: .crossed)
+        try c.encodeOrNull(epoch, forKey: .epoch)
+        try c.encodeOrNull(wallMsToCross, forKey: .wallMsToCross)
+        try c.encodeOrNull(gpuMsToCross, forKey: .gpuMsToCross)
+    }
+}
+
+extension EpochSample {
+    enum CodingKeys: String, CodingKey {
+        case epoch, phase, wallMs, gpuMs, hostResidualMs, rawSteps, commandSteps,
+             copyWrites, entropyBitsPerByte, meanProgramEntropyBitsPerByte,
+             deltaHFromInitial, transitionRate, compressionProxyRatio
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(epoch, forKey: .epoch)
+        try c.encode(phase, forKey: .phase)
+        try c.encode(wallMs, forKey: .wallMs)
+        try c.encodeOrNull(gpuMs, forKey: .gpuMs)
+        try c.encodeOrNull(hostResidualMs, forKey: .hostResidualMs)
+        try c.encode(rawSteps, forKey: .rawSteps)
+        try c.encode(commandSteps, forKey: .commandSteps)
+        try c.encode(copyWrites, forKey: .copyWrites)
+        try c.encode(entropyBitsPerByte, forKey: .entropyBitsPerByte)
+        try c.encode(meanProgramEntropyBitsPerByte, forKey: .meanProgramEntropyBitsPerByte)
+        try c.encode(deltaHFromInitial, forKey: .deltaHFromInitial)
+        try c.encode(transitionRate, forKey: .transitionRate)
+        try c.encodeOrNull(compressionProxyRatio, forKey: .compressionProxyRatio)
+    }
+}
+
+extension BenchmarkResult {
+    enum CodingKeys: String, CodingKey {
+        case config, deviceName, rngContractID, warmupEpochs, measuredEpochs,
+             gpuTimingAvailable, wallMsPerEpoch, gpuMsPerEpoch, hostResidualMsPerEpoch,
+             gpuBusyFraction, signalAnalysisMsTotal, epochsPerSecond, pairsPerSecond,
+             rawStepsPerSecond, commandStepsPerSecond, totalPairs, totalRawSteps,
+             totalCommandSteps, totalCopyWrites, haltBudget, haltPCOut, haltUnmatched,
+             haltUnknown, signalsAnalyzed, initialEntropyBitsPerByte,
+             finalEntropyBitsPerByte, finalDeltaH, finalMeanProgramEntropyBitsPerByte,
+             finalTransitionRate, finalCompressionProxyRatio, thresholdCrossings,
+             shadowCheckedTotal, shadowMismatchTotal, maxRSSBytes, samples, finalDigest
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(config, forKey: .config)
+        try c.encodeOrNull(deviceName, forKey: .deviceName)
+        try c.encode(rngContractID, forKey: .rngContractID)
+        try c.encode(warmupEpochs, forKey: .warmupEpochs)
+        try c.encode(measuredEpochs, forKey: .measuredEpochs)
+        try c.encode(gpuTimingAvailable, forKey: .gpuTimingAvailable)
+        try c.encode(wallMsPerEpoch, forKey: .wallMsPerEpoch)
+        try c.encodeOrNull(gpuMsPerEpoch, forKey: .gpuMsPerEpoch)
+        try c.encodeOrNull(hostResidualMsPerEpoch, forKey: .hostResidualMsPerEpoch)
+        try c.encodeOrNull(gpuBusyFraction, forKey: .gpuBusyFraction)
+        try c.encodeOrNull(signalAnalysisMsTotal, forKey: .signalAnalysisMsTotal)
+        try c.encode(epochsPerSecond, forKey: .epochsPerSecond)
+        try c.encode(pairsPerSecond, forKey: .pairsPerSecond)
+        try c.encode(rawStepsPerSecond, forKey: .rawStepsPerSecond)
+        try c.encode(commandStepsPerSecond, forKey: .commandStepsPerSecond)
+        try c.encode(totalPairs, forKey: .totalPairs)
+        try c.encode(totalRawSteps, forKey: .totalRawSteps)
+        try c.encode(totalCommandSteps, forKey: .totalCommandSteps)
+        try c.encode(totalCopyWrites, forKey: .totalCopyWrites)
+        try c.encode(haltBudget, forKey: .haltBudget)
+        try c.encode(haltPCOut, forKey: .haltPCOut)
+        try c.encode(haltUnmatched, forKey: .haltUnmatched)
+        try c.encode(haltUnknown, forKey: .haltUnknown)
+        try c.encode(signalsAnalyzed, forKey: .signalsAnalyzed)
+        try c.encodeOrNull(initialEntropyBitsPerByte, forKey: .initialEntropyBitsPerByte)
+        try c.encodeOrNull(finalEntropyBitsPerByte, forKey: .finalEntropyBitsPerByte)
+        try c.encodeOrNull(finalDeltaH, forKey: .finalDeltaH)
+        try c.encodeOrNull(finalMeanProgramEntropyBitsPerByte,
+                           forKey: .finalMeanProgramEntropyBitsPerByte)
+        try c.encodeOrNull(finalTransitionRate, forKey: .finalTransitionRate)
+        try c.encodeOrNull(finalCompressionProxyRatio, forKey: .finalCompressionProxyRatio)
+        try c.encode(thresholdCrossings, forKey: .thresholdCrossings)
+        try c.encode(shadowCheckedTotal, forKey: .shadowCheckedTotal)
+        try c.encode(shadowMismatchTotal, forKey: .shadowMismatchTotal)
+        try c.encodeOrNull(maxRSSBytes, forKey: .maxRSSBytes)
+        try c.encode(samples, forKey: .samples)
+        try c.encode(finalDigest, forKey: .finalDigest)
+    }
 }
 
 // MARK: - Aggregation
