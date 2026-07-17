@@ -123,8 +123,12 @@ kinetics sample every `N` epochs (plus the final), bounding output at large soup
 These are **distinct** knobs and are not interchangeable:
 
 - **`--sample-interval N`** — *JSON emission* cadence. A per-epoch kinetics `samples[]`
-  entry is written every `N` epochs (plus the final epoch). It only decides which
-  measured epochs are *reported*; it does not change what is measured. Default `1`.
+  entry is written every `N` epochs (plus the final epoch), from among the epochs that
+  carry a signal measurement. It decides which measured epochs are *reported* — and, when
+  `--compression` is on, it is **also the LZ-proxy measurement cadence**: the O(n·window)
+  proxy is computed only at epochs that are both an emission point and a measured signal
+  epoch, so `--sample-interval` bounds that one expensive signal. It does not change the
+  cheap entropy/transition signals (those follow `--signal-interval`). Default `1`.
 - **`--signal-interval N`** — *signal-measurement* cadence (cadence-only signal
   analysis). It decides at which epochs the entropy/transition (and, when `--compression`
   is on, LZ) signals are **measured at all**. Default `1` = every epoch, the exact
@@ -138,13 +142,16 @@ These are **distinct** knobs and are not interchangeable:
   counters are byte-for-byte identical to a per-epoch or `--no-samples` run. It is
   ignored under `--no-samples` (nothing is measured then) with a stderr note.
 
-**Interaction.** A `samples[]` entry is emitted for an epoch only when it is *both* an
-emission point (`--sample-interval`) *and* an epoch that carries a measurement
+**Interaction.** A `samples[]` entry is emitted for a **completed** epoch only when it is
+*both* an emission point (`--sample-interval`) *and* an epoch that carries a measurement
 (`--signal-interval`). With a sparse signal interval the reported samples are therefore
-the intersection — always including epoch-0's reference kinetics and the final epoch.
-The signal cadence is a **CLI-only** control: it changes which epochs carry samples but
-adds **no** JSON key (the schema-2 key set, including `config.sampleInterval`, is
-unchanged).
+the intersection of the two cadences over the completed epochs, **always including the
+final completed epoch** (which is both by construction). **Epoch 0 is never a `samples[]`
+entry**: it is the pre-mutation reference, measured before the loop and reported through
+the `initial*` fields (`initialEntropyBitsPerByte` and the ΔH baseline), not as a
+`samples[]` row. The signal cadence is a **CLI-only** control: it changes which epochs
+carry samples but adds **no** JSON key (the schema-2 key set, including
+`config.sampleInterval`, is unchanged).
 
 **ΔH thresholds require per-epoch signals.** Exact ΔH-threshold epochs can only be
 resolved from the full per-epoch trajectory, so `--delta-h-thresholds` is **incompatible

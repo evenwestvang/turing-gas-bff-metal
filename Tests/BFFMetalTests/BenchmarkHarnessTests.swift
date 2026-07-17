@@ -327,6 +327,87 @@ final class BenchmarkHarnessTests: XCTestCase {
         XCTAssertNotNil(result.finalCompressionProxyRatio)
     }
 
+    // MARK: - Runner-level cadence guard (blocker 1)
+
+    /// Wraps an evaluator and counts `evaluate` calls (one per epoch), so a test can
+    /// prove the epoch loop was — or was not — entered.
+    private struct CountingEvaluator: PairEvaluator {
+        let base: CPUPairEvaluator
+        let onEvaluate: () -> Void
+        func evaluate(pairTapes: [[UInt8]], variant: BFFVariant,
+                      stepBudget: Int) -> [GPUPairOutcome] {
+            onEvaluate()
+            return base.evaluate(pairTapes: pairTapes, variant: variant,
+                                 stepBudget: stepBudget)
+        }
+    }
+
+    /// The public runner itself enforces the signal-cadence contract: a sparse
+    /// `signalInterval` combined with ΔH thresholds throws *before* any RSS sampling,
+    /// `SoupRunner` allocation, epoch execution, or signal measurement — so a caller
+    /// bypassing the CLI can never produce threshold epochs off a sparse trajectory.
+    func testRunnerRejectsSparseSignalsWithThresholdsBeforeAnyWork() throws {
+        let cfg = BenchmarkConfig(seed: 3, programCount: 16, initMode: .opcode,
+                                  warmupEpochs: 1, measuredEpochs: 8,
+                                  deltaHThresholds: [0.1], sampleInterval: 1)
+        let soupConfig = try cfg.soupConfig()
+
+        var epochCalls = 0
+        var measureCalls = 0
+        var rssReads = 0
+        let evaluator = CountingEvaluator(base: CPUPairEvaluator()) { epochCalls += 1 }
+
+        XCTAssertThrowsError(try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: evaluator,
+            deviceName: nil,
+            options: .init(analyzeSignals: true, includeCompression: false,
+                           signalInterval: 4),
+            readMaxRSSBytes: { rssReads += 1; return nil },
+            now: { 0 },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                measureCalls += 1
+                return SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                           includeCompression: includeComp)
+            })) { error in
+            XCTAssertEqual(error as? SignalCadenceError,
+                           .thresholdsRequirePerEpochSignals(signalInterval: 4),
+                           "runner throws the same cadence error the CLI validates")
+        }
+        XCTAssertEqual(epochCalls, 0, "no epoch executed before the cadence guard")
+        XCTAssertEqual(measureCalls, 0, "no signal measured before the cadence guard")
+        XCTAssertEqual(rssReads, 0, "the guard precedes even RSS sampling")
+    }
+
+    /// `--no-samples` (analyzeSignals == false) is exempt: the identical sparse interval +
+    /// thresholds runs cleanly, because no trajectory is measured at all and the signal
+    /// knobs are inert. Proves the guard does not weaken throughput-only semantics.
+    func testRunnerAllowsSparseSignalsWithThresholdsUnderNoSamples() throws {
+        let cfg = BenchmarkConfig(seed: 3, programCount: 16, initMode: .opcode,
+                                  warmupEpochs: 1, measuredEpochs: 8,
+                                  deltaHThresholds: [0.1], sampleInterval: 1)
+        let soupConfig = try cfg.soupConfig()
+        var measureCalls = 0
+        var clock = 0.0
+        let result = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil,
+            options: .init(analyzeSignals: false, includeCompression: false,
+                           signalInterval: 4),
+            readMaxRSSBytes: { nil },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                measureCalls += 1
+                return SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                           includeCompression: includeComp)
+            })
+        XCTAssertEqual(measureCalls, 0, "no signal analysis runs under --no-samples")
+        XCTAssertFalse(result.signalsAnalyzed)
+        XCTAssertTrue(result.thresholdCrossings.isEmpty, "thresholds ignored, not errored")
+        XCTAssertGreaterThan(result.totalRawSteps, 0, "the run still executed")
+    }
+
     // MARK: - Sparse signal-analysis cadence (--signal-interval)
 
     /// Build a runner invocation over the CPU reference that records, per epoch, whether
@@ -531,36 +612,87 @@ final class BenchmarkHarnessTests: XCTestCase {
         XCTAssertFalse(disabled.signalsAnalyzed)
     }
 
-    /// Compression stays independent of the signal cadence and never broadens: with a
-    /// sparse interval the LZ proxy runs only where an emission point and a measured
-    /// epoch coincide, so it runs no more often than a per-epoch run would — and never
-    /// on an epoch where signals were not measured at all.
-    func testCompressionIndependentAndBoundedUnderSparseSignals() throws {
-        // warmup 0 + measured 12, signalInterval 4 => signals at 4, 8, 12(final).
-        // sampleInterval 1 => every measured epoch is an emission point, so compression
-        // is requested at each signal epoch (+ the initial reference).
-        let sparse = try runCadence(warmup: 0, measured: 12, signalInterval: 4,
-                                    sampleInterval: 1, compression: true)
-        XCTAssertEqual(sparse.perEpochSignalEpochs, [4, 8, 12])
-        // Compression calls: initial (1) + the three measured signal epochs = 4.
-        XCTAssertEqual(sparse.compressionCalls, 1 + 3)
-        // Never exceeds total measurements (LZ is a strict subset of measurements).
-        XCTAssertLessThanOrEqual(sparse.compressionCalls, sparse.totalCalls)
-        XCTAssertNotNil(sparse.result.finalCompressionProxyRatio,
-                        "the final epoch is always both a signal point and a sample point")
+    /// Record the exact completed-epoch index at which each `measureSignals` call fired,
+    /// and which of those requested compression, over a run with a *nontrivial*
+    /// intersection of the two cadences. `measureSignals` fires before `onEpoch` within an
+    /// iteration, so at the call for completed epoch C exactly C−1 `onEpoch`s have run;
+    /// the pre-loop epoch-0 reference is the first call. This lets the test read the true
+    /// measurement/compression epochs, not just call counts.
+    private func compressionCadenceProbe(signalInterval: Int, sampleInterval: Int,
+                                         measured: Int, compression: Bool)
+        throws -> (measured: [Int], compression: [Int], result: BenchmarkResult) {
+        let cfg = BenchmarkConfig(seed: 4, programCount: 24, mutationP32: 1 << 22,
+                                  initMode: .opcode, warmupEpochs: 0,
+                                  measuredEpochs: measured, sampleInterval: sampleInterval)
+        let soupConfig = try cfg.soupConfig()
+        var measuredEpochs: [Int] = []
+        var compressionEpochs: [Int] = []
+        var onEpochCount = 0
+        var firstCall = true
+        var clock = 0.0
+        let result = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil,
+            options: .init(analyzeSignals: true, includeCompression: compression,
+                           signalInterval: signalInterval),
+            readMaxRSSBytes: { nil },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                let epoch = firstCall ? 0 : onEpochCount + 1
+                firstCall = false
+                measuredEpochs.append(epoch)
+                if includeComp { compressionEpochs.append(epoch) }
+                return SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                           includeCompression: includeComp)
+            },
+            onEpoch: { _ in onEpochCount += 1 })
+        return (measuredEpochs, compressionEpochs, result)
+    }
 
-        // A per-epoch run with the SAME emission cadence computes LZ at least as often —
-        // sparse never broadens LZ work.
-        let dense = try runCadence(warmup: 0, measured: 12, signalInterval: 1,
-                                   sampleInterval: 1, compression: true)
-        XCTAssertGreaterThanOrEqual(dense.compressionCalls, sparse.compressionCalls,
+    /// The LZ proxy sits at the genuine *intersection* of two independent cadences. Over
+    /// 12 completed epochs with `--signal-interval 4` and `--sample-interval 3`:
+    ///   - signals are measured at epoch 0 (reference) and completed 4, 8, 12 (final);
+    ///   - emission points are completed 3, 6, 9, 12;
+    ///   - so LZ runs only at the epoch-0 reference and epoch 12 — the sole coincidence —
+    ///     never at 4/8 (measured but not emitted) nor 3/6/9 (emitted but not measured).
+    /// This is a non-degenerate intersection (unlike sampleInterval == 1, where every
+    /// measured epoch is trivially an emission point).
+    func testCompressionRunsOnlyAtSignalEmissionIntersection() throws {
+        let sparse = try compressionCadenceProbe(signalInterval: 4, sampleInterval: 3,
+                                                 measured: 12, compression: true)
+        XCTAssertEqual(sparse.measured, [0, 4, 8, 12],
+                       "signals measured only at epoch 0 and every 4th completed epoch + final")
+        XCTAssertEqual(sparse.compression, [0, 12],
+                       "LZ only at the epoch-0 reference and epoch 12 (signal ∩ emission)")
+        // The emitted samples[] are the same intersection over *completed* epochs — epoch
+        // 0 is the initial reference, reported via initial* fields, never a samples[] row.
+        XCTAssertEqual(sparse.result.samples.map(\.epoch), [12],
+                       "only epoch 12 is both a signal point and an emission point")
+        XCTAssertNotNil(sparse.result.samples.first?.compressionProxyRatio,
+                        "the emitted final sample carries the LZ proxy")
+        XCTAssertNotNil(sparse.result.finalCompressionProxyRatio)
+        XCTAssertNotNil(sparse.result.initialEntropyBitsPerByte,
+                        "epoch-0 reference measured before the loop")
+
+        // Per-epoch signals with the SAME emission cadence compute LZ at least as often —
+        // sparse never broadens LZ work. Dense signals measure every epoch, so LZ lands on
+        // every emission point {3,6,9,12} plus the epoch-0 reference.
+        let dense = try compressionCadenceProbe(signalInterval: 1, sampleInterval: 3,
+                                                measured: 12, compression: true)
+        XCTAssertEqual(dense.compression, [0, 3, 6, 9, 12],
+                       "per-epoch signals land LZ on the epoch-0 reference and every emission point")
+        XCTAssertGreaterThanOrEqual(dense.compression.count, sparse.compression.count,
                                     "sparse analysis must not run LZ more than per-epoch does")
 
-        // And compression truly stays opt-in: with it off, the proxy is never requested.
-        let noComp = try runCadence(warmup: 0, measured: 12, signalInterval: 4,
-                                    sampleInterval: 1, compression: false)
-        XCTAssertEqual(noComp.compressionCalls, 0, "LZ proxy never runs without --compression")
-        XCTAssertNil(noComp.result.finalCompressionProxyRatio)
+        // Opt-in truly off: no LZ anywhere, and the final ratio is nil — while the signal
+        // cadence itself is unchanged by the LZ opt-out.
+        let off = try compressionCadenceProbe(signalInterval: 4, sampleInterval: 3,
+                                              measured: 12, compression: false)
+        XCTAssertEqual(off.compression, [], "LZ proxy never runs without --compression")
+        XCTAssertNil(off.result.finalCompressionProxyRatio)
+        XCTAssertEqual(off.measured, [0, 4, 8, 12],
+                       "signal cadence is independent of the LZ opt-out")
     }
 
     // MARK: - Machine-readable contract

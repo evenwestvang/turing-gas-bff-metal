@@ -188,6 +188,35 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         XCTAssertEqual(r.status, 2)
         #endif
     }
+
+    /// The sparse-signals + ΔH-thresholds incompatibility only exists when signals are
+    /// actually analyzed. Under `--no-samples` no trajectory is measured, so
+    /// `--no-samples --signal-interval 2 --delta-h-thresholds 0.1` must NOT exit usage 64
+    /// solely for cadence — the flags are accepted and noted as ignored (blocker 2).
+    func testNoSamplesWithSparseSignalsAndThresholdsIsNotUsageError() throws {
+        let r = try runBench(["--programs", "2", "--seed", "1",
+                              "--warmup", "0", "--epochs", "4",
+                              "--no-samples", "--signal-interval", "2",
+                              "--delta-h-thresholds", "0.1"])
+        XCTAssertNotEqual(r.status, 64,
+                          "sparse signals + thresholds under --no-samples is not a usage error")
+        XCTAssertTrue(r.stderr.contains("--signal-interval is ignored under --no-samples"),
+                      "signal-interval ignored note emitted")
+        XCTAssertTrue(r.stderr.contains("--delta-h-thresholds is ignored under --no-samples"),
+                      "delta-h-thresholds ignored note emitted")
+        #if !canImport(Metal)
+        XCTAssertEqual(r.status, 2, "nothing runs on a non-Metal host")
+        #endif
+
+        // Guard against regressing the *analyzing* path: the same sparse+thresholds combo
+        // WITHOUT --no-samples is still a usage error (exit 64).
+        let analyzing = try runBench(["--programs", "2", "--seed", "1",
+                                      "--warmup", "0", "--epochs", "4",
+                                      "--signal-interval", "2",
+                                      "--delta-h-thresholds", "0.1"])
+        XCTAssertEqual(analyzing.status, 64,
+                       "sparse signals + thresholds while analyzing remains a usage error")
+    }
 }
 
 /// Local mirror of the documented exit codes, so the Metal-host branch above can name

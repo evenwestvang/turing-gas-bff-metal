@@ -72,6 +72,20 @@ public enum BenchmarkRunner {
         measureSignals: (_ soup: [UInt8], _ includeCompression: Bool) -> SoupSignals,
         onEpoch: (EpochReport) -> Void = { _ in }
     ) throws -> BenchmarkResult {
+        // Enforce the signal-cadence contract at the very top — before any RSS reading,
+        // `SoupRunner` allocation, epoch execution, or signal measurement — so a sparse
+        // `--signal-interval` combined with ΔH thresholds can never even begin a run that
+        // would report threshold epochs off a trajectory it never measured. The CLI also
+        // validates this, but the guard lives here too so any caller of the public runner
+        // (not just `bff-metal-bench`) is held to the same contract. Skipped when
+        // `analyzeSignals == false` (`--no-samples`): no trajectory is measured then, so
+        // the signal knobs are inert and thresholds are simply ignored, exactly as under
+        // the throughput-only path.
+        if options.analyzeSignals {
+            try validateSignalCadence(signalInterval: options.signalInterval,
+                                      deltaHThresholdCount: config.deltaHThresholds.count)
+        }
+
         // Process peak (high-water) RSS is sampled at three points and reduced to the
         // maximum available reading: pre-cell (before any allocation for this cell),
         // post-allocation (right after the SoupRunner is constructed), and post-cell

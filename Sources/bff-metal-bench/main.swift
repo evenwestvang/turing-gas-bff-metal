@@ -153,7 +153,10 @@ while cursor < arguments.count {
           --delta-h-thresholds L  comma bits/byte ΔH levels to time (e.g. 0.25,0.5,1.0);
                                   requires per-epoch signals (--signal-interval 1)
           --sample-interval N     JSON emission cadence: emit a kinetics sample every N
-                                  epochs (+ the final epoch) (default 1)
+                                  epochs (+ the final epoch) (default 1). It is also the
+                                  LZ-proxy MEASUREMENT cadence when --compression is on
+                                  (the proxy runs only where an emission point and a
+                                  measured signal epoch coincide).
           --signal-interval N     signal-MEASUREMENT cadence (distinct from
                                   --sample-interval). 1 (default) measures entropy every
                                   epoch. N>1 is cadence-only analysis: measure at epoch 0,
@@ -184,20 +187,28 @@ guard sampleInterval >= 1 else { fail("--sample-interval must be >= 1", exitCode
 guard signalInterval >= 1 else { fail("--signal-interval must be >= 1", exitCode: usageExit) }
 // Exact ΔH thresholds require the per-epoch trajectory; a sparse signal interval is
 // cadence-only. Reject the combination as a usage error (validated in the library so
-// the policy is unit-tested without Metal).
-do {
-    try validateSignalCadence(signalInterval: signalInterval,
-                              deltaHThresholdCount: deltaHThresholds.count)
-} catch let e as SignalCadenceError {
-    fail(e.description, exitCode: usageExit)
-} catch {
-    fail("\(error)", exitCode: usageExit)
+// the policy is unit-tested without Metal). This incompatibility only exists when
+// signals are actually analyzed: under `--no-samples` no trajectory is measured at all,
+// so `--signal-interval` and `--delta-h-thresholds` are simply inert (noted below), not
+// a usage error — `--no-samples --signal-interval 2 --delta-h-thresholds …` runs fine.
+if analyzeSignals {
+    do {
+        try validateSignalCadence(signalInterval: signalInterval,
+                                  deltaHThresholdCount: deltaHThresholds.count)
+    } catch let e as SignalCadenceError {
+        fail(e.description, exitCode: usageExit)
+    } catch {
+        fail("\(error)", exitCode: usageExit)
+    }
 }
 if includeCompression && !analyzeSignals {
     warn("--compression is ignored under --no-samples (no signal analysis runs)")
 }
 if signalInterval > 1 && !analyzeSignals {
     warn("--signal-interval is ignored under --no-samples (no signal analysis runs)")
+}
+if !deltaHThresholds.isEmpty && !analyzeSignals {
+    warn("--delta-h-thresholds is ignored under --no-samples (no signal analysis runs)")
 }
 
 // Build the matrix (programs outer, seeds inner) and validate every cell up front so
