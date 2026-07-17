@@ -70,14 +70,37 @@ public enum BFFRandom {
     }
 
     /// A reproducible low-entropy soup drawn from a small alphabet (default: the ten
-    /// BFF opcode bytes, `BFFOp.all`). Byte `i` is `alphabet[draw % alphabet.count]`
-    /// where `draw` is the SAME `.soupInit` counter draw the uniform path uses — so it
-    /// is deterministic under `counter-pcg-v1`, reproducible across machines, and adds
-    /// no new RNG. Unlike an all-zero soup this seeds the soup with *executable*
-    /// opcodes, so interactions do real work from epoch 0 while the order-0 Shannon
-    /// entropy still starts low (≤ log2(alphabet.count) bits/byte) — the intended
-    /// regime for observing entropy growth. The uniform `initialSoup` is unchanged and
-    /// remains the default.
+    /// BFF opcode bytes, `BFFOp.all`). Deterministic under `counter-pcg-v1`,
+    /// reproducible across machines, and it adds no new RNG. Unlike an all-zero soup
+    /// this seeds the soup with *executable* opcodes, so interactions do real work
+    /// from epoch 0 while the order-0 Shannon entropy still starts low
+    /// (≤ log2(alphabet.count) bits/byte) — the intended regime for observing entropy
+    /// growth. The uniform `initialSoup` is unchanged and remains the default.
+    ///
+    /// Exact contract (pinned by `StructureMetricsTests`; do NOT change without
+    /// re-pinning, as it would change every `.opcode` trajectory):
+    ///
+    /// - **Alphabet — the ten command bytes.** The default `alphabet` is `BFFOp.all`,
+    ///   whose byte VALUES are exactly the ten commands of cubff's `CommandRepr`
+    ///   `"[]+-.,<>{}"` (`0x5B 0x5D 0x2B 0x2D 0x2E 0x2C 0x3C 0x3E 0x7B 0x7D`). NB the
+    ///   index ORDER of `BFFOp.all` is its own — `< > { } + - . , [ ]`
+    ///   (`0x3C 0x3E 0x7B 0x7D 0x2B 0x2D 0x2E 0x2C 0x5B 0x5D`), NOT the `CommandRepr`
+    ///   order — and that index order is what the modulo below selects into.
+    /// - **Stream/index mapping.** Byte `i` uses the SAME draw the uniform path uses:
+    ///   `draw = rng3(seed, stream(epoch: 0, pass: .soupInit), index: UInt32(i))`,
+    ///   i.e. stream `0*4 + 2 = 2` and index = the byte position `i`.
+    /// - **Symbol selection is `draw % alphabet.count`** (= `draw % 10` for the
+    ///   default alphabet): `soup[i] = alphabet[Int(draw % n)]`.
+    /// - **Modulo bias contract.** `draw` is a uniform `UInt32` over `[0, 2^32)`.
+    ///   `2^32 = 429496729 * 10 + 6`, so residues `0...5` each occur one extra time:
+    ///   the ten symbols are NOT perfectly equiprobable (indices `0...5` are favored
+    ///   by ~1 part in 4.3e8). This negligible, fully-deterministic bias is the
+    ///   pinned contract — the same one the pairing shuffle documents — chosen for a
+    ///   one-hash-per-byte draw over statistical perfection.
+    /// - **Relation to the epoch loop.** This runs once at epoch 0. Thereafter each
+    ///   epoch mutates BEFORE pairing/evaluation (`SoupPlanner.plan`: mutate stream
+    ///   `epoch*4+0`, then pairing stream `epoch*4+1`), at the default per-byte
+    ///   probability `BFF.defaultMutationP32 = 1<<20` (= 1/4096) unless overridden.
     public static func opcodeSoup(programs: Int, seed: UInt32,
                                   alphabet: [UInt8] = BFFOp.all) -> [UInt8] {
         precondition(programs > 0)

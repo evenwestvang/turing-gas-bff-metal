@@ -55,26 +55,40 @@ var shadowSampleArg: String? = nil     // nil => 0 (throughput mode)
 var deltaHThresholds: [Double] = []
 var sampleInterval = 1
 var allowMissingGPUTiming = false
-var emitSamples = true
+// `--no-samples` disables ALL sample-only metric analysis (entropy/transition/LZ/
+// kinetics), not merely JSON emission — the throughput-only mode. `--compression`
+// opts the O(n·window) LZ proxy in; it is ignored when analysis is off.
+var analyzeSignals = true
+var includeCompression = false
+
+let usageExit = BenchmarkExitCode.usage
 
 func intArg(_ name: String, _ v: String) -> Int {
-    guard let n = Int(v) else { fail("\(name) requires an integer, got '\(v)'", exitCode: 64) }
+    guard let n = Int(v) else { fail("\(name) requires an integer, got '\(v)'", exitCode: usageExit) }
     return n
 }
 func u32Arg(_ name: String, _ v: String) -> UInt32 {
-    guard let n = UInt32(v) else { fail("\(name) requires a 0...\(UInt32.max) integer, got '\(v)'", exitCode: 64) }
+    guard let n = UInt32(v) else { fail("\(name) requires a 0...\(UInt32.max) integer, got '\(v)'", exitCode: usageExit) }
     return n
 }
 func intList(_ name: String, _ v: String) -> [Int] {
     let parts = v.split(separator: ",").map(String.init)
-    guard !parts.isEmpty else { fail("\(name) requires at least one value", exitCode: 64) }
+    guard !parts.isEmpty else { fail("\(name) requires at least one value", exitCode: usageExit) }
     return parts.map { intArg(name, $0) }
 }
 func doubleList(_ name: String, _ v: String) -> [Double] {
     v.split(separator: ",").map(String.init).map {
-        guard let d = Double($0) else { fail("\(name) requires numbers, got '\($0)'", exitCode: 64) }
+        guard let d = Double($0) else { fail("\(name) requires numbers, got '\($0)'", exitCode: usageExit) }
         return d
     }
+}
+
+/// Strict seed parsing, factored into `BFFMetal.parseSeedList` so it is unit-tested
+/// without a Metal device. Any malformed token is a usage error — never truncated.
+func seedArg(_ name: String, _ v: String) -> [UInt32] {
+    do { return try parseSeedList(v) }
+    catch let e as SeedParseError { fail("\(name): \(e.description)", exitCode: usageExit) }
+    catch { fail("\(name): \(error)", exitCode: usageExit) }
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -89,8 +103,13 @@ while cursor < arguments.count {
     let argument = arguments[cursor]
     cursor += 1
     switch argument {
-    case "--seeds": seeds = intList(argument, nextValue(argument)).map { UInt32(truncatingIfNeeded: $0) }
-    case "--seed": seeds = [u32Arg(argument, nextValue(argument))]
+    case "--seeds": seeds = seedArg(argument, nextValue(argument))
+    case "--seed":
+        let parsed = seedArg(argument, nextValue(argument))
+        guard parsed.count == 1 else {
+            fail("--seed takes exactly one seed (use --seeds for a list)", exitCode: usageExit)
+        }
+        seeds = parsed
     case "--programs": programsList = intList(argument, nextValue(argument))
     case "--epochs": measuredEpochs = intArg(argument, nextValue(argument))
     case "--warmup": warmupEpochs = intArg(argument, nextValue(argument))
@@ -100,7 +119,8 @@ while cursor < arguments.count {
     case "--delta-h-thresholds": deltaHThresholds = doubleList(argument, nextValue(argument))
     case "--sample-interval": sampleInterval = intArg(argument, nextValue(argument))
     case "--allow-missing-gpu-timing": allowMissingGPUTiming = true
-    case "--no-samples": emitSamples = false
+    case "--no-samples": analyzeSignals = false
+    case "--compression": includeCompression = true
     case "--variant":
         let raw = nextValue(argument)
         guard let v = BFFVariant(rawValue: raw) else {
@@ -128,20 +148,28 @@ while cursor < arguments.count {
           --shadow-sample N|all   pairs CPU-shadowed per epoch; 0/omit = throughput mode
           --delta-h-thresholds L  comma bits/byte ΔH levels to time (e.g. 0.25,0.5,1.0)
           --sample-interval N     emit a kinetics sample every N epochs (default 1)
-          --no-samples            omit the per-epoch samples array from the output
+          --no-samples            throughput mode: skip ALL sample-only metric analysis
+                                  (entropy/transition/LZ/kinetics), not just JSON output
+          --compression           opt in to the O(n·window) LZ proxy (sampled epochs
+                                  only; off by default; ignored under --no-samples)
           --allow-missing-gpu-timing  exit 0 even if GPU timestamps are unavailable
+        Seeds are strict unsigned decimals in 0...\(UInt32.max); malformed/overflowing
+        tokens are a usage error (exit \(BenchmarkExitCode.usage)), never truncated.
         Output: one JSON document {schemaVersion, results:[...]} on stdout.
         """)
         exit(0)
     default:
-        fail("unknown argument '\(argument)'", exitCode: 64)
+        fail("unknown argument '\(argument)'", exitCode: usageExit)
     }
 }
 
 guard measuredEpochs >= 0, warmupEpochs >= 0 else {
-    fail("epochs and warmup must be >= 0", exitCode: 64)
+    fail("epochs and warmup must be >= 0", exitCode: usageExit)
 }
-guard sampleInterval >= 1 else { fail("--sample-interval must be >= 1", exitCode: 64) }
+guard sampleInterval >= 1 else { fail("--sample-interval must be >= 1", exitCode: usageExit) }
+if includeCompression && !analyzeSignals {
+    warn("--compression is ignored under --no-samples (no signal analysis runs)")
+}
 
 // Build the matrix (programs outer, seeds inner) and validate every cell up front so
 // a bad size fails before any GPU work.
@@ -163,9 +191,9 @@ for programs in programsList {
         do {
             _ = try cfg.soupConfig()   // validate bounds now
         } catch let e as SoupConfig.ConfigError {
-            fail("invalid config (programs=\(programs) seed=\(seed)): \(e.description)", exitCode: 64)
+            fail("invalid config (programs=\(programs) seed=\(seed)): \(e.description)", exitCode: usageExit)
         } catch {
-            fail("invalid config (programs=\(programs) seed=\(seed)): \(error)", exitCode: 64)
+            fail("invalid config (programs=\(programs) seed=\(seed)): \(error)", exitCode: usageExit)
         }
         configs.append(cfg)
     }
@@ -202,11 +230,13 @@ func emit(_ results: [BenchmarkResult]) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     do {
-        let data = try encoder.encode(Envelope(schemaVersion: 1, results: results))
+        // schemaVersion 2: kinetics fields are now optional (nil under --no-samples),
+        // signalsAnalyzed + signalAnalysisMsTotal added (see Docs/Benchmarking.md).
+        let data = try encoder.encode(Envelope(schemaVersion: 2, results: results))
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))
     } catch {
-        fail("failed to encode results: \(error)", exitCode: 1)
+        fail("failed to encode results: \(error)", exitCode: BenchmarkExitCode.runtimeFailure)
     }
 }
 
@@ -217,8 +247,19 @@ let evaluator: MetalBFFEvaluator
 do {
     evaluator = try MetalBFFEvaluator()
 } catch {
-    fail("could not initialize Metal evaluator: \(error)", exitCode: 1)
+    // Normalize "no Metal device / no default device" to the documented exit 2
+    // (metal unavailable); every other init failure stays a distinct exit 1.
+    let outcome: EvaluatorInitOutcome
+    if let ee = error as? MetalBFFEvaluator.EvaluatorError, case .noDevice = ee {
+        outcome = .metalUnavailable
+    } else {
+        outcome = .runtimeFailure
+    }
+    fail("could not initialize Metal evaluator: \(error)", exitCode: outcome.exitCode)
 }
+
+let runOptions = BenchmarkRunner.Options(analyzeSignals: analyzeSignals,
+                                         includeCompression: includeCompression)
 
 var results: [BenchmarkResult] = []
 var anyShadowMismatch = false
@@ -227,54 +268,30 @@ var anyMissingGPUTiming = false
 for config in configs {
     let soupConfig: SoupConfig
     do { soupConfig = try config.soupConfig() }
-    catch { fail("config build failed: \(error)", exitCode: 64) }
+    catch { fail("config build failed: \(error)", exitCode: usageExit) }
 
-    var runner = SoupRunner(config: soupConfig)
-    let initialSignals = SoupSignals.measure(soup: runner.soup,
-                                             programCount: config.programCount,
-                                             includeCompression: true)
-
-    var observations: [EpochObservation] = []
-    observations.reserveCapacity(config.totalEpochs)
-
-    for e in 0..<config.totalEpochs {
-        let isWarmup = e < config.warmupEpochs
-        let completed = e + 1
-        let isSamplePoint = (completed % config.sampleInterval == 0)
-            || completed == config.totalEpochs
-
-        let t0 = monotonicSeconds()
-        let report: EpochReport
-        do {
-            report = try runner.runEpoch(using: evaluator)
-        } catch {
-            fail("epoch execution failed (programs=\(config.programCount) "
-                 + "seed=\(config.seed) epoch=\(e)): \(error)", exitCode: 1)
-        }
-        let wall = monotonicSeconds() - t0
-        let gpu = evaluator.lastGPUCommandBufferSeconds
-        if !isWarmup && gpu == nil { anyMissingGPUTiming = true }
-
-        let signals = SoupSignals.measure(soup: runner.soup,
-                                          programCount: config.programCount,
-                                          includeCompression: isSamplePoint)
-
-        for mm in report.shadowMismatches {
-            warn("SHADOW MISMATCH " + mm.summary)
-        }
-
-        observations.append(EpochObservation(
-            epoch: completed, isWarmup: isWarmup, wallSeconds: wall, gpuSeconds: gpu,
-            counters: report.counters, shadowChecked: report.shadowChecked,
-            shadowMismatches: report.shadowMismatches.count, signals: signals))
+    let result: BenchmarkResult
+    do {
+        result = try BenchmarkRunner.run(
+            config: config,
+            soupConfig: soupConfig,
+            evaluator: evaluator,
+            deviceName: evaluator.deviceName,
+            options: runOptions,
+            maxRSSBytes: maxResidentBytes(),
+            now: monotonicSeconds,
+            gpuSecondsAfterEpoch: { evaluator.lastGPUCommandBufferSeconds },
+            measureSignals: { soup, includeComp in
+                SoupSignals.measure(soup: soup, programCount: config.programCount,
+                                    includeCompression: includeComp)
+            },
+            onEpoch: { report in
+                for mm in report.shadowMismatches { warn("SHADOW MISMATCH " + mm.summary) }
+            })
+    } catch {
+        fail("epoch execution failed (programs=\(config.programCount) "
+             + "seed=\(config.seed)): \(error)", exitCode: BenchmarkExitCode.runtimeFailure)
     }
-
-    var result = BenchmarkAggregator.aggregate(
-        config: config, deviceName: evaluator.deviceName,
-        initialSignals: initialSignals, observations: observations,
-        finalDigestHex: SoupDigest.hexString(runner.digest),
-        maxRSSBytes: maxResidentBytes())
-    if !emitSamples { result.samples = [] }
 
     if result.shadowMismatchTotal > 0 { anyShadowMismatch = true }
     if config.measuredEpochs > 0 && !result.gpuTimingAvailable { anyMissingGPUTiming = true }
@@ -284,18 +301,21 @@ for config in configs {
 emit(results)
 
 if anyShadowMismatch {
-    fail("one or more CPU-shadow mismatches — GPU diverged from the oracle", exitCode: 1)
+    fail("one or more CPU-shadow mismatches — GPU diverged from the oracle",
+         exitCode: BenchmarkExitCode.runtimeFailure)
 }
 if anyMissingGPUTiming && !allowMissingGPUTiming {
     fail("GPU command-buffer timestamps were unavailable; wall timing is still "
          + "reported but GPU/host attribution is not. Re-run with "
-         + "--allow-missing-gpu-timing to accept this.", exitCode: 3)
+         + "--allow-missing-gpu-timing to accept this.",
+         exitCode: BenchmarkExitCode.gpuTimingUnavailable)
 }
-exit(0)
+exit(BenchmarkExitCode.success)
 
 #else
 // Non-Metal host: nothing can run. Echo the resolved matrix so the invocation is
-// still verifiable, then exit 2 exactly like the other GPU CLIs.
+// still verifiable, then exit 2 — the same "Metal unavailable" code the CLI uses
+// when a Metal-capable host reports no default device (see EvaluatorInitOutcome).
 warn("Metal is unavailable on this platform; the benchmark harness needs a Metal "
      + "device (see Docs/Benchmarking.md). Nothing was executed.")
 for config in configs {
@@ -303,8 +323,9 @@ for config in configs {
          + "warmup=\(config.warmupEpochs) epochs=\(config.measuredEpochs) "
          + "budget=\(config.stepBudget) init=\(config.initMode.rawValue) "
          + "variant=\(config.variant.rawValue) shadowSample=\(config.shadowSampleCount) "
+         + "analyzeSignals=\(analyzeSignals) compression=\(includeCompression) "
          + "rng=\(BFFRandom.contractID)")
 }
 emit([])
-exit(2)
+exit(BenchmarkExitCode.metalUnavailable)
 #endif

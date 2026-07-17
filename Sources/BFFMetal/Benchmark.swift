@@ -27,8 +27,10 @@ public struct SoupSignals: Equatable, Sendable {
     /// Adjacent-byte transition rate over the whole soup, `[0, 1]`.
     public var transitionRate: Double
     /// Finite-window LZ77 compression proxy over the whole soup, `(0, 1]`. Optional
-    /// because it is the one O(n·window) signal — the harness computes it only on
-    /// sampled epochs and the final epoch to bound cost at large soups.
+    /// and OPT-IN: it is the one O(n·window) signal, so the CLI computes it only when
+    /// `--compression` is given, and even then only on sampled epochs and the final
+    /// epoch — never every epoch — so its cost stays bounded at 131072 programs.
+    /// `nil` means "not computed", not "incompressible".
     public var compressionProxyRatio: Double?
 
     public init(entropyBitsPerByte: Double, meanProgramEntropyBitsPerByte: Double,
@@ -39,9 +41,11 @@ public struct SoupSignals: Equatable, Sendable {
         self.compressionProxyRatio = compressionProxyRatio
     }
 
-    /// Measure a soup. `includeCompression` gates the expensive proxy so callers can
-    /// keep the cheap per-epoch signals (entropy, transition rate) always-on and the
-    /// proxy on a sampling cadence.
+    /// Measure a soup. `includeCompression` gates the expensive O(n·window) proxy so
+    /// callers can compute the cheap signals (entropy, transition rate) on their own
+    /// cadence and the proxy only when explicitly opted in and only on a sampling
+    /// cadence. This whole call is skipped entirely under `--no-samples` — the CLI
+    /// never invokes it, so no entropy scan, transition scan, or LZ proxy runs.
     public static func measure(soup: [UInt8], programCount: Int,
                                tapeSize: Int = BFF.tapeSize,
                                includeCompression: Bool) -> SoupSignals {
@@ -125,9 +129,20 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
 
 // MARK: - Per-epoch observation
 
-/// Everything measured for one executed epoch. `gpuSeconds` is `nil` when the
-/// hardware reported no usable command-buffer timestamp; the aggregator then marks
-/// GPU timing unavailable rather than inventing a number.
+/// Everything measured for one executed epoch.
+///
+/// - `wallSeconds` is the **epoch execution wall**: the monotonic interval that
+///   strictly encloses `runEpoch` (mutation, pairing, packing, GPU dispatch + wait,
+///   scatter, counters/program-metrics reduction, and the CPU shadow if enabled) and
+///   *nothing else*. Sampled signal analysis is timed separately in `analysisSeconds`.
+/// - `gpuSeconds` is `nil` when the hardware reported no usable command-buffer
+///   timestamp; the aggregator then marks GPU timing unavailable rather than
+///   inventing a number.
+/// - `signals` is `nil` when sample-only metric analysis was skipped (`--no-samples`);
+///   the aggregator then reports entropy kinetics as not computed rather than faking
+///   a zero.
+/// - `analysisSeconds` is the host wall spent computing `signals` for this epoch,
+///   measured *outside* `wallSeconds`; `nil` when no analysis ran.
 public struct EpochObservation: Sendable {
     public var epoch: Int
     public var isWarmup: Bool
@@ -136,11 +151,14 @@ public struct EpochObservation: Sendable {
     public var counters: EpochCounters
     public var shadowChecked: Int
     public var shadowMismatches: Int
-    public var signals: SoupSignals
+    public var signals: SoupSignals?
+    /// Host wall spent on sampled signal/metric analysis for this epoch, measured
+    /// outside the epoch execution wall. `nil` under `--no-samples` (not computed).
+    public var analysisSeconds: Double?
 
     public init(epoch: Int, isWarmup: Bool, wallSeconds: Double, gpuSeconds: Double?,
                 counters: EpochCounters, shadowChecked: Int, shadowMismatches: Int,
-                signals: SoupSignals) {
+                signals: SoupSignals?, analysisSeconds: Double? = nil) {
         self.epoch = epoch
         self.isWarmup = isWarmup
         self.wallSeconds = wallSeconds
@@ -149,6 +167,7 @@ public struct EpochObservation: Sendable {
         self.shadowChecked = shadowChecked
         self.shadowMismatches = shadowMismatches
         self.signals = signals
+        self.analysisSeconds = analysisSeconds
     }
 }
 
@@ -219,9 +238,21 @@ public struct EpochSample: Equatable, Sendable, Codable {
 }
 
 /// The full machine-readable result for one benchmark config. Codable so the CLI can
-/// emit it as JSON. Timing/throughput fields cover the MEASURED epochs only; entropy
-/// kinetics and threshold crossings span the whole run (warmup included) because the
-/// entropy trajectory is deterministic regardless of timing.
+/// emit it as JSON.
+///
+/// Timing attribution (see the honesty note on each field):
+/// - `wallMsPerEpoch` is the mean **epoch execution wall** — `runEpoch` only — over
+///   measured epochs. Raw simulation throughput derives *only* from this.
+/// - `gpuMsPerEpoch` is separate command-buffer GPU time.
+/// - `hostResidualMsPerEpoch` = epoch wall − GPU. It is a lump; it does NOT isolate
+///   planning, allocation, marshalling, encode, readback, scatter, counter/program
+///   metric reduction, or the CPU shadow — all of those live inside the epoch wall.
+/// - `signalAnalysisMsTotal` is the sampled signal/metric analysis wall, measured
+///   *outside* the epoch wall. `nil` under `--no-samples` (not computed).
+///
+/// Entropy kinetics and threshold crossings span the whole run (warmup included)
+/// because the entropy trajectory is deterministic regardless of timing. They are
+/// `nil`/empty when signal analysis was skipped (`--no-samples`).
 public struct BenchmarkResult: Sendable, Codable {
     public var config: BenchmarkConfig
     public var deviceName: String?
@@ -236,6 +267,10 @@ public struct BenchmarkResult: Sendable, Codable {
     public var gpuMsPerEpoch: Double?
     public var hostResidualMsPerEpoch: Double?
     public var gpuBusyFraction: Double?
+    /// Whole-run sampled signal/metric analysis wall (ms), measured outside epoch
+    /// execution. `nil` when signal analysis was skipped (`--no-samples`): honest
+    /// "not computed", never a fabricated 0.
+    public var signalAnalysisMsTotal: Double?
 
     // Throughput (measured epochs)
     public var epochsPerSecond: Double
@@ -253,12 +288,15 @@ public struct BenchmarkResult: Sendable, Codable {
     public var haltUnmatched: Int
     public var haltUnknown: Int
 
-    // Entropy kinetics (whole run)
-    public var initialEntropyBitsPerByte: Double
-    public var finalEntropyBitsPerByte: Double
-    public var finalDeltaH: Double
-    public var finalMeanProgramEntropyBitsPerByte: Double
-    public var finalTransitionRate: Double
+    // Entropy kinetics (whole run). `nil`/empty when `--no-samples` skipped analysis.
+    /// `true` iff sample-only signal analysis ran; when `false` every kinetics field
+    /// below is `nil` and `thresholdCrossings` is empty (not computed, not zeroed).
+    public var signalsAnalyzed: Bool
+    public var initialEntropyBitsPerByte: Double?
+    public var finalEntropyBitsPerByte: Double?
+    public var finalDeltaH: Double?
+    public var finalMeanProgramEntropyBitsPerByte: Double?
+    public var finalTransitionRate: Double?
     public var finalCompressionProxyRatio: Double?
     public var thresholdCrossings: [ThresholdCrossing]
 
@@ -269,7 +307,7 @@ public struct BenchmarkResult: Sendable, Codable {
     // Host memory (best effort)
     public var maxRSSBytes: Int?
 
-    // Per-epoch kinetics samples (sampled cadence)
+    // Per-epoch kinetics samples (sampled cadence). Empty under `--no-samples`.
     public var samples: [EpochSample]
 
     // Final soup fingerprint for cross-machine determinism checks.
@@ -283,16 +321,26 @@ public enum BenchmarkAggregator {
     /// Fold per-epoch observations into a `BenchmarkResult`.
     ///
     /// - `initialSignals` are the epoch-0 (pre-run) soup signals, so ΔH is measured
-    ///   from the true starting state.
-    /// - Timing/throughput use measured (non-warmup) epochs only.
+    ///   from the true starting state. `nil` when signal analysis was skipped
+    ///   (`--no-samples`): every kinetics field is then reported as not computed.
+    /// - `initialAnalysisSeconds` is the host wall spent measuring `initialSignals`,
+    ///   folded into `signalAnalysisMsTotal` alongside the per-epoch analysis time.
+    /// - Timing/throughput use measured (non-warmup) epochs only, and derive solely
+    ///   from the epoch execution wall — signal analysis is never mixed in.
     /// - Threshold crossings and kinetics use every epoch in order.
     public static func aggregate(config: BenchmarkConfig,
                                  deviceName: String?,
-                                 initialSignals: SoupSignals,
+                                 initialSignals: SoupSignals?,
                                  observations: [EpochObservation],
                                  finalDigestHex: String,
-                                 maxRSSBytes: Int?) -> BenchmarkResult {
-        let initialH = initialSignals.entropyBitsPerByte
+                                 maxRSSBytes: Int?,
+                                 initialAnalysisSeconds: Double? = nil) -> BenchmarkResult {
+        // Signal analysis is "available" only when we have both the initial reference
+        // and a signal for every epoch — i.e. it was not skipped by `--no-samples`.
+        let signalsAnalyzed = initialSignals != nil
+            && !observations.isEmpty
+            && observations.allSatisfy { $0.signals != nil }
+        let initialH = initialSignals?.entropyBitsPerByte
         let measured = observations.filter { !$0.isWarmup }
 
         // --- Timing over measured epochs ---
@@ -323,42 +371,64 @@ public enum BenchmarkAggregator {
         let perSec: (Int) -> Double = { measuredWall > 0 ? Double($0) / measuredWall : 0 }
         let epochsPerSecond = measuredWall > 0 ? n / measuredWall : 0
 
-        // --- Kinetics + thresholds over every epoch, in order ---
-        var tracker = ThresholdTracker(thresholds: config.deltaHThresholds)
+        // --- Kinetics + thresholds over every epoch, in order (only when analyzed) ---
+        // When `--no-samples` skipped analysis, every observation's `signals` is nil;
+        // we emit no thresholds, no samples, and nil kinetics rather than fabricating
+        // a flat ΔH == 0 trajectory.
+        var tracker = ThresholdTracker(thresholds: signalsAnalyzed ? config.deltaHThresholds : [])
         var cumWall = 0.0
         var cumGpu: Double? = 0.0
         var samples: [EpochSample] = []
-        for o in observations {
-            cumWall += o.wallSeconds
-            if let g = o.gpuSeconds, cumGpu != nil { cumGpu! += g } else { cumGpu = nil }
-            let deltaH = o.signals.entropyBitsPerByte - initialH
-            tracker.observe(epoch: o.epoch, deltaH: deltaH,
-                            cumulativeWallMs: cumWall * 1000,
-                            cumulativeGpuMs: cumGpu.map { $0 * 1000 })
+        if signalsAnalyzed, let initialH {
+            for o in observations {
+                cumWall += o.wallSeconds
+                if let g = o.gpuSeconds, cumGpu != nil { cumGpu! += g } else { cumGpu = nil }
+                guard let s = o.signals else { continue }
+                let deltaH = s.entropyBitsPerByte - initialH
+                tracker.observe(epoch: o.epoch, deltaH: deltaH,
+                                cumulativeWallMs: cumWall * 1000,
+                                cumulativeGpuMs: cumGpu.map { $0 * 1000 })
 
-            let isSamplePoint = (o.epoch % config.sampleInterval == 0)
-                || o.epoch == observations.last?.epoch
-            if isSamplePoint {
-                let gpuMs = o.gpuSeconds.map { $0 * 1000 }
-                samples.append(EpochSample(
-                    epoch: o.epoch,
-                    phase: o.isWarmup ? "warmup" : "measured",
-                    wallMs: o.wallSeconds * 1000,
-                    gpuMs: gpuMs,
-                    hostResidualMs: gpuMs.map { o.wallSeconds * 1000 - $0 },
-                    rawSteps: o.counters.totalRawSteps,
-                    commandSteps: o.counters.totalCommandSteps,
-                    copyWrites: o.counters.totalCopyWrites,
-                    entropyBitsPerByte: o.signals.entropyBitsPerByte,
-                    meanProgramEntropyBitsPerByte: o.signals.meanProgramEntropyBitsPerByte,
-                    deltaHFromInitial: deltaH,
-                    transitionRate: o.signals.transitionRate,
-                    compressionProxyRatio: o.signals.compressionProxyRatio))
+                let isSamplePoint = (o.epoch % config.sampleInterval == 0)
+                    || o.epoch == observations.last?.epoch
+                if isSamplePoint {
+                    let gpuMs = o.gpuSeconds.map { $0 * 1000 }
+                    samples.append(EpochSample(
+                        epoch: o.epoch,
+                        phase: o.isWarmup ? "warmup" : "measured",
+                        wallMs: o.wallSeconds * 1000,
+                        gpuMs: gpuMs,
+                        hostResidualMs: gpuMs.map { o.wallSeconds * 1000 - $0 },
+                        rawSteps: o.counters.totalRawSteps,
+                        commandSteps: o.counters.totalCommandSteps,
+                        copyWrites: o.counters.totalCopyWrites,
+                        entropyBitsPerByte: s.entropyBitsPerByte,
+                        meanProgramEntropyBitsPerByte: s.meanProgramEntropyBitsPerByte,
+                        deltaHFromInitial: deltaH,
+                        transitionRate: s.transitionRate,
+                        compressionProxyRatio: s.compressionProxyRatio))
+                }
             }
         }
 
+        // --- Host analysis cost (outside epoch wall); nil when not computed ---
+        let signalAnalysisMsTotal: Double? = signalsAnalyzed
+            ? (observations.compactMap { $0.analysisSeconds }.reduce(0, +)
+               + (initialAnalysisSeconds ?? 0)) * 1000
+            : nil
+
+        // --- Kinetics fields (nil when analysis was skipped) ---
         let last = observations.last?.signals
-        let finalH = last?.entropyBitsPerByte ?? initialH
+        let finalH: Double? = signalsAnalyzed ? (last?.entropyBitsPerByte ?? initialH) : nil
+        let finalDeltaH: Double? = (signalsAnalyzed && initialH != nil && finalH != nil)
+            ? finalH! - initialH! : nil
+        let finalMeanH: Double? = signalsAnalyzed
+            ? (last?.meanProgramEntropyBitsPerByte ?? initialSignals?.meanProgramEntropyBitsPerByte)
+            : nil
+        let finalTransition: Double? = signalsAnalyzed
+            ? (last?.transitionRate ?? initialSignals?.transitionRate) : nil
+        let finalCompression: Double? = signalsAnalyzed
+            ? (last?.compressionProxyRatio ?? initialSignals?.compressionProxyRatio) : nil
 
         let shadowChecked = observations.reduce(0) { $0 + $1.shadowChecked }
         let shadowMismatch = observations.reduce(0) { $0 + $1.shadowMismatches }
@@ -374,6 +444,7 @@ public enum BenchmarkAggregator {
             gpuMsPerEpoch: gpuMsPerEpoch,
             hostResidualMsPerEpoch: hostResidualMsPerEpoch,
             gpuBusyFraction: gpuBusyFraction,
+            signalAnalysisMsTotal: signalAnalysisMsTotal,
             epochsPerSecond: epochsPerSecond,
             pairsPerSecond: perSec(totalPairs),
             rawStepsPerSecond: perSec(totalRaw),
@@ -383,12 +454,13 @@ public enum BenchmarkAggregator {
             totalCommandSteps: totalCmd,
             totalCopyWrites: totalCopy,
             haltBudget: hB, haltPCOut: hP, haltUnmatched: hU, haltUnknown: hUnk,
-            initialEntropyBitsPerByte: initialH,
+            signalsAnalyzed: signalsAnalyzed,
+            initialEntropyBitsPerByte: signalsAnalyzed ? initialH : nil,
             finalEntropyBitsPerByte: finalH,
-            finalDeltaH: finalH - initialH,
-            finalMeanProgramEntropyBitsPerByte: last?.meanProgramEntropyBitsPerByte ?? initialSignals.meanProgramEntropyBitsPerByte,
-            finalTransitionRate: last?.transitionRate ?? initialSignals.transitionRate,
-            finalCompressionProxyRatio: last?.compressionProxyRatio ?? initialSignals.compressionProxyRatio,
+            finalDeltaH: finalDeltaH,
+            finalMeanProgramEntropyBitsPerByte: finalMeanH,
+            finalTransitionRate: finalTransition,
+            finalCompressionProxyRatio: finalCompression,
             thresholdCrossings: tracker.crossings,
             shadowCheckedTotal: shadowChecked,
             shadowMismatchTotal: shadowMismatch,

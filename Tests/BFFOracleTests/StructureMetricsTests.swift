@@ -106,4 +106,51 @@ final class StructureMetricsTests: XCTestCase {
         XCTAssertNotEqual(uniform, BFFRandom.constantSoup(programs: 16))
         XCTAssertNotEqual(uniform, BFFRandom.opcodeSoup(programs: 16, seed: 3))
     }
+
+    // MARK: - Opcode initializer: exact pinned contract (blocker 7)
+
+    /// The ten opcode byte VALUES are exactly the commands of cubff's `CommandRepr`
+    /// `"[]+-.,<>{}"` (as a set), and each has the documented ASCII code.
+    func testOpcodeAlphabetIsExactlyTheTenCommandBytes() {
+        XCTAssertEqual(BFFOp.all.count, 10)
+        let commandRepr: [UInt8] = Array("[]+-.,<>{}".utf8)
+        XCTAssertEqual(Set(BFFOp.all), Set(commandRepr),
+                       "the alphabet's byte values are exactly the ten command bytes")
+        // Exact codes, in BFFOp.all's own index order: < > { } + - . , [ ]
+        XCTAssertEqual(BFFOp.all,
+                       [0x3C, 0x3E, 0x7B, 0x7D, 0x2B, 0x2D, 0x2E, 0x2C, 0x5B, 0x5D])
+    }
+
+    /// Byte `i` of the opcode soup is exactly `BFFOp.all[draw % 10]` where `draw`
+    /// uses the epoch-0 `.soupInit` stream and index `i` — the pinned stream/index
+    /// mapping and modulo selection. This reconstructs the whole soup independently.
+    func testOpcodeSoupExactStreamIndexAndModuloMapping() {
+        let seed: UInt32 = 12345
+        let programs = 8
+        let soup = BFFRandom.opcodeSoup(programs: programs, seed: seed)
+
+        // .soupInit stream is epoch 0 → 0*4 + 2 = 2.
+        let stream = BFFRandom.stream(epoch: 0, pass: .soupInit)
+        XCTAssertEqual(stream, 2, "soupInit stream at epoch 0 must be 2")
+
+        let n = UInt32(BFFOp.all.count)   // 10
+        for i in 0..<soup.count {
+            let draw = BFFRandom.rng3(seed: seed, stream: stream, index: UInt32(i))
+            XCTAssertEqual(soup[i], BFFOp.all[Int(draw % n)],
+                           "byte \(i) must be alphabet[draw % 10]")
+        }
+    }
+
+    /// The modulo-bias contract: `2^32 mod 10 == 6`, so residues 0...5 occur one extra
+    /// time over `[0, 2^32)`. This documents (and pins) that `% 10` is a deliberate,
+    /// negligibly-biased mapping, not a claim of perfect uniformity.
+    func testOpcodeModuloBiasContract() {
+        XCTAssertEqual((1 << 32) % 10, 6)
+    }
+
+    /// The default per-byte mutation probability is the pinned `1<<20` (= 1/4096).
+    func testDefaultMutationProbabilityIsPinned() {
+        XCTAssertEqual(BFF.defaultMutationP32, 1 << 20)
+        XCTAssertEqual(BFF.defaultMutationP32, 1_048_576)
+    }
 }
