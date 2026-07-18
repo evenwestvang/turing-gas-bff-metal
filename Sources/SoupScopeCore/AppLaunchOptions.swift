@@ -84,8 +84,14 @@ public struct AppLaunchOptions: Equatable, Sendable {
 
     /// Parse arguments (already stripped of the executable name). Recognizes the
     /// `--flag value` forms above; `--shadow-sample all` shadows every pair.
+    ///
+    /// `all` resolves to `programCount / 2` against the *final* program count, so the
+    /// result is independent of whether `--programs` precedes or follows
+    /// `--shadow-sample all` on the command line (resolution is deferred to after the
+    /// whole argument list is consumed).
     public static func parse(_ args: [String]) throws -> AppLaunchOptions {
         var options = AppLaunchOptions()
+        var shadowSampleAll = false
         var i = 0
         func value(_ flag: String) throws -> String {
             guard i < args.count else { throw ParseError.missingValue(flag) }
@@ -111,9 +117,14 @@ public struct AppLaunchOptions: Equatable, Sendable {
             case "--mutation-p32": options.mutationP32 = try u32(flag, try value(flag))
             case "--shadow-sample":
                 let raw = try value(flag)
-                options.shadowSampleCount = (raw == "all")
-                    ? options.programCount / 2
-                    : try int(flag, raw)
+                if raw == "all" {
+                    // Resolve after the whole list is parsed, against the final program
+                    // count — order-independent (see below).
+                    shadowSampleAll = true
+                } else {
+                    shadowSampleAll = false
+                    options.shadowSampleCount = try int(flag, raw)
+                }
             case "--variant":
                 let raw = try value(flag)
                 guard let v = BFFVariant(rawValue: raw) else {
@@ -134,6 +145,11 @@ public struct AppLaunchOptions: Equatable, Sendable {
             default:
                 throw ParseError.unknownFlag(flag)
             }
+        }
+        // `--shadow-sample all` resolves here, against the final program count, so it is
+        // independent of the order of `--programs` and `--shadow-sample` on the line.
+        if shadowSampleAll {
+            options.shadowSampleCount = max(0, options.programCount / 2)
         }
         return options
     }

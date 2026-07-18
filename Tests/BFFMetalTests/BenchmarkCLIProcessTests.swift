@@ -73,6 +73,32 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         XCTAssertEqual(junk.status, 64)
     }
 
+    // MARK: - --shadow-sample all resolves independently of argument order
+
+    /// `--shadow-sample all` resolves to `programs / 2` against the matched program
+    /// size, regardless of whether `--programs` precedes or follows it. The bench
+    /// resolves `all` per matrix cell after the whole line is parsed; this process test
+    /// pins that end to end so an argument-order regression can't creep back in. On a
+    /// non-Metal host the resolved shadow count is echoed in the would-run line; on a
+    /// Metal host we only require the invocation is accepted (not a usage error).
+    func testShadowSampleAllIsArgumentOrderIndependent() throws {
+        let programsFirst = try runBench(["--programs", "4", "--shadow-sample", "all",
+                                          "--warmup", "0", "--epochs", "1"])
+        let sampleFirst = try runBench(["--shadow-sample", "all", "--programs", "4",
+                                        "--warmup", "0", "--epochs", "1"])
+        #if canImport(Metal)
+        XCTAssertNotEqual(programsFirst.status, 64, "`all` must not be a usage error")
+        XCTAssertNotEqual(sampleFirst.status, 64, "`all` must not be a usage error")
+        #else
+        XCTAssertEqual(programsFirst.status, 2)
+        XCTAssertEqual(sampleFirst.status, 2)
+        XCTAssertTrue(programsFirst.stderr.contains("shadowSample=2"),
+                      "all → programs/2 = 2 when --programs precedes --shadow-sample")
+        XCTAssertTrue(sampleFirst.stderr.contains("shadowSample=2"),
+                      "all → programs/2 = 2 when --shadow-sample precedes --programs")
+        #endif
+    }
+
     // MARK: - --no-samples propagation and schema behavior
 
     /// `--no-samples` is accepted and propagated; on a non-Metal host the run emits a

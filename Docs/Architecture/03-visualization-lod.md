@@ -233,8 +233,13 @@ total per frame.
 
 - **Zoom**: pinch (`MagnifyGesture`) and scroll wheel, **anchored at the cursor**:
   `origin' = b_cursor − pixel_cursor / bytePx'`. Exponential response
-  (`bytePx *= exp(k·Δ)`), then clamp to [`minBytePx`, 96], with `origin` re-clamped so the
-  soup stays on screen (allow ~25 % overscroll margin).
+  (`bytePx *= exp(k·Δ)`), then clamp to [`minBytePx`, 96], with `origin` re-clamped by the
+  **camera invariant**: the populated content is never pannable partially or fully outside the
+  viewport. Per axis, content larger than the viewport stays fully covering it (no background
+  gap opens at either edge — no overscroll); content smaller than the viewport is centered and
+  panning on that axis is disabled. Fit/reset, cursor-anchored zoom, pan, resize, the max-zoom
+  limit, and non-finite gesture input all re-establish it through the one shared clamp
+  (`Camera.clamp`, pinned by `CameraInvariantTests`).
 - **Pan**: drag; also two-finger scroll. Inertia via a critically-damped spring on
   `(originByte, log bytePx)` — animate in the render loop on the CPU, ~5 lines, feels native.
 - **Double-click**: animate zoom to the clicked *program* framed at `bytePx = 14` (glyph

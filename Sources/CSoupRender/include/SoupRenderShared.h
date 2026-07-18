@@ -41,9 +41,11 @@ typedef struct {
     uint32_t programCount; /* offset 36 — real programs; cells >= this are background */
     uint32_t metricChannel; /* offset 40 — 0 activity, 1 entropy, 2 life composite */
     uint32_t flags;      /* offset 44 — reserved, must be 0 */
-} VizUniforms;           /* size 48, alignment 4 */
+    float programBoundaryBlend; /* offset 48 — smoothstep(24,48,8*bytePx), host-evaluated */
+    float byteBoundaryBlend;    /* offset 52 — smoothstep(24,32,bytePx), host-evaluated */
+} VizUniforms;           /* size 56, alignment 4 */
 
-_Static_assert(sizeof(VizUniforms) == 48, "VizUniforms must be 48 bytes");
+_Static_assert(sizeof(VizUniforms) == 56, "VizUniforms must be 56 bytes");
 _Static_assert(_Alignof(VizUniforms) == 4, "VizUniforms must be 4-byte aligned");
 _Static_assert(offsetof(VizUniforms, viewportPxX) == 0, "viewportPxX at 0");
 _Static_assert(offsetof(VizUniforms, viewportPxY) == 4, "viewportPxY at 4");
@@ -57,5 +59,7 @@ _Static_assert(offsetof(VizUniforms, gridHeight) == 32, "gridHeight at 32");
 _Static_assert(offsetof(VizUniforms, programCount) == 36, "programCount at 36");
 _Static_assert(offsetof(VizUniforms, metricChannel) == 40, "metricChannel at 40");
 _Static_assert(offsetof(VizUniforms, flags) == 44, "flags at 44");
+_Static_assert(offsetof(VizUniforms, programBoundaryBlend) == 48, "programBoundaryBlend at 48");
+_Static_assert(offsetof(VizUniforms, byteBoundaryBlend) == 52, "byteBoundaryBlend at 52");
 
 #endif /* SOUP_RENDER_SHARED_H */

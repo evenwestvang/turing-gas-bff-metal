@@ -13,6 +13,10 @@ public struct LODReadout: Equatable, Sendable {
     public let microBlend: Double
     /// Opacity of the opcode glyph overlay.
     public let glyphBlend: Double
+    /// Program-boundary (8×8-block edge) fade, gated on `8·bytePx`.
+    public let programBoundaryBlend: Double
+    /// Per-byte-boundary fade, close LOD only, drawn beneath the glyph ink.
+    public let byteBoundaryBlend: Double
 
     /// Evaluate the readout from the same camera transform and LOD model a frame
     /// renders with — the blend factors come from `LODModel`'s tested methods, not a
@@ -23,6 +27,8 @@ public struct LODReadout: Equatable, Sendable {
         self.macroBlend = lod.macroBlend(bytePx: px)
         self.microBlend = lod.microBlend(bytePx: px)
         self.glyphBlend = lod.glyphBlend(bytePx: px)
+        self.programBoundaryBlend = lod.programBoundaryBlend(bytePx: px)
+        self.byteBoundaryBlend = lod.byteBoundaryBlend(bytePx: px)
     }
 
     /// The readout for the frame currently being submitted, paired with whether it

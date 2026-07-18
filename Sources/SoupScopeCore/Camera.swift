@@ -17,26 +17,22 @@ public struct CameraGeometry: Equatable, Sendable {
     public var viewPxHeight: Double
     /// Hard zoom-in ceiling in pixels per byte cell (03 §2 uses 96).
     public var maxBytePx: Double
-    /// Overscroll margin as a fraction of the visible span; the soup may drift this
-    /// far past a viewport edge before panning is clamped (03 §8 ≈ 0.25).
-    public var overscroll: Double
 
     public init(soupByteWidth: Double, soupByteHeight: Double,
                 viewPxWidth: Double, viewPxHeight: Double,
-                maxBytePx: Double = 96, overscroll: Double = 0.25) {
+                maxBytePx: Double = 96) {
         self.soupByteWidth = soupByteWidth
         self.soupByteHeight = soupByteHeight
         self.viewPxWidth = viewPxWidth
         self.viewPxHeight = viewPxHeight
         self.maxBytePx = maxBytePx
-        self.overscroll = overscroll
     }
 
     /// Whether every field is finite and positive enough to transform against.
     public var isUsable: Bool {
         [soupByteWidth, soupByteHeight, viewPxWidth, viewPxHeight, maxBytePx].allSatisfy {
             $0.isFinite && $0 > 0
-        } && overscroll.isFinite && overscroll >= 0
+        }
     }
 }
 
@@ -45,9 +41,17 @@ public struct CameraGeometry: Equatable, Sendable {
 /// State is just the byte coordinate at the top-left pixel (`originByte`) and the
 /// LOD variable `bytePx` (screen pixels per byte cell). Screen → soup is
 /// `b = originByte + pixel / bytePx`. Every mutating operation re-clamps so
-/// `bytePx ∈ [minBytePx, maxBytePx]` and the soup cannot fully leave the viewport,
-/// and every operation ignores non-finite inputs — so the transform can never
-/// become NaN/Inf regardless of gesture noise.
+/// `bytePx ∈ [minBytePx, maxBytePx]` and the **camera invariant** holds, and every
+/// operation ignores non-finite inputs — so the transform can never become NaN/Inf
+/// regardless of gesture noise.
+///
+/// Camera invariant (per axis): the populated content is never pannable partially
+/// or fully outside the viewport. On an axis where the content is *larger* than the
+/// viewport it stays fully covering it (no background gap can open at either edge —
+/// there is no overscroll); on an axis where the content is *smaller than or equal
+/// to* the viewport it is centered and panning on that axis is disabled. Fit/reset,
+/// cursor-anchored zoom, pan, resize, and the max-zoom limit all re-establish it
+/// through the shared `clamp`.
 public struct Camera: Equatable, Sendable {
     /// Soup byte coordinate mapped to the top-left pixel.
     public var originByteX: Double
@@ -82,8 +86,9 @@ public struct Camera: Equatable, Sendable {
         ((byteX - originByteX) * bytePx, (byteY - originByteY) * bytePx)
     }
 
-    /// Clamp `bytePx` into `[minBytePx, maxBytePx]` and re-clamp the origin so the
-    /// soup stays within the overscroll margin. Idempotent.
+    /// Clamp `bytePx` into `[minBytePx, maxBytePx]` and re-establish the camera
+    /// invariant on each axis (content covers the viewport, or is centered when it is
+    /// smaller than the viewport). Idempotent.
     public mutating func clamp(_ g: CameraGeometry) {
         guard g.isUsable else { return }
         let lo = minBytePx(g)
@@ -91,10 +96,8 @@ public struct Camera: Equatable, Sendable {
         if !bytePx.isFinite || bytePx <= 0 { bytePx = lo }
         bytePx = Swift.min(Swift.max(bytePx, lo), hi)
 
-        clampOrigin(&originByteX, viewPx: g.viewPxWidth, soupBytes: g.soupByteWidth,
-                    margin: g.overscroll)
-        clampOrigin(&originByteY, viewPx: g.viewPxHeight, soupBytes: g.soupByteHeight,
-                    margin: g.overscroll)
+        clampOrigin(&originByteX, viewPx: g.viewPxWidth, soupBytes: g.soupByteWidth)
+        clampOrigin(&originByteY, viewPx: g.viewPxHeight, soupBytes: g.soupByteHeight)
     }
 
     /// Zoom by `factor` (≈ `exp(k·Δ)`) anchored at a screen pixel: the soup byte
@@ -139,15 +142,18 @@ public struct Camera: Equatable, Sendable {
         clamp(g)
     }
 
-    private func clampOrigin(_ v: inout Double, viewPx: Double, soupBytes: Double,
-                             margin: Double) {
+    /// Re-establish the invariant on one axis. Content larger than the viewport is
+    /// clamped so it fully covers the viewport (`origin ∈ [0, soupBytes − visible]`,
+    /// no background gap at either edge); content smaller than or equal to the
+    /// viewport is pinned to the centered origin, which also disables panning on that
+    /// axis (any pan is immediately clamped back to center).
+    private func clampOrigin(_ v: inout Double, viewPx: Double, soupBytes: Double) {
         guard v.isFinite, bytePx > 0 else { v = 0; return }
         let visible = viewPx / bytePx                 // soup bytes across the viewport
-        let slack = margin * visible
-        let a = -slack                                // soup left/top edge past origin
-        let b = soupBytes - visible + slack           // soup right/bottom edge
-        let lo = Swift.min(a, b)
-        let hi = Swift.max(a, b)
-        v = Swift.min(Swift.max(v, lo), hi)
+        if soupBytes <= visible {
+            v = (soupBytes - visible) / 2             // center; nothing to reveal by panning
+        } else {
+            v = Swift.min(Swift.max(v, 0), soupBytes - visible)
+        }
     }
 }

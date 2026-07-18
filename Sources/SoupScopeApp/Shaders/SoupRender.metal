@@ -34,9 +34,11 @@ struct VizUniforms {
     uint  programCount;   // 36 real programs (cells >= this render as background)
     uint  metricChannel;  // 40 0 activity, 1 entropy, 2 life composite
     uint  flags;          // 44 reserved
-};                        // size 48, align 4
+    float programBoundaryBlend; // 48 smoothstep(24,48,8*bytePx) — host-evaluated (LODModel)
+    float byteBoundaryBlend;    // 52 smoothstep(24,32,bytePx)   — host-evaluated
+};                        // size 56, align 4
 
-static_assert(sizeof(VizUniforms) == 48, "VizUniforms must be 48 bytes");
+static_assert(sizeof(VizUniforms) == 56, "VizUniforms must be 56 bytes");
 static_assert(alignof(VizUniforms) == 4, "VizUniforms must be 4-byte aligned");
 
 constant float3 kBackground = float3(0.02, 0.02, 0.03);
@@ -169,20 +171,35 @@ fragment float4 soup_fragment(VSOut in [[stage_in]],
     uint byteIndex = inBlk.y * 8u + inBlk.x;   // reading order = tape order
     uchar bv = soup[prog * 64u + byteIndex];
     float3 micro = palette_color(bv);
+    float2 cellUV = fract(b);                  // position within this byte cell (0..1)
 
+    // Structural boundaries, drawn BENEATH the glyph ink so glyphs stay legible. Both
+    // fade factors are host-evaluated (LODModel, pinned by Swift tests); the shader
+    // only draws them — it never re-derives the thresholds. A padded/background cell
+    // never reaches here (the prog >= programCount guard above returned), so a boundary
+    // can never bleed onto padding. Line width ≈ 1 device pixel, in cell-fraction units.
+    float lineFrac = min(0.5 / max(u.bytePx, 1e-4), 0.5);
+
+    // Program boundaries: the outer (top/left) edge of each 8×8 block. Absent at macro
+    // LOD (blend is 0 while a program cell is subpixel), subtle when the blocks read.
+    if (u.programBoundaryBlend > 0.0) {
+        bool onProgEdge = (inBlk.x == 0u && cellUV.x < lineFrac)
+                        || (inBlk.y == 0u && cellUV.y < lineFrac);
+        if (onProgEdge) micro = mix(micro, kBackground, 0.55 * u.programBoundaryBlend);
+    }
+
+    // Per-byte boundaries: every byte-cell edge, low alpha, closest LOD only.
+    if (u.byteBoundaryBlend > 0.0) {
+        bool onByteEdge = (cellUV.x < lineFrac) || (cellUV.y < lineFrac);
+        if (onByteEdge) micro = mix(micro, kBackground, 0.18 * u.byteBoundaryBlend);
+    }
+
+    // Opcode glyph ink on top of the boundaries.
     if (u.glyphBlend > 0.0) {
-        float2 cellUV = fract(b);
         float ink = glyph_ink(bv, cellUV) * u.glyphBlend;
         float lum = dot(micro, float3(0.299, 0.587, 0.114));
         float3 inkColor = lum > 0.45 ? float3(0.02) : float3(0.95);
         micro = mix(micro, inkColor, ink);
-    }
-
-    // Faint program-block outline once byte cells are large, to reveal the 8×8
-    // structure without a hard mode switch.
-    if (u.bytePx >= 3.0 && (inBlk.x == 0u || inBlk.y == 0u)) {
-        float edge = 0.25 * u.microBlend;
-        micro = mix(micro, float3(0.0), edge * 0.15);
     }
 
     float3 c = mix(macro, micro, clamp(u.microBlend, 0.0, 1.0));
@@ -210,4 +227,6 @@ kernel void viz_layout_probe(device uint *out [[buffer(0)]],
     out[11] = (uint)((thread char *)&v.programCount - base);
     out[12] = (uint)((thread char *)&v.metricChannel - base);
     out[13] = (uint)((thread char *)&v.flags - base);
+    out[14] = (uint)((thread char *)&v.programBoundaryBlend - base);
+    out[15] = (uint)((thread char *)&v.byteBoundaryBlend - base);
 }

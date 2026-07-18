@@ -13,6 +13,7 @@ public enum VizLayout {
     ///     [2] viewportPxX [3] viewportPxY [4] originByteX [5] originByteY
     ///     [6] bytePx   [7] microBlend  [8] glyphBlend
     ///     [9] gridWidth [10] gridHeight [11] programCount [12] metricChannel [13] flags
+    ///     [14] programBoundaryBlend [15] byteBoundaryBlend
     public static func hostProbeWords() -> [UInt32] {
         func word(_ value: Int?) -> UInt32 {
             guard let value, let narrowed = UInt32(exactly: value) else {
@@ -35,11 +36,13 @@ public enum VizLayout {
             word(MemoryLayout<VizUniforms>.offset(of: \.programCount)),
             word(MemoryLayout<VizUniforms>.offset(of: \.metricChannel)),
             word(MemoryLayout<VizUniforms>.offset(of: \.flags)),
+            word(MemoryLayout<VizUniforms>.offset(of: \.programBoundaryBlend)),
+            word(MemoryLayout<VizUniforms>.offset(of: \.byteBoundaryBlend)),
         ]
     }
 
     /// Number of `uint32` words the probe writes.
-    public static var probeWordCount: Int { 14 }
+    public static var probeWordCount: Int { 16 }
 
     /// Build the per-frame uniforms from the current transform, layout, and the
     /// frame's already-evaluated `LODReadout`. The blend factors are taken straight
@@ -62,6 +65,8 @@ public enum VizLayout {
             gridHeight: UInt32(grid.height),
             programCount: UInt32(grid.programCount),
             metricChannel: metricChannel,
-            flags: 0)
+            flags: 0,
+            programBoundaryBlend: Float(readout.programBoundaryBlend),
+            byteBoundaryBlend: Float(readout.byteBoundaryBlend))
     }
 }

@@ -92,6 +92,38 @@ final class VisualizationModelTests: XCTestCase {
         XCTAssertEqual(full.populatedRows, 256)
     }
 
+    func testFullCanonicalFieldFramesAndFitsAsAWhole() {
+        // The full 131072-program soup fills every canonical cell: 512×256 program
+        // cells → the whole 4096×2048 byte grid is populated.
+        let g = ProgramGrid(programCount: ProgramGrid.capacity)
+        XCTAssertEqual(g.programCount, 131_072)
+        XCTAssertEqual(g.paddedCellCount, 0, "the full field has no padding")
+        XCTAssertEqual(g.populatedColumns, 512)
+        XCTAssertEqual(g.populatedRows, 256)
+        XCTAssertEqual(g.populatedByteWidth, 4096)
+        XCTAssertEqual(g.populatedByteHeight, 2048)
+
+        // A camera built from that populated extent fits the entire field and honors the
+        // invariant: at min zoom the field is centered (fit adds breathing room), and the
+        // whole 4096×2048 span is inside the viewport.
+        var cam = Camera()
+        let geo = CameraGeometry(soupByteWidth: Double(g.populatedByteWidth),
+                                 soupByteHeight: Double(g.populatedByteHeight),
+                                 viewPxWidth: 1440, viewPxHeight: 900)
+        cam.fitAll(geo)
+        XCTAssertEqual(cam.bytePx, cam.minBytePx(geo), accuracy: 1e-12)
+        // Both corners of the field map inside the viewport at fit (content ≤ viewport).
+        let tl = cam.byteToScreen(byteX: 0, byteY: 0)
+        let br = cam.byteToScreen(byteX: 4096, byteY: 2048)
+        XCTAssertGreaterThanOrEqual(tl.x, -1e-6)
+        XCTAssertGreaterThanOrEqual(tl.y, -1e-6)
+        XCTAssertLessThanOrEqual(br.x, geo.viewPxWidth + 1e-6)
+        XCTAssertLessThanOrEqual(br.y, geo.viewPxHeight + 1e-6)
+        // Centered: equal margins horizontally and vertically.
+        XCTAssertEqual(tl.x, geo.viewPxWidth - br.x, accuracy: 1e-4)
+        XCTAssertEqual(tl.y, geo.viewPxHeight - br.y, accuracy: 1e-4)
+    }
+
     func testByteOffsetIsTapeReadingOrder() {
         XCTAssertEqual(ProgramGrid.byteOffset(inBlockX: 0, inBlockY: 0), 0)
         XCTAssertEqual(ProgramGrid.byteOffset(inBlockX: 7, inBlockY: 0), 7)
@@ -142,12 +174,20 @@ final class VisualizationModelTests: XCTestCase {
         var cam = Camera()
         let g = geometry()
         cam.fitAll(g)
+        // Zoom in so the content is larger than the viewport on both axes (panning is
+        // only meaningful once content exceeds the viewport).
+        cam.zoom(factor: 20, anchorPxX: 400, anchorPxY: 300, geometry: g)
         // Pan absurdly far in both directions; origin must stay clamped/finite.
         for _ in 0 ..< 100 { cam.pan(dxPx: 100_000, dyPx: 100_000, geometry: g) }
         XCTAssertTrue(cam.originByteX.isFinite && cam.originByteY.isFinite)
-        // Soup right/bottom edge cannot pass the overscroll margin off-screen.
+        // No overscroll: content stays fully covering the viewport, so origin never
+        // exceeds `soupBytes − visible` (right/bottom edge flush with the viewport).
         let visW = g.viewPxWidth / cam.bytePx
-        XCTAssertLessThanOrEqual(cam.originByteX, g.soupByteWidth - visW + g.overscroll * visW + 1e-6)
+        let visH = g.viewPxHeight / cam.bytePx
+        XCTAssertLessThanOrEqual(cam.originByteX, g.soupByteWidth - visW + 1e-6)
+        XCTAssertLessThanOrEqual(cam.originByteY, g.soupByteHeight - visH + 1e-6)
+        XCTAssertGreaterThanOrEqual(cam.originByteX, -1e-6)
+        XCTAssertGreaterThanOrEqual(cam.originByteY, -1e-6)
     }
 
     func testNonFiniteInputsAreIgnored() {
@@ -185,6 +225,78 @@ final class VisualizationModelTests: XCTestCase {
 
     func testSmoothstepHandlesNonFinite() {
         XCTAssertEqual(LODModel.smoothstep(0, 1, .nan), 0)
+    }
+
+    // MARK: - LOD-gated structural boundaries (program + byte)
+
+    func testProgramBoundaryIsAbsentAtMacroAndFadesInOnBlockSize() {
+        let lod = LODModel()
+        // Gated on the program-cell size on screen = 8·bytePx. Below the start it is
+        // absent, including the subpixel-macro regime (a program cell < 1 px).
+        XCTAssertEqual(lod.programBoundaryStartPx, 24, accuracy: 1e-12)  // 8·3
+        XCTAssertEqual(lod.programBoundaryEndPx, 48, accuracy: 1e-12)    // 8·6
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 0.1), 0, accuracy: 1e-12) // 0.8px block
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 1.0), 0, accuracy: 1e-12) // 8px block
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 3.0), 0, accuracy: 1e-12) // at start
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 6.0), 1, accuracy: 1e-12) // at end
+        // Strictly increasing in the fade band (smoothstep midpoint at 8·bytePx = 36).
+        let mid = lod.programBoundaryBlend(bytePx: 4.5)                  // 8·4.5 = 36
+        XCTAssertEqual(mid, 0.5, accuracy: 1e-12)
+        XCTAssertGreaterThan(lod.programBoundaryBlend(bytePx: 5.0),
+                             lod.programBoundaryBlend(bytePx: 4.0))
+    }
+
+    func testByteBoundaryIsCloseLODOnlyAndFadesIn() {
+        let lod = LODModel()
+        // Gated directly on bytePx; only appears at the closest zoom.
+        XCTAssertEqual(lod.byteBoundaryStart, 24, accuracy: 1e-12)
+        XCTAssertEqual(lod.byteBoundaryEnd, 32, accuracy: 1e-12)
+        XCTAssertEqual(lod.byteBoundaryBlend(bytePx: 1.0), 0, accuracy: 1e-12)
+        XCTAssertEqual(lod.byteBoundaryBlend(bytePx: 12.0), 0, accuracy: 1e-12) // glyphs, no byte grid yet
+        XCTAssertEqual(lod.byteBoundaryBlend(bytePx: 24.0), 0, accuracy: 1e-12) // at start
+        XCTAssertEqual(lod.byteBoundaryBlend(bytePx: 32.0), 1, accuracy: 1e-12) // at end
+        let mid = lod.byteBoundaryBlend(bytePx: 28.0)                    // smoothstep midpoint
+        XCTAssertEqual(mid, 0.5, accuracy: 1e-12)
+        // Byte boundaries only switch on well after glyphs begin (readability: the byte
+        // grid never precedes the glyph ink it sits beneath).
+        XCTAssertGreaterThan(lod.byteBoundaryStart, lod.glyphStart)
+    }
+
+    func testBoundaryBlendsRideInTheRenderReadoutAndUniforms() {
+        // The two boundary fades are host-evaluated in exactly one place (LODReadout)
+        // and handed to the shader verbatim through the uniforms — never re-derived on
+        // the GPU, so the shader cannot drift from the tested thresholds.
+        let lod = LODModel()
+        let grid = ProgramGrid(programCount: 1024)
+        for px in [0.1, 3.0, 4.5, 6.0, 12.0, 24.0, 28.0, 32.0, 96.0] {
+            let camera = Camera(bytePx: px)
+            let readout = LODReadout(camera: camera, lod: lod)
+            XCTAssertEqual(readout.programBoundaryBlend, lod.programBoundaryBlend(bytePx: px),
+                           accuracy: 1e-12)
+            XCTAssertEqual(readout.byteBoundaryBlend, lod.byteBoundaryBlend(bytePx: px),
+                           accuracy: 1e-12)
+            let u = VizLayout.makeUniforms(readout: readout, camera: camera, grid: grid,
+                                           metricChannel: 2, viewPxWidth: 800, viewPxHeight: 600)
+            XCTAssertEqual(u.programBoundaryBlend, Float(readout.programBoundaryBlend))
+            XCTAssertEqual(u.byteBoundaryBlend, Float(readout.byteBoundaryBlend))
+        }
+    }
+
+    func testBoundariesNeverIndexPaddingCells() {
+        // The shader draws a boundary only after resolving a real program (it returns
+        // background for prog >= programCount before any boundary code). That guarantee
+        // is the grid's padding contract: on a ragged last row, the cell just past the
+        // final program is padding and never resolves to a soup index, so no boundary
+        // can be painted onto padding.
+        let g = ProgramGrid(programCount: 1025)          // 2 full rows + 1 cell in row 2
+        XCTAssertEqual(g.populatedRows, 3)
+        XCTAssertEqual(g.programIndex(col: 0, row: 2), 1024) // the lone real cell of row 2
+        XCTAssertNil(g.programIndex(col: 1, row: 2))         // its right neighbor is padding
+        // Every canonical cell is either a real program (< programCount) or padding —
+        // the render/boundary path can only key off a non-nil program index.
+        for (col, row) in [(1, 2), (300, 200), (511, 255)] {
+            XCTAssertNil(g.programIndex(col: col, row: row))
+        }
     }
 
     // MARK: - LOD readout: the values the HUD displays, at the transition endpoints
@@ -426,9 +538,9 @@ final class VisualizationModelTests: XCTestCase {
     // MARK: - VizUniforms host layout
 
     func testVizLayoutHostProbeWordsMatchDocumentedLiterals() {
-        XCTAssertEqual(VizLayout.probeWordCount, 14)
+        XCTAssertEqual(VizLayout.probeWordCount, 16)
         XCTAssertEqual(VizLayout.hostProbeWords(),
-                       [48, 4, 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44])
+                       [56, 4, 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52])
     }
 
     // MARK: - Launch options
@@ -454,6 +566,34 @@ final class VisualizationModelTests: XCTestCase {
 
         // A valid config is produced from the defaults.
         XCTAssertNoThrow(try defaults.soupConfig())
+    }
+
+    func testShadowSampleAllResolvesIndependentlyOfArgumentOrder() throws {
+        // `all` = programCount / 2, regardless of whether --programs comes before or
+        // after --shadow-sample (resolution is deferred to after the full parse).
+        let before = try AppLaunchOptions.parse(["--programs", "64", "--shadow-sample", "all"])
+        let after = try AppLaunchOptions.parse(["--shadow-sample", "all", "--programs", "64"])
+        XCTAssertEqual(before.shadowSampleCount, 32)
+        XCTAssertEqual(after.shadowSampleCount, 32)
+        XCTAssertEqual(before.shadowSampleCount, after.shadowSampleCount,
+                       "order of --programs / --shadow-sample must not change the result")
+
+        // `all` with the default program count resolves against that default (1024/2).
+        let defaulted = try AppLaunchOptions.parse(["--shadow-sample", "all"])
+        XCTAssertEqual(defaulted.shadowSampleCount, 512)
+
+        // A later explicit --programs after `all` still governs; a later explicit numeric
+        // --shadow-sample after `all` overrides `all` (last flag wins, not `all`).
+        let overridden = try AppLaunchOptions.parse(
+            ["--shadow-sample", "all", "--programs", "8", "--shadow-sample", "3"])
+        XCTAssertEqual(overridden.shadowSampleCount, 3)
+        let reAll = try AppLaunchOptions.parse(
+            ["--shadow-sample", "3", "--programs", "8", "--shadow-sample", "all"])
+        XCTAssertEqual(reAll.shadowSampleCount, 4, "trailing 'all' re-resolves to pairs (8/2)")
+
+        // Resolved counts still produce a valid config on both orders.
+        XCTAssertNoThrow(try before.soupConfig())
+        XCTAssertNoThrow(try after.soupConfig())
     }
 
     func testProgramCountAboveCanvasCapacityIsRejected() throws {
