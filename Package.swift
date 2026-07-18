@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "bff-metal-parity", targets: ["bff-metal-parity"]),
         .executable(name: "bff-metal-soup", targets: ["bff-metal-soup"]),
         .executable(name: "bff-metal-bench", targets: ["bff-metal-bench"]),
+        .executable(name: "bff-resident-epoch", targets: ["bff-resident-epoch"]),
         .executable(name: "SoupScope", targets: ["SoupScopeApp"]),
     ],
     targets: [
@@ -45,7 +46,10 @@ let package = Package(
         .target(
             name: "BFFMetal",
             dependencies: ["BFFOracle", "CBFFShared"],
-            resources: [.copy("Shaders/BFFEvaluate.metal")]
+            resources: [
+                .copy("Shaders/BFFEvaluate.metal"),
+                .copy("Shaders/BFFResidentEpoch.metal"),
+            ]
         ),
         // Command-line GPU fixture parity runner (exits 2 on non-Metal hosts).
         .executableTarget(name: "bff-metal-parity",
@@ -57,6 +61,11 @@ let package = Package(
         // native M4 Max runs (exits 2 on non-Metal hosts).
         .executableTarget(name: "bff-metal-bench",
                           dependencies: ["BFFMetal", "BFFOracle", "BrotliMetrics"]),
+        // Experimental first runnable GPU-resident epoch vertical slice. This is an
+        // opt-in product with its own shader and CLI; existing defaults/products stay
+        // unchanged.
+        .executableTarget(name: "bff-resident-epoch",
+                          dependencies: ["BFFMetal", "BFFOracle"]),
         // Platform-independent app core: grid/camera/LOD/normalization/opcode/
         // batcher/HUD/snapshot pure models + launch-option parsing. Depends on
         // BFFMetal for the soup runner and epoch types; builds and is tested on
