@@ -358,8 +358,10 @@ public struct HostStageAttribution: Sendable, Equatable, Codable {
                 - (allocMs ?? 0) - (uploadMs ?? 0) - (encodeMs ?? 0)
                 - (submitMs ?? 0) - (readbackMs ?? 0))
             : nil
-        let evaluatorClassifiedMs = (allocMs ?? 0) + (uploadMs ?? 0) + (encodeMs ?? 0)
-            + (submitMs ?? 0) + (readbackMs ?? 0)
+        let evaluatorClassifiedFrontMs: Double = (allocMs ?? 0) + (uploadMs ?? 0)
+        let evaluatorClassifiedEncodeMs: Double = evaluatorClassifiedFrontMs + (encodeMs ?? 0)
+        let evaluatorClassifiedSubmitMs: Double = evaluatorClassifiedEncodeMs + (submitMs ?? 0)
+        let evaluatorClassifiedMs: Double = evaluatorClassifiedSubmitMs + (readbackMs ?? 0)
         let evaluatorValid = evaluatorUnclassifiedMs.map {
             !TimingReconciliationTolerance.isOverrun(
                 -$0 / 1000.0, enclosingSeconds: eval / n,
