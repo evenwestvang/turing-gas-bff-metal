@@ -5,17 +5,11 @@ import MetalKit
 import BFFMetal
 import SoupScopeCore
 
-enum ResidentDriverStopReason: Equatable, Sendable {
-    case requested
-    case epochLimit
-    case secondsLimit
-    case failure
-}
-
 final class ResidentSimulationDriver: @unchecked Sendable {
     typealias ReportHandler = @MainActor @Sendable (ResidentEpochReport, Int) -> Void
     typealias FailureHandler = @MainActor @Sendable (String) -> Void
-    typealias StopHandler = @MainActor @Sendable (ResidentDriverStopReason, Int) -> Void
+    typealias StopHandler = @MainActor @Sendable (ResidentDriverStopReason,
+                                                  ResidentProgressSnapshot) -> Void
 
     private enum LoopAction {
         case advance
@@ -30,11 +24,15 @@ final class ResidentSimulationDriver: @unchecked Sendable {
     private let group = DispatchGroup()
     private let lock = NSLock()
     private var state = ResidentSimulationStateMachine()
+    private var deadlineTimer: ResidentDeadlineTimer?
     private var cpuReference: ResidentCPUReferenceRunner?
     private var hasStarted = false
+    private var hasFinished = false
+    private var stopReasonValue: ResidentDriverStopReason?
     private var startedAt = 0.0
     private var latestEpochValue = 0
     private var failureCountValue = 0
+    private var latestUnknownHaltsValue = 0
 
     private let onReport: ReportHandler
     private let onFailure: FailureHandler
@@ -57,6 +55,11 @@ final class ResidentSimulationDriver: @unchecked Sendable {
         self.onFailure = onFailure
         self.onStop = onStop
         queue.setSpecific(key: queueKey, value: 1)
+        if case .seconds(let seconds) = plan.limit {
+            self.deadlineTimer = ResidentDeadlineTimer(seconds: seconds) { [weak self] in
+                self?.finish(reason: .secondsLimit)
+            }
+        }
     }
 
     deinit {
@@ -75,6 +78,10 @@ final class ResidentSimulationDriver: @unchecked Sendable {
         locked { failureCountValue }
     }
 
+    var diagnosticSnapshot: ResidentProgressSnapshot {
+        locked { snapshotLocked() }
+    }
+
     func start() {
         let shouldStart = locked { () -> Bool in
             guard !hasStarted else { return false }
@@ -84,6 +91,7 @@ final class ResidentSimulationDriver: @unchecked Sendable {
         }
         guard shouldStart else { return }
         group.enter()
+        deadlineTimer?.start()
         queue.async { [self] in
             runLoop()
             group.leave()
@@ -108,7 +116,7 @@ final class ResidentSimulationDriver: @unchecked Sendable {
     }
 
     func stop() {
-        locked { state.requestStop() }
+        requestStop(reason: .requested)
     }
 
     func stopAndWait() {
@@ -119,7 +127,6 @@ final class ResidentSimulationDriver: @unchecked Sendable {
     }
 
     private func runLoop() {
-        var stopReason: ResidentDriverStopReason = .requested
         loop:
         while true {
             switch nextAction() {
@@ -129,8 +136,9 @@ final class ResidentSimulationDriver: @unchecked Sendable {
                     let failures = validate(report)
                     let count = locked { () -> Int in
                         latestEpochValue = report.counters.epoch + 1
+                        latestUnknownHaltsValue = report.counters.haltUnknown
                         failureCountValue += failures.count
-                        if !failures.isEmpty { state.requestStop() }
+                        if !failures.isEmpty { requestStopLocked(reason: .failure) }
                         return failureCountValue
                     }
                     DispatchQueue.main.async { [onReport] in
@@ -148,7 +156,7 @@ final class ResidentSimulationDriver: @unchecked Sendable {
                 } catch {
                     let count = locked { () -> Int in
                         failureCountValue += 1
-                        state.requestStop()
+                        requestStopLocked(reason: .failure)
                         return failureCountValue
                     }
                     DispatchQueue.main.async { [onFailure] in
@@ -160,21 +168,12 @@ final class ResidentSimulationDriver: @unchecked Sendable {
             case .sleep:
                 Thread.sleep(forTimeInterval: 0.005)
             case .stop(let reason):
-                stopReason = reason
+                finish(reason: reason)
                 break loop
             }
             if locked({ state.state == .stopping }) {
-                stopReason = failureCountValue > 0 ? .failure : .requested
+                finish(reason: stopReasonValue ?? (failureCountValue > 0 ? .failure : .requested))
                 break loop
-            }
-        }
-        let finalEpoch = locked { () -> Int in
-            state.markStopped()
-            return latestEpochValue
-        }
-        DispatchQueue.main.async { [onStop] in
-            MainActor.assumeIsolated {
-                onStop(stopReason, finalEpoch)
             }
         }
     }
@@ -183,7 +182,7 @@ final class ResidentSimulationDriver: @unchecked Sendable {
         locked {
             switch state.state {
             case .stopping, .stopped:
-                return .stop(failureCountValue > 0 ? .failure : .requested)
+                return .stop(stopReasonValue ?? (failureCountValue > 0 ? .failure : .requested))
             case .paused:
                 return .sleep
             case .running:
@@ -198,6 +197,46 @@ final class ResidentSimulationDriver: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    private func requestStop(reason: ResidentDriverStopReason) {
+        locked {
+            requestStopLocked(reason: reason)
+        }
+    }
+
+    private func requestStopLocked(reason: ResidentDriverStopReason) {
+        if stopReasonValue == nil || reason == .failure {
+            stopReasonValue = reason
+        }
+        state.requestStop()
+    }
+
+    @discardableResult
+    private func finish(reason: ResidentDriverStopReason) -> Bool {
+        let finished = locked { () -> (ResidentDriverStopReason, ResidentProgressSnapshot)? in
+            guard !hasFinished else { return nil }
+            hasFinished = true
+            requestStopLocked(reason: reason)
+            let finalReason = stopReasonValue ?? reason
+            state.markStopped()
+            return (finalReason, snapshotLocked())
+        }
+        guard let (finalReason, snapshot) = finished else { return false }
+        deadlineTimer?.cancel()
+        DispatchQueue.main.async { [onStop] in
+            MainActor.assumeIsolated {
+                onStop(finalReason, snapshot)
+            }
+        }
+        return true
+    }
+
+    private func snapshotLocked() -> ResidentProgressSnapshot {
+        ResidentProgressSnapshot(simulationEpoch: latestEpochValue,
+                                 textureSourceEpoch: latestEpochValue,
+                                 failures: failureCountValue,
+                                 unknownHalts: latestUnknownHaltsValue)
     }
 
     private func validate(_ gpu: ResidentEpochReport) -> [String] {

@@ -70,13 +70,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         // span and remains in the explicit app-frame unclassified remainder.
         let encodeStart = timing ? AppMonotonicClock.nowSeconds() : 0
         if appModel.usesResidentRendering {
+            let sourceEpoch = appModel.latestResidentSourceEpoch
             if let texture = appModel.residentVisualizationTexture {
                 var uniforms = appModel.makeUniforms()
                 encoder.setRenderPipelineState(context.residentRenderPipeline)
                 encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VizUniforms>.stride, index: 0)
                 encoder.setFragmentTexture(texture, index: 0)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-                appModel.noteResidentDisplayedEpoch(appModel.latestResidentSourceEpoch)
+                appModel.noteResidentFrameSubmitted(sourceEpoch: sourceEpoch)
             }
         } else if let snapshot {
             let soupStart = timing ? AppMonotonicClock.nowSeconds() : 0

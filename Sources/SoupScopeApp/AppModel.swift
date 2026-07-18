@@ -1,5 +1,6 @@
 #if canImport(MetalKit)
 import Foundation
+import AppKit
 import Combine
 import Metal
 import MetalKit
@@ -44,6 +45,8 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     private var runner: SoupRunner
     private var residentDriver: ResidentSimulationDriver?
     private var residentDisplayedEpoch = 0
+    private var residentRenderedFrames = 0
+    private var residentFinalDiagnosticEmitter = ResidentFinalDiagnosticEmitter()
     private(set) var lastSnapshot: RenderSnapshot?
 
     // Opt-in per-frame host-stage timing (`--frame-stage-timing`). `nil` (off) unless the
@@ -147,7 +150,11 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     }
 
     deinit {
-        residentDriver?.stopAndWait()
+        if residentFinalDiagnosticEmitter.emitted {
+            residentDriver?.stop()
+        } else {
+            residentDriver?.stopAndWait()
+        }
     }
 
     // MARK: - Frame driving
@@ -309,21 +316,34 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         }
     }
 
+    func noteResidentFrameSubmitted(sourceEpoch: Int) {
+        residentRenderedFrames += 1
+        noteResidentDisplayedEpoch(sourceEpoch)
+    }
+
     private func startResidentIfNeeded() {
         guard residentPlan.enabled else { return }
         guard let context else {
             hud.setError((hud.errorState.map { $0 + "; " } ?? "")
                          + "resident mode requires Metal")
             if residentPlan.limit.isBounded || residentPlan.tinyValidation {
-                print(residentDiagnosticLine(reason: .failure, epoch: 0))
-                exit(2)
+                emitResidentFinalDiagnosticAndTerminate(
+                    reason: .failure,
+                    snapshot: ResidentProgressSnapshot(simulationEpoch: 0,
+                                                       textureSourceEpoch: 0,
+                                                       failures: 1,
+                                                       unknownHalts: 0))
             }
             return
         }
         guard let residentConfig else {
             if residentPlan.limit.isBounded || residentPlan.tinyValidation {
-                print(residentDiagnosticLine(reason: .failure, epoch: 0))
-                exit(1)
+                emitResidentFinalDiagnosticAndTerminate(
+                    reason: .failure,
+                    snapshot: ResidentProgressSnapshot(simulationEpoch: 0,
+                                                       textureSourceEpoch: 0,
+                                                       failures: 1,
+                                                       unknownHalts: 0))
             }
             return
         }
@@ -339,8 +359,8 @@ final class AppModel: ObservableObject, @unchecked Sendable {
                 onFailure: { [weak self] message in
                     self?.hud.setError(message)
                 },
-                onStop: { [weak self] reason, epoch in
-                    self?.residentDidStop(reason: reason, epoch: epoch)
+                onStop: { [weak self] reason, snapshot in
+                    self?.residentDidStop(reason: reason, snapshot: snapshot)
                 })
             residentDriver = driver
             isRunning = true
@@ -348,6 +368,14 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         } catch {
             hud.setError((hud.errorState.map { $0 + "; " } ?? "")
                          + "resident start failed: \(error)")
+            if residentPlan.limit.isBounded || residentPlan.tinyValidation {
+                emitResidentFinalDiagnosticAndTerminate(
+                    reason: .failure,
+                    snapshot: ResidentProgressSnapshot(simulationEpoch: 0,
+                                                       textureSourceEpoch: 0,
+                                                       failures: 1,
+                                                       unknownHalts: 0))
+            }
         }
     }
 
@@ -365,44 +393,30 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         objectWillChange.send()
     }
 
-    private func residentDidStop(reason: ResidentDriverStopReason, epoch: Int) {
+    private func residentDidStop(reason: ResidentDriverStopReason,
+                                 snapshot: ResidentProgressSnapshot) {
         isRunning = false
         objectWillChange.send()
         guard residentPlan.limit.isBounded || residentPlan.tinyValidation || reason == .failure else {
             return
         }
-        print(residentDiagnosticLine(reason: reason, epoch: epoch))
-        exit(reason == .failure || hud.errorState != nil ? 1 : 0)
+        emitResidentFinalDiagnosticAndTerminate(reason: reason, snapshot: snapshot)
     }
 
-    private func residentDiagnosticLine(reason: ResidentDriverStopReason, epoch: Int) -> String {
-        let d = hud.resident
-        func f(_ x: Double?) -> String {
-            x.map { String(format: "%.3f", $0) } ?? "nil"
-        }
-        let reasonText: String
-        switch reason {
-        case .requested: reasonText = "requested"
-        case .epochLimit: reasonText = "epochLimit"
-        case .secondsLimit: reasonText = "secondsLimit"
-        case .failure: reasonText = "failure"
-        }
-        return "resident outcome=\(hud.errorState == nil ? "ok" : "error") "
-            + "reason=\(reasonText) finalEpoch=\(epoch) "
-            + "sourceEpoch=\(d?.sourceEpoch ?? 0) displayedEpoch=\(d?.displayedEpoch ?? 0) "
-            + "planner=\(residentPlan.planner.cliValue) "
-            + "plannerMode=\(residentPlan.planner.identifier) "
-            + "plannerLabel=\(residentPlan.planner.provenanceLabel) "
-            + "epochWallMs=\(f(d?.epochWallMs)) "
-            + "gpu[mutateMs=\(f(d?.mutationGpuMs)),planMs=\(f(d?.plannerGpuMs)),"
-            + "evalMs=\(f(d?.evalGpuMs)),visualizeMs=\(f(d?.visualizationGpuMs))] "
-            + "checkpointInterval=\(residentConfig?.checkpointInterval ?? 0) "
-            + "checkpointBytes=\(d?.checkpointBytes ?? 0) "
-            + "readbackBytes=\(d?.readbackBytes ?? 0) "
-            + "failures=\(d?.failureCount ?? 0) "
-            + "haltUnknown=\(d?.unknownHalts ?? hud.haltUnknown) "
-            + "programs=\(hud.programCount) device=\"\(hud.deviceName)\" "
-            + "error=\(hud.errorState ?? "none")"
+    private func emitResidentFinalDiagnosticAndTerminate(
+        reason: ResidentDriverStopReason,
+        snapshot: ResidentProgressSnapshot
+    ) {
+        let diagnostic = ResidentFinalDiagnostic(
+            simulationEpoch: snapshot.simulationEpoch,
+            displayedEpoch: residentDisplayedEpoch,
+            textureSourceEpoch: snapshot.textureSourceEpoch,
+            frameCount: residentRenderedFrames,
+            failures: snapshot.failures,
+            unknownHalts: snapshot.unknownHalts,
+            stopReason: reason)
+        residentFinalDiagnosticEmitter.emit(diagnostic) { print($0) }
+        NSApplication.shared.terminate(nil)
     }
 
     func stopResidentSimulation() {

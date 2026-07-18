@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 import BFFMetal
 @testable import SoupScopeCore
 
@@ -97,5 +98,64 @@ final class ResidentAppRunPlanTests: XCTestCase {
         machine.markStopped()
         XCTAssertEqual(machine.state, .stopped)
         XCTAssertTrue(machine.isTerminal)
+    }
+
+    func testResidentDeadlineTimerStopsDriverStateWithoutDisplayProgress() {
+        let stopped = expectation(description: "resident seconds deadline stopped driver")
+        let lock = NSLock()
+        var machine = ResidentSimulationStateMachine()
+        let timer = ResidentDeadlineTimer(seconds: 0.02) {
+            lock.lock()
+            machine.requestStop()
+            lock.unlock()
+            stopped.fulfill()
+        }
+        timer.start()
+        wait(for: [stopped], timeout: 1.0)
+        timer.cancel()
+        lock.lock()
+        let state = machine.state
+        lock.unlock()
+        XCTAssertEqual(state, .stopping)
+    }
+
+    func testResidentFinalDiagnosticIsCompleteWithNoDrawableCallbacks() throws {
+        let diagnostic = ResidentFinalDiagnostic(
+            simulationEpoch: 17,
+            displayedEpoch: 0,
+            textureSourceEpoch: 17,
+            frameCount: 0,
+            failures: 0,
+            unknownHalts: 2,
+            stopReason: .secondsLimit)
+        let line = diagnostic.jsonLine()
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8))
+            as? [String: Any])
+
+        XCTAssertEqual(obj["kind"] as? String, "residentFinalDiagnostic")
+        XCTAssertEqual(obj["simulationEpoch"] as? Int, 17)
+        XCTAssertEqual(obj["displayedEpoch"] as? Int, 0)
+        XCTAssertEqual(obj["textureSourceEpoch"] as? Int, 17)
+        XCTAssertEqual(obj["frameCount"] as? Int, 0)
+        XCTAssertEqual(obj["failures"] as? Int, 0)
+        XCTAssertEqual(obj["unknownHalts"] as? Int, 2)
+        XCTAssertEqual(obj["stopReason"] as? String, "secondsLimit")
+    }
+
+    func testResidentFinalDiagnosticEmitterCompletesExactlyOnce() {
+        var emitter = ResidentFinalDiagnosticEmitter()
+        let diagnostic = ResidentFinalDiagnostic(
+            simulationEpoch: 3,
+            displayedEpoch: 0,
+            textureSourceEpoch: 3,
+            frameCount: 0,
+            failures: 0,
+            unknownHalts: 0,
+            stopReason: .secondsLimit)
+        var lines: [String] = []
+
+        XCTAssertTrue(emitter.emit(diagnostic) { lines.append($0) })
+        XCTAssertFalse(emitter.emit(diagnostic) { lines.append($0) })
+        XCTAssertEqual(lines.count, 1)
     }
 }
