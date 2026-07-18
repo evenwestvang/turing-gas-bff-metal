@@ -113,7 +113,7 @@ Launch arguments (all optional; defaults are a modest soup for interactive launc
 
 ```
 --seed N               run seed (default 45071)
---programs EVEN        soup size, positive & even, ≤ 131072 (default 1024)
+--programs EVEN        soup size, positive & even, ≤ 131072 (default 131072 = ProgramGrid.capacity)
 --budget N             per-interaction step budget (default 8192)
 --mutation-p32 N       mutate iff a uint32 draw < N; 0 disables
 --variant noheads|bff  initial-state variant (default noheads)

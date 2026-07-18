@@ -88,9 +88,13 @@ final class AppModel: ObservableObject {
         do {
             resolvedConfig = try parsed.soupConfig()
         } catch {
-            // A valid, modest default so the app still runs and shows the error.
-            resolvedConfig = (try? SoupConfig(seed: parsed.seed, programCount: 1024))
-                ?? (try! SoupConfig(seed: 1, programCount: 1024))
+            // A valid, full-capacity default so the app still runs and shows the
+            // error. Matches the omitted-argument app default (ProgramGrid.capacity)
+            // so a parse failure or a rejected --programs cannot silently fall back
+            // to the old 1,024-program modest soup.
+            resolvedConfig = (try? SoupConfig(seed: parsed.seed,
+                                              programCount: ProgramGrid.capacity))
+                ?? (try! SoupConfig(seed: 1, programCount: ProgramGrid.capacity))
             startupError = (startupError.map { $0 + "; " } ?? "") + "config: \(error)"
         }
         self.config = resolvedConfig

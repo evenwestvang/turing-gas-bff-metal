@@ -31,7 +31,7 @@ public struct AppLaunchOptions: Equatable, Sendable {
     public var frameStageTiming: Bool
 
     public init(seed: UInt32 = 0xB00F,
-                programCount: Int = 1_024,
+                programCount: Int = ProgramGrid.capacity,
                 stepBudget: Int = BFF.stepBudget,
                 mutationP32: UInt32 = BFF.defaultMutationP32,
                 variant: BFFVariant = .noheads,
@@ -73,7 +73,7 @@ public struct AppLaunchOptions: Equatable, Sendable {
     public static let usage = """
     SoupScope launch arguments:
       --seed N               run seed (default 45071)
-      --programs EVEN        soup size, positive & even, ≤ 131072 (default 1024)
+      --programs EVEN        soup size, positive & even, ≤ 131072 (default 131072 = ProgramGrid.capacity)
       --budget N             per-interaction step budget (default \(BFF.stepBudget))
       --mutation-p32 N       mutate iff a uint32 draw < N; 0 disables
       --variant noheads|bff  initial-state variant (default noheads)

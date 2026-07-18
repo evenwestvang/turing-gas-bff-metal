@@ -547,7 +547,10 @@ final class VisualizationModelTests: XCTestCase {
 
     func testLaunchOptionDefaultsAndParsing() throws {
         let defaults = try AppLaunchOptions.parse([])
-        XCTAssertEqual(defaults.programCount, 1_024)      // modest interactive default
+        // The omitted-argument app default is exactly ProgramGrid.capacity (131,072):
+        // a parse failure or omitted --programs must never silently fall back to 1,024.
+        XCTAssertEqual(defaults.programCount, 131_072)
+        XCTAssertEqual(defaults.programCount, ProgramGrid.capacity)
         XCTAssertNil(defaults.validationSeconds)
 
         let parsed = try AppLaunchOptions.parse(
@@ -568,6 +571,30 @@ final class VisualizationModelTests: XCTestCase {
         XCTAssertNoThrow(try defaults.soupConfig())
     }
 
+    /// The omitted-argument default is exactly ProgramGrid.capacity (131,072), and
+    /// an explicit --programs override is always respected — including values far
+    /// below capacity. This pins both halves of the app default contract so a
+    /// regression to the old 1,024 default (or a swallowed override) is caught.
+    func testLaunchOptionsOmittedDefaultIsCapacityAndExplicitOverrideIsRespected() throws {
+        let omitted = try AppLaunchOptions.parse([])
+        XCTAssertEqual(omitted.programCount, 131_072)
+        XCTAssertEqual(omitted.programCount, ProgramGrid.capacity)
+
+        // Explicit override, including a small value, wins over the capacity default.
+        let small = try AppLaunchOptions.parse(["--programs", "8"])
+        XCTAssertEqual(small.programCount, 8)
+        XCTAssertNotEqual(small.programCount, ProgramGrid.capacity)
+
+        // An explicit override at capacity is identical to the omitted default.
+        let atCapacity = try AppLaunchOptions.parse(["--programs", "131072"])
+        XCTAssertEqual(atCapacity.programCount, ProgramGrid.capacity)
+        XCTAssertEqual(atCapacity.programCount, omitted.programCount)
+
+        // Both the omitted default and the explicit small override build valid configs.
+        XCTAssertNoThrow(try omitted.soupConfig())
+        XCTAssertNoThrow(try small.soupConfig())
+    }
+
     func testShadowSampleAllResolvesIndependentlyOfArgumentOrder() throws {
         // `all` = programCount / 2, regardless of whether --programs comes before or
         // after --shadow-sample (resolution is deferred to after the full parse).
@@ -578,9 +605,9 @@ final class VisualizationModelTests: XCTestCase {
         XCTAssertEqual(before.shadowSampleCount, after.shadowSampleCount,
                        "order of --programs / --shadow-sample must not change the result")
 
-        // `all` with the default program count resolves against that default (1024/2).
+        // `all` with the default program count resolves against that default (131072/2).
         let defaulted = try AppLaunchOptions.parse(["--shadow-sample", "all"])
-        XCTAssertEqual(defaulted.shadowSampleCount, 512)
+        XCTAssertEqual(defaulted.shadowSampleCount, 65_536)
 
         // A later explicit --programs after `all` still governs; a later explicit numeric
         // --shadow-sample after `all` overrides `all` (last flag wins, not `all`).
