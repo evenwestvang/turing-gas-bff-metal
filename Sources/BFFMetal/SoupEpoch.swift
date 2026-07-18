@@ -1,4 +1,5 @@
 import BFFOracle
+import Foundation
 
 /// The two program identities that meet in one interaction. Pairing does NOT
 /// redefine identity: `a` and `b` are the *stable program IDs* (indices into the
@@ -226,6 +227,13 @@ public struct ProgramMetric: Equatable, Sendable, Codable {
 /// Platform-independent per-program metric computation.
 public enum SoupMetrics {
 
+    /// Program-count threshold below which per-program metric construction runs
+    /// serially. Below this the concurrent-dispatch overhead exceeds the entropy
+    /// savings; above it each program's metric is built on a concurrent queue with
+    /// disjoint indexed writes. Chosen so every existing test/soup (≤ a few hundred
+    /// programs) stays serial, while the 131,072-program default harvests all cores.
+    static let parallelThreshold = 4096
+
     /// Byte entropy of a single 64-byte program, bits/byte in [0, 6].
     /// Thin wrapper over `ByteHistogram` so the definition lives in exactly one
     /// place; pinned by tests (uniform → 0, 64 distinct → 6).
@@ -233,13 +241,94 @@ public enum SoupMetrics {
         ByteHistogram(bytes: program).shannonEntropyBitsPerByte
     }
 
+    /// Allocation-free order-0 Shannon entropy over a contiguous slice of `soup`,
+    /// bits/byte in [0, 8]. The reusable `bins` buffer (256 entries) is zeroed and
+    /// refilled per call, eliminating the per-program Array slice and 256-bin heap
+    /// allocation of the `ByteHistogram(bytes:)` path used at 131,072 programs.
+    ///
+    /// The entropy is accumulated in byte-value order `0..<256`, exactly matching
+    /// `ByteHistogram.shannonEntropyBitsPerByte`: `reduce(0, +)` for the total, then
+    /// `h -= p * log2(p)` for each non-empty bin in ascending byte-value order. This
+    /// preserves the floating-point summation order, so the result is bit-identical
+    /// to the legacy path for every input.
+    static func entropyBitsPerByte(soup: [UInt8], start: Int, length: Int,
+                                   bins: inout [UInt64]) -> Double {
+        precondition(start >= 0 && length >= 0 && start + length <= soup.count)
+        precondition(bins.count == 256)
+        // Zero-length slice ⇒ zero entropy, matching `ByteHistogram` on empty input.
+        // Also avoids force-unwrapping a nil base address for an empty `soup`.
+        if length == 0 { return 0 }
+        return soup.withUnsafeBufferPointer { soupPtr in
+            bins.withUnsafeMutableBufferPointer { binPtr in
+                entropyBitsPerByte(soupBase: soupPtr.baseAddress!,
+                                   start: start, length: length,
+                                   bins: binPtr.baseAddress!)
+            }
+        }
+    }
+
+    /// Core entropy computation over raw pointers. `@inline(__always)` so the serial
+    /// and parallel paths share one implementation without a call-cost penalty at the
+    /// 131,072-program scale.
+    ///
+    /// - Parameters:
+    ///   - soupBase: Base of the contiguous soup buffer.
+    ///   - start: Offset of the program's first byte within `soupBase`.
+    ///   - length: Number of bytes in the program (`BFF.tapeSize`).
+    ///   - bins: A 256-element `UInt64` buffer; zeroed and refilled per call.
+    @inline(__always)
+    private static func entropyBitsPerByte(soupBase: UnsafePointer<UInt8>,
+                                           start: Int, length: Int,
+                                           bins: UnsafeMutablePointer<UInt64>) -> Double {
+        // Zero the reusable bin buffer for this program.
+        for v in 0..<256 { bins[v] = 0 }
+        // Accumulate byte counts directly from the soup buffer (no Array slice).
+        let p = soupBase + start
+        for i in 0..<length {
+            bins[Int(p[i])] += 1
+        }
+        // Total in byte-value order 0..<256 — identical to `bins.reduce(0, +)`.
+        var total: UInt64 = 0
+        for v in 0..<256 { total += bins[v] }
+        guard total > 0 else { return 0 }
+        // Entropy in byte-value order 0..<256, skipping zeros — identical to
+        // `ByteHistogram.shannonEntropyBitsPerByte`.
+        let n = Double(total)
+        var h = 0.0
+        for v in 0..<256 {
+            let count = bins[v]
+            if count > 0 {
+                let prob = Double(count) / n
+                h -= prob * log2(prob)
+            }
+        }
+        return h
+    }
+
     /// One `ProgramMetric` per program ID `0..<programCount`, in ID order.
     /// Activity is taken from the pair outcome and attributed to both partners;
     /// entropy is computed from the post-epoch soup. Every program appears in
     /// exactly one pair (the pairing is a permutation), so every activity is set.
+    ///
+    /// At or above `parallelThreshold` programs the per-program scan runs on a
+    /// concurrent queue (disjoint indexed writes, per-chunk 256-bin buffers);
+    /// below it the scan is serial with one reusable buffer. Both paths are
+    /// allocation-free per program and produce element-for-element identical output.
     public static func programMetrics(soup: [UInt8], plan: EpochPlan,
                                       outcomes: [GPUPairOutcome],
                                       programCount: Int) -> [ProgramMetric] {
+        programMetrics(soup: soup, plan: plan, outcomes: outcomes,
+                       programCount: programCount,
+                       parallel: programCount >= parallelThreshold)
+    }
+
+    /// Internal overload that forces serial or parallel metric construction. The
+    /// public entry point selects based on `parallelThreshold`; this exists so tests
+    /// can prove the two paths are element-for-element identical across thresholds.
+    static func programMetrics(soup: [UInt8], plan: EpochPlan,
+                               outcomes: [GPUPairOutcome],
+                               programCount: Int,
+                               parallel: Bool) -> [ProgramMetric] {
         precondition(soup.count == programCount * BFF.tapeSize)
         precondition(outcomes.count == plan.pairs.count)
 
@@ -250,14 +339,96 @@ public enum SoupMetrics {
             activity[Int(pair.b)] = a
         }
 
-        var metrics: [ProgramMetric] = []
-        metrics.reserveCapacity(programCount)
-        for id in 0..<programCount {
-            let start = id * BFF.tapeSize
-            let bytes = Array(soup[start ..< start + BFF.tapeSize])
-            metrics.append(ProgramMetric(programID: id, activity: activity[id],
-                                         entropyBitsPerByte: entropyBitsPerByte(bytes)))
+        // Pre-allocate the output so the parallel path can write to disjoint indices
+        // via UnsafeMutableBufferPointer (race-free: each program ID is written by
+        // exactly one iteration). Every element is overwritten below.
+        var metrics = [ProgramMetric](
+            repeating: ProgramMetric(programID: 0, activity: 0, entropyBitsPerByte: 0),
+            count: programCount)
+
+        soup.withUnsafeBufferPointer { soupPtr in
+            activity.withUnsafeBufferPointer { actPtr in
+                metrics.withUnsafeMutableBufferPointer { mPtr in
+                    if parallel {
+                        parallelMetrics(soupBase: soupPtr.baseAddress!,
+                                        activity: actPtr.baseAddress!,
+                                        metrics: mPtr.baseAddress!,
+                                        programCount: programCount)
+                    } else {
+                        serialMetrics(soupBase: soupPtr.baseAddress!,
+                                      activity: actPtr.baseAddress!,
+                                      metrics: mPtr.baseAddress!,
+                                      programCount: programCount)
+                    }
+                }
+            }
         }
         return metrics
+    }
+
+    /// Serial metric construction: one reusable 256-bin buffer for all programs.
+    /// Eliminates the per-program Array slice and 256-bin allocation of the legacy
+    /// `entropyBitsPerByte(Array(soup[start..<...]))` path.
+    private static func serialMetrics(soupBase: UnsafePointer<UInt8>,
+                                      activity: UnsafePointer<Int>,
+                                      metrics: UnsafeMutablePointer<ProgramMetric>,
+                                      programCount: Int) {
+        var bins = [UInt64](repeating: 0, count: 256)
+        bins.withUnsafeMutableBufferPointer { binPtr in
+            let binBase = binPtr.baseAddress!
+            for id in 0..<programCount {
+                let start = id * BFF.tapeSize
+                let h = entropyBitsPerByte(soupBase: soupBase, start: start,
+                                           length: BFF.tapeSize, bins: binBase)
+                metrics[id] = ProgramMetric(programID: id, activity: activity[id],
+                                            entropyBitsPerByte: h)
+            }
+        }
+    }
+
+    /// Parallel metric construction across CPU cores. Each chunk gets its own
+    /// 256-bin buffer (no shared mutable state); output writes are to disjoint
+    /// program-ID indices, so the result is element-for-element identical to the
+    /// serial path regardless of how chunks are scheduled. `concurrentPerform` is
+    /// synchronous, so the function returns only after every chunk is done.
+    private static func parallelMetrics(soupBase: UnsafePointer<UInt8>,
+                                        activity: UnsafePointer<Int>,
+                                        metrics: UnsafeMutablePointer<ProgramMetric>,
+                                        programCount: Int) {
+        let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let chunk = (programCount + cores - 1) / cores
+        // Wrap the raw pointers in an `@unchecked Sendable` container so the
+        // `concurrentPerform` closure (which is `@Sendable` under Swift 6) can capture
+        // them. Safety rests on the disjoint-index discipline: each concurrent
+        // iteration writes to a unique program ID (no aliasing), and `soup`/`activity`
+        // are read-only during the parallel section. `ProgramMetric` is a trivial
+        // struct (Int/Int/Double — no reference counting), so disjoint pointer stores
+        // are plain memory writes with no retain/release races.
+        let ctx = ParallelContext(soup: soupBase, activity: activity, metrics: metrics)
+        DispatchQueue.concurrentPerform(iterations: cores) { c in
+            let lo = c * chunk
+            let hi = min(lo + chunk, programCount)
+            guard lo < hi else { return }
+            var bins = [UInt64](repeating: 0, count: 256)
+            bins.withUnsafeMutableBufferPointer { binPtr in
+                let binBase = binPtr.baseAddress!
+                for id in lo..<hi {
+                    let start = id * BFF.tapeSize
+                    let h = entropyBitsPerByte(soupBase: ctx.soup, start: start,
+                                               length: BFF.tapeSize, bins: binBase)
+                    ctx.metrics[id] = ProgramMetric(programID: id, activity: ctx.activity[id],
+                                                    entropyBitsPerByte: h)
+                }
+            }
+        }
+    }
+
+    /// Race-free pointer bundle for `concurrentPerform`. `@unchecked Sendable`
+    /// because the parallel section writes to disjoint indices (no aliasing) and
+    /// reads only from immutable buffers; see `parallelMetrics` for the invariant.
+    fileprivate struct ParallelContext: @unchecked Sendable {
+        let soup: UnsafePointer<UInt8>
+        let activity: UnsafePointer<Int>
+        let metrics: UnsafeMutablePointer<ProgramMetric>
     }
 }

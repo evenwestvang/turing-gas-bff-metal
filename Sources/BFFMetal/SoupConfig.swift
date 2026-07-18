@@ -128,11 +128,39 @@ public struct SoupConfig: Equatable, Sendable {
 /// divergence changes the digest. This is a byte fingerprint, not a cryptographic
 /// hash — its only job is cheap deterministic equality across machines.
 public enum SoupDigest {
+    /// FNV-1a 64-bit over the raw soup bytes.
+    ///
+    /// The byte loop is rewritten over an `UnsafeBufferPointer` with a conservative
+    /// 8× unroll: each iteration performs eight sequential `(hash ^ byte) &* prime`
+    /// steps in ascending byte order, then a scalar remainder handles the tail. The
+    /// operations are exactly the legacy ones in exactly the legacy order, so every
+    /// pinned digest value is bit-identical; the rewrite only removes per-byte Array
+    /// bounds checking and loop-counter overhead. Empty input returns the FNV-1a
+    /// offset basis unchanged, as before.
     public static func digest(_ soup: [UInt8]) -> UInt64 {
         var hash: UInt64 = 0xCBF2_9CE4_8422_2325 // FNV-1a 64-bit offset basis
         let prime: UInt64 = 0x0000_0100_0000_01B3 // FNV-1a 64-bit prime
-        for byte in soup {
-            hash = (hash ^ UInt64(byte)) &* prime
+        let n = soup.count
+        guard n > 0 else { return hash }
+        soup.withUnsafeBufferPointer { buf in
+            let base = buf.baseAddress!
+            let unrolled = n & ~7 // largest multiple of 8 ≤ n
+            var i = 0
+            while i < unrolled {
+                hash = (hash ^ UInt64(base[i    ])) &* prime
+                hash = (hash ^ UInt64(base[i + 1])) &* prime
+                hash = (hash ^ UInt64(base[i + 2])) &* prime
+                hash = (hash ^ UInt64(base[i + 3])) &* prime
+                hash = (hash ^ UInt64(base[i + 4])) &* prime
+                hash = (hash ^ UInt64(base[i + 5])) &* prime
+                hash = (hash ^ UInt64(base[i + 6])) &* prime
+                hash = (hash ^ UInt64(base[i + 7])) &* prime
+                i += 8
+            }
+            while i < n {
+                hash = (hash ^ UInt64(base[i])) &* prime
+                i += 1
+            }
         }
         return hash
     }
