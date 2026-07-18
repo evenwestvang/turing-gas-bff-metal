@@ -18,6 +18,12 @@ import BFFOracle
 ///   `signalInterval > 1` it is called only at epoch 0, every `N`th completed epoch,
 ///   and the final completed epoch — never on the intervening epochs. Tests inject a
 ///   counting closure to prove exactly that cadence.
+/// - `measureBrotliBitsPerByte` (optional) supplies the paper-aligned Brotli 1.1.0
+///   q2 bits/byte for a soup. Injected only by `bff-metal-bench` (wired to
+///   `BrotliMetrics`), so BFFMetal itself never links Brotli; the CPU reference and
+///   the tests pass `nil` or a synthetic closure. It is invoked ONLY when
+///   `options.includeBrotli` is set and the epoch is on the LZ-proxy cadence
+///   (sample ∩ signal point), always outside the epoch execution wall.
 public enum BenchmarkRunner {
 
     /// Controls for sample-only metric analysis. Both flags are off in throughput
@@ -30,6 +36,15 @@ public enum BenchmarkRunner {
         /// Opt-in for the O(n·window) LZ compression proxy. Even when true, the proxy
         /// is only computed on sampled epochs + the final epoch (bounded cost).
         public var includeCompression: Bool
+        /// Opt-in for the paper-aligned Brotli 1.1.0 q2 measurement (`--brotli`).
+        /// DISTINCT from `includeCompression` (the LZ proxy). When true, the injected
+        /// `measureBrotliBitsPerByte` closure is called on exactly the same bounded
+        /// cadence as the LZ proxy — sampled epochs + the final epoch, and only when
+        /// the epoch also carries a signal measurement — so the real codec runs only
+        /// at the reviewed sparse cadence, never every epoch and never inside the
+        /// epoch execution wall. `nil` from the closure (e.g. non-1.1.0 encoder) is
+        /// carried through as "not computed".
+        public var includeBrotli: Bool
         /// Signal-measurement cadence. `1` (the default) measures signals every epoch —
         /// the exact per-epoch entropy trajectory that ΔH thresholds require. `N > 1`
         /// is cadence-only / sparse analysis: signals are measured at epoch 0 (the
@@ -42,10 +57,11 @@ public enum BenchmarkRunner {
         public var signalInterval: Int
 
         public init(analyzeSignals: Bool, includeCompression: Bool,
-                    signalInterval: Int = 1) {
+                    signalInterval: Int = 1, includeBrotli: Bool = false) {
             self.analyzeSignals = analyzeSignals
             self.includeCompression = includeCompression
             self.signalInterval = Swift.max(1, signalInterval)
+            self.includeBrotli = includeBrotli
         }
 
         /// Pure throughput: no signal analysis at all.
@@ -70,6 +86,7 @@ public enum BenchmarkRunner {
         now: () -> Double,
         gpuSecondsAfterEpoch: () -> Double?,
         measureSignals: (_ soup: [UInt8], _ includeCompression: Bool) -> SoupSignals,
+        measureBrotliBitsPerByte: ((_ soup: [UInt8]) -> Double?)? = nil,
         onEpoch: (EpochReport) -> Void = { _ in }
     ) throws -> BenchmarkResult {
         // Enforce the signal-cadence contract at the very top — before any RSS reading,
@@ -99,11 +116,25 @@ public enum BenchmarkRunner {
 
         // Initial (epoch-0) reference signals — only when analyzing. Timed as host
         // analysis cost, never mixed into any epoch wall.
+        // Fold a Brotli bits/byte reading into an already-measured `SoupSignals`
+        // (epoch is a sample point). Both the entropy scan (`measureSignals`) and this
+        // are timed inside the same analysis window, entirely outside the epoch wall.
+        func withBrotli(_ signals: SoupSignals, soup: [UInt8]) -> SoupSignals {
+            guard options.includeBrotli, let bpb = measureBrotliBitsPerByte?(soup) else {
+                return signals
+            }
+            var s = signals
+            s.brotliBitsPerByte = bpb
+            s.highOrderComplexity = s.entropyBitsPerByte - bpb
+            return s
+        }
+
         var initialSignals: SoupSignals? = nil
         var initialAnalysisSeconds: Double? = nil
         if options.analyzeSignals {
             let a0 = now()
-            initialSignals = measureSignals(runner.soup, options.includeCompression)
+            initialSignals = withBrotli(measureSignals(runner.soup, options.includeCompression),
+                                        soup: runner.soup)
             initialAnalysisSeconds = now() - a0
         }
 
@@ -150,7 +181,12 @@ public enum BenchmarkRunner {
             if options.analyzeSignals && isSignalPoint {
                 let a0 = now()
                 let includeComp = options.includeCompression && isSamplePoint
-                signals = measureSignals(runner.soup, includeComp)
+                var s = measureSignals(runner.soup, includeComp)
+                // The paper Brotli metric follows the LZ proxy's cadence exactly:
+                // only where a measured signal epoch and an emission point coincide,
+                // so it never runs more often than the LZ proxy would.
+                if isSamplePoint { s = withBrotli(s, soup: runner.soup) }
+                signals = s
                 analysisSeconds = now() - a0
             }
 

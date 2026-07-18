@@ -1,0 +1,15 @@
+// System-library module over the platform's Brotli encoder. The include/library
+// search paths come from `pkgConfig: "libbrotlienc"` in Package.swift (resolved
+// via pkg-config on Linux and Homebrew on macOS), so no path is hard-coded here.
+//
+// This target is depended on ONLY by the `BrotliMetrics` library, its test
+// target, and the `bff-metal-bench` executable — the core oracle/evaluator/app
+// targets never link Brotli. The encoder version is verified at runtime
+// (`BrotliCompressor.isPaperPinned`, pinned to 1.1.0) before any paper metric is
+// emitted, so this is a *version-checked* dependency, not an unversioned one.
+module CBrotli [system] {
+    header "shim.h"
+    link "brotlienc"
+    link "brotlicommon"
+    export *
+}

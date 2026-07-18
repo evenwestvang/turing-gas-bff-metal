@@ -20,8 +20,20 @@ Everything here uses the full **8192-step** budget by default, exactly as produc
 | halt buckets, copy writes | `EpochCounters` reduced from the GPU records | The existing science counters, summed over measured epochs. Reduced inside `runEpoch`, so part of the epoch wall. |
 | max RSS (`maxRSSBytes`) | `getrusage(RUSAGE_SELF).ru_maxrss` | Process **peak / high-water** RSS (bytes; normalized from KiB on Linux, native bytes on Darwin). It is cumulative for the whole process/matrix — **not** cell-exclusive and **not** current resident memory. Sampled at three points per cell (pre-cell, post-`SoupRunner` allocation, post-cell) and reduced to the **maximum available** reading (`PeakRSSSampler`); `null` only if every reading was unavailable. One ceiling for the whole run, best-effort. |
 
-Output is one JSON document `{ "schemaVersion": 2, "results": [ … ] }` on stdout; all
+Output is one JSON document `{ "schemaVersion": 3, "results": [ … ] }` on stdout; all
 diagnostics and warnings go to stderr. One `results[]` entry per matrix cell. Pipe to `jq`.
+
+**Schema 3** (from 2): paper-aligned high-order-complexity fields (see
+"Paper-aligned observability" below). Per sample: `brotliBitsPerByte`,
+`highOrderComplexity`. Per result: `initialBrotliBitsPerByte`,
+`initialHighOrderComplexity`, `finalBrotliBitsPerByte`, `finalHighOrderComplexity`,
+and `highOrderComplexityCrossings` (an array of `{complexity, crossed, epoch,
+wallMsToCross, gpuMsToCross}` first-crossing records). Per config:
+`highOrderComplexityThresholds`. **All are `null`/`[]` unless `--brotli` is on and
+the linked Brotli is exactly 1.1.0** — the same explicit-null discipline as schema 2
+(keys always present; `null` = "not computed", never a fabricated 0). Schema 2's key
+set is otherwise unchanged; `H0` itself is the already-present whole-soup entropy
+(`initial/finalEntropyBitsPerByte`, per-sample `entropyBitsPerByte`).
 
 **Schema 2** (from 1): entropy-kinetics fields (`initialEntropyBitsPerByte`,
 `finalEntropyBitsPerByte`, `finalDeltaH`, `finalMeanProgramEntropyBitsPerByte`,
@@ -79,6 +91,12 @@ Order-0 Shannon entropy is order-blind. Two structure-sensitive signals accompan
   default and never under `--no-samples`. `null` means "not computed", not "incompressible".
 
 Read all three as relative, same-alphabet, same-length signals.
+
+> **The LZ proxy is not the paper's compression metric.** `compressionProxyRatio` is
+> a codec-free, unit-cost token *ratio* — deterministic and explainable, but **not**
+> Brotli and **not** the paper's number. The paper-aligned metric is a separate,
+> opt-in path (`--brotli`) that calls **real Brotli 1.1.0 quality 2**; see
+> "Paper-aligned observability" below. Never treat the LZ proxy as paper-equivalent.
 
 ### Metric controls and hidden-cost avoidance
 
@@ -159,6 +177,139 @@ with a sparse `--signal-interval` (`> 1`)** and the combination is rejected as a
 error (exit `64`) with a message naming both options. Use `--signal-interval 1` (the
 default) for ΔH thresholds, or drop `--delta-h-thresholds` for cadence-only analysis.
 
+## Paper-aligned observability (Brotli 1.1.0 high-order complexity)
+
+`--brotli` opts in to the **paper's** high-order-complexity metric — the one the
+reference implementation (paradigms-of-intelligence/cubff) logs as `higher_entropy`.
+It is measured with **real Brotli 1.1.0 quality 2**, byte-for-byte the cubff call, and
+is entirely separate from the deterministic LZ proxy above.
+
+### What it reports
+
+| Field | Definition | cubff name |
+|---|---|---|
+| **H0** | whole-soup order-0 Shannon entropy, bits/byte | `h0` |
+| **Brotli bpb** (`brotliBitsPerByte`) | `brotli_size * 8 / soupBytes` — the whole soup compressed under Brotli 1.1.0 q2, as bits per input byte | `brotli_bpb` |
+| **High-order complexity** (`highOrderComplexity`) | `H0 − brotli_bpb` | `higher_entropy` |
+| **Threshold crossing** (`highOrderComplexityCrossings`) | first epoch/time high-order complexity reaches each `--high-order-thresholds` level (default **`>= 1`**) | — |
+
+H0 is the already-reported whole-soup entropy (`initial/finalEntropyBitsPerByte`), so
+`--brotli` adds only the Brotli reading and the derived complexity + crossings.
+
+### Exact Brotli provenance and parameters (pinned)
+
+| | |
+|---|---|
+| Encoder | Brotli **1.1.0**, tag `v1.1.0` = `ed738e842d2fbdf2d6459e39267a633c4a9b2f5d` |
+| Call | `BrotliEncoderCompress(2, 24, BROTLI_MODE_GENERIC, n, soup, &size, buf)` |
+| Parameters | quality **2**, lgwin **24** (`BROTLI_MAX_WINDOW_BITS`), mode **generic**, whole soup in one shot, output sized by `BrotliEncoderMaxCompressedSize(n)` |
+| Provenance gate | `BrotliEncoderVersion() == 0x1001000`; the metric is emitted **only** against 1.1.0 — any other encoder yields `null` (honest "not computed"), never a wrong number |
+
+These match cubff's `common_language.h` exactly (verified in `Docs/CubffGrounding.md`).
+This is a **version-checked** dependency, not an unversioned system Brotli: the runtime
+gate refuses to stand in a non-1.1.0 encoder for the paper number.
+
+**Fixtures.** `Tests/BrotliMetricsTests/Fixtures/brotli-1.1.0-q2.json` records eight
+small literal inputs (empty, constant runs, an opcode cycle, an iota block, SplitMix64
+pseudo-random blocks) with their authoritative 1.1.0 q2 compressed byte counts.
+Regenerate with `Tools/brotli-fixtures/generate.sh` (clones the pinned tag, rebuilds,
+refuses to emit unless it linked 1.1.0). `BrotliMetricsTests` asserts our encoder call
+reproduces every count. For these small inputs the counts are byte-identical under
+Brotli 1.0.9 and 1.1.0 (verified), so the fixture test passes on either host; the
+divergence appears only at soup scale (see `Docs/CubffGrounding.md`), which is exactly
+why the *runtime* metric is pinned to 1.1.0.
+
+### Cadence, cost, and the two knobs it shares
+
+Compressing the whole soup is O(soup); `--brotli` therefore runs on **exactly the
+LZ-proxy cadence** — only at an epoch that is *both* a signal-measurement point
+(`--signal-interval`) and a JSON emission point (`--sample-interval`), plus the epoch-0
+reference and the always-both final epoch — and **outside the measured epoch wall**
+(timed into `signalAnalysisMsTotal`, like every other sampled signal). It never runs
+every epoch and never inside `runEpoch`, so simulation throughput is unaffected. It is
+ignored (stderr note) under `--no-samples`.
+
+`--high-order-thresholds L` records the first-crossing epoch/time for each level
+(default `1`). Because Brotli is sparse by construction, the crossing epoch is resolved
+**to the Brotli measurement cadence**, not necessarily the exact epoch — stated in the
+field docs rather than implied to be per-epoch exact. (Contrast `--delta-h-thresholds`,
+which needs the per-epoch entropy trajectory and so is rejected under a sparse
+`--signal-interval`.)
+
+### Determinism and isolation
+
+Enabling `--brotli` changes **nothing** about the simulation: the Brotli reading is a
+read-only pass over the committed soup outside the epoch wall, so soup evolution, RNG,
+pairing, mutation, scatter, counters, digest, and shadows are byte-for-byte identical
+to a run without it (pinned by `PaperComplexityHarnessTests.testBrotliDoesNotAlterTrajectory`).
+
+### Build dependency
+
+`--brotli` requires linking Brotli. The `bff-metal-bench` executable and the
+`BrotliMetrics`/`BrotliMetricsTests` targets depend on the `CBrotli` system library
+(`pkgConfig: "libbrotlienc"`, providers `apt libbrotli-dev` / `brew brotli`) — the
+oracle, the Metal evaluator, and the app do **not**. Install `libbrotli-dev` (Linux)
+or `brew install brotli` (macOS). For the *paper* number specifically the linked
+Brotli must be **1.1.0**; on any other version the run still completes with the brotli
+fields reported as `null`.
+
+### Honest limitations
+
+- **Statistical, not exact-trajectory, parity with cubff.** Our simulator keeps its
+  `counter-pcg-v1` RNG; cubff uses SplitMix64 counters with pair-indexed mutation
+  (2^30 denominator) and a biased-modulo Fisher–Yates shuffle (`Docs/CubffGrounding.md`).
+  So fixed-seed whole-soup trajectories are **not** bit-identical to published cubff
+  runs, and neither are the per-epoch H0 / Brotli-bpb / high-order-complexity values.
+  Acceptance is **statistical** — the *shapes* (H0 rising, high-order complexity
+  crossing 1, replicator onset) should agree in distribution — not exact numeric parity
+  at a given epoch. The compression *definition* is exact (same encoder, same
+  parameters); only the soup that is fed to it comes from a different RNG.
+- **Crossing epoch is cadence-resolved** (above).
+- **1.0.9 ≠ 1.1.0 at scale**: the metric is pinned to 1.1.0 for this reason.
+
+## Self-replicator counting (`CheckSelfRep`): feasibility report
+
+The paper's fourth observable is `number_selfreps` (`main.cc`), the count of programs
+that pass cubff's `CheckSelfRep`. This phase does **not** implement it; this is the
+written feasibility assessment the task calls for.
+
+**Semantics are already pinned.** `Docs/CubffGrounding.md` §6 documents `CheckSelfRep`
+from the pinned cubff source exactly: `kNumIters = 13` independent trials; per-trial
+noise `noise[j] = SplitMix64(local_seed ^ SplitMix64((iter+1)*64 + j)) % 256` with
+`local_seed = SplitMix64(num_programs*seed + index)`; `kNumExtraGens = 4` feed-forward
+generations (5 evaluations/trial, budget 8192); scoring where a byte position counts
+if some trial value is shared by ≥ 4 of 13 trials (first-half positions must also equal
+the original program byte); program score `min(res[0], res[1])`; classified a
+replicator at score **≥ 5**. The per-epoch seed is `seed(epoch)`. So the evaluator work
+is fully specified and reuses the oracle's existing `.dynamicScan` interpreter.
+
+**What makes it bounded and source-compatible.** The trial evaluation is exactly the
+interpreter we already ground against cubff (fixed 128-byte tape → final tape), so no
+new evaluator semantics are needed. The 13/4/≥5 constants and the scoring are small,
+pinned, and testable against curated tapes.
+
+**What blocks a faithful drop-in now — two real costs:**
+
+1. **RNG.** The noise stream and per-epoch seed are cubff **SplitMix64**, not our
+   `counter-pcg-v1`. To reproduce cubff's *exact* replicator counts we would need a
+   `cubffCompat` SplitMix64 noise source (a new RNG surface, explicitly out of scope for
+   this observability phase — 01 §7.1). Without it, `CheckSelfRep` is still well-defined,
+   but its counts are **statistical, not exact** — the same honesty caveat as the Brotli
+   metric, for the same RNG reason.
+2. **Compute.** `CheckSelfRep` is 13 × 5 = 65 evaluations *per program*. At 131072
+   programs that is ~8.5M budgeted 128-byte runs **per measured epoch** — many times the
+   cost of one simulation epoch. On the CPU oracle it is affordable only at small `N` or
+   over a sampled subset; a full-soup pass wants a GPU kernel.
+
+**Recommendation: defer to a dedicated follow-up, do not fold into this phase.** When
+implemented it should (a) preserve **13 trials, 4 extra generations, and threshold 5**
+exactly per §6; (b) run only at the reviewed **sparse cadence**, outside the epoch wall,
+behind its own `--self-rep` flag (never on by default); (c) be labeled **statistical,
+not exact-trajectory** parity unless/until a `cubffCompat` SplitMix64 noise stream is
+added; and (d) ship with curated fixtures pinning the scoring on known
+self-replicating / non-replicating tapes. Implementing it here would exceed a bounded
+observability change and would ship an exact-count claim the RNG cannot yet support.
+
 ## Native commands (Apple M4 Max)
 
 Build once in release; `-c release` matters for host-side throughput numbers.
@@ -226,6 +377,42 @@ swift run -c release bff-metal-bench \
   --init opcode --signal-interval 25 \
   > kinetics-sparse.json
 ```
+
+### Paper high-order complexity (Brotli 1.1.0) — native, requires brotli 1.1.0
+
+Both commands need the linked Brotli to be **1.1.0** (`brew install brotli`; verify
+with `bff-metal-bench --brotli … 2>&1 | grep -i brotli` — a version warning means the
+paper fields will be `null`). Brotli runs on the sample cadence only, outside the epoch
+wall. **Not executed in this repo** — they are native Apple-silicon runs.
+
+Bounded 131K single-cell probe (one soup size, sparse cadence so Brotli stays cheap):
+
+```sh
+swift run -c release bff-metal-bench \
+  --programs 131072 --seed 1 --warmup 2 --epochs 200 \
+  --init uniform --brotli --signal-interval 25 --sample-interval 25 \
+  --high-order-thresholds 1 \
+  > paper-probe-131k.json
+jq '.results[] | {h0:.finalEntropyBitsPerByte, brotliBpb:.finalBrotliBitsPerByte,
+  highOrder:.finalHighOrderComplexity, cross:.highOrderComplexityCrossings}' paper-probe-131k.json
+```
+
+Full 16,384-epoch study (the paper's horizon). Keep the two cadences aligned and sparse
+so Brotli is measured a bounded number of times over the run:
+
+```sh
+swift run -c release bff-metal-bench \
+  --programs 131072 --seed 1,2,3 --warmup 2 --epochs 16384 \
+  --init uniform --brotli --signal-interval 64 --sample-interval 64 \
+  --high-order-thresholds 0.5,1,2 \
+  > paper-study-16384.json
+```
+
+`--delta-h-thresholds` is deliberately absent from both: it needs the per-epoch entropy
+trajectory and is rejected under a sparse `--signal-interval`. High-order-complexity
+crossings are resolved to the Brotli cadence (documented above). Interpret against the
+honest limitations: parity with cubff is **statistical**, not exact-trajectory, because
+of the `counter-pcg-v1` vs SplitMix64 RNG difference.
 
 ### Shadow-on correctness spot checks
 

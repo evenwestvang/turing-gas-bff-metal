@@ -32,13 +32,26 @@ public struct SoupSignals: Equatable, Sendable {
     /// epoch — never every epoch — so its cost stays bounded at 131072 programs.
     /// `nil` means "not computed", not "incompressible".
     public var compressionProxyRatio: Double?
+    /// Paper-aligned Brotli 1.1.0 quality-2 compressed **bits per byte** of the
+    /// whole soup (cubff's `brotli_bpb`). OPT-IN (`--brotli`) and, like the LZ
+    /// proxy, computed only on the sample cadence — never every epoch — and only
+    /// when the linked Brotli is exactly 1.1.0 (else `nil`, honest "not computed").
+    /// This is the real codec number, distinct from `compressionProxyRatio`.
+    public var brotliBitsPerByte: Double?
+    /// Paper high-order complexity `H0 − brotli_bpb` (cubff's `higher_entropy`),
+    /// `entropyBitsPerByte − brotliBitsPerByte`. `nil` exactly when
+    /// `brotliBitsPerByte` is. The paper's regime of interest is `>= 1`.
+    public var highOrderComplexity: Double?
 
     public init(entropyBitsPerByte: Double, meanProgramEntropyBitsPerByte: Double,
-                transitionRate: Double, compressionProxyRatio: Double?) {
+                transitionRate: Double, compressionProxyRatio: Double?,
+                brotliBitsPerByte: Double? = nil, highOrderComplexity: Double? = nil) {
         self.entropyBitsPerByte = entropyBitsPerByte
         self.meanProgramEntropyBitsPerByte = meanProgramEntropyBitsPerByte
         self.transitionRate = transitionRate
         self.compressionProxyRatio = compressionProxyRatio
+        self.brotliBitsPerByte = brotliBitsPerByte
+        self.highOrderComplexity = highOrderComplexity
     }
 
     /// Measure a soup. `includeCompression` gates the expensive O(n·window) proxy so
@@ -89,6 +102,11 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
     public var measuredEpochs: Int
     /// ΔH (whole-soup, from the initial soup) levels to record time/epochs-to-cross.
     public var deltaHThresholds: [Double]
+    /// Paper high-order-complexity (`H0 − brotli_bpb`) levels to record the first
+    /// epoch/time reaching them. Only meaningful with `--brotli`; the crossing epoch
+    /// is resolved to the Brotli **measurement cadence** (see the note on the
+    /// aggregator), not necessarily the exact epoch. Empty by default.
+    public var highOrderComplexityThresholds: [Double]
     /// Emit a per-epoch kinetics sample (and the expensive compression proxy) every
     /// `sampleInterval` epochs. `>= 1`; large values bound output at large soups.
     public var sampleInterval: Int
@@ -102,6 +120,7 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
                 warmupEpochs: Int = 1,
                 measuredEpochs: Int = 8,
                 deltaHThresholds: [Double] = [],
+                highOrderComplexityThresholds: [Double] = [],
                 sampleInterval: Int = 1) {
         self.seed = seed
         self.programCount = programCount
@@ -113,6 +132,7 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
         self.warmupEpochs = warmupEpochs
         self.measuredEpochs = measuredEpochs
         self.deltaHThresholds = deltaHThresholds
+        self.highOrderComplexityThresholds = highOrderComplexityThresholds
         self.sampleInterval = max(1, sampleInterval)
     }
 
@@ -221,6 +241,56 @@ public struct ThresholdTracker {
     public var crossings: [ThresholdCrossing] { recorded }
 }
 
+/// First-crossing record for one paper high-order-complexity (`H0 − brotli_bpb`)
+/// threshold. Parallel to `ThresholdCrossing` but tracks the *absolute* complexity,
+/// not a delta, and its epoch is resolved only to the Brotli measurement cadence.
+public struct HighOrderComplexityCrossing: Equatable, Sendable, Codable {
+    /// The threshold in bits/byte of high-order complexity. The paper's regime is `1`.
+    public var complexity: Double
+    public var crossed: Bool
+    /// The first Brotli-measured epoch whose complexity reached the threshold.
+    /// Because Brotli runs only on the sample cadence, this is the crossing epoch
+    /// **to Brotli-measurement resolution**, not necessarily the exact epoch —
+    /// stated honestly rather than implied to be per-epoch exact.
+    public var epoch: Int?
+    /// Cumulative wall ms from run start to that epoch (includes warmup timing).
+    public var wallMsToCross: Double?
+    /// Cumulative GPU command-buffer ms to that epoch, or `nil` if any epoch up to
+    /// the crossing lacked a usable GPU timestamp.
+    public var gpuMsToCross: Double?
+}
+
+/// Records the first Brotli-measured epoch at which high-order complexity reaches
+/// each threshold. Pure and order-following: feed it one `observe(...)` per
+/// Brotli-measured epoch, in epoch order (epoch 0's reference first, if measured).
+public struct HighOrderComplexityTracker {
+    private let thresholds: [Double]
+    private var recorded: [HighOrderComplexityCrossing]
+
+    public init(thresholds: [Double]) {
+        self.thresholds = thresholds
+        self.recorded = thresholds.map {
+            HighOrderComplexityCrossing(complexity: $0, crossed: false, epoch: nil,
+                                        wallMsToCross: nil, gpuMsToCross: nil)
+        }
+    }
+
+    /// Observe one Brotli-measured epoch. A threshold is crossed the first epoch
+    /// `complexity >= threshold`.
+    public mutating func observe(epoch: Int, complexity: Double,
+                                 cumulativeWallMs: Double, cumulativeGpuMs: Double?) {
+        for i in recorded.indices where !recorded[i].crossed
+            && complexity >= recorded[i].complexity {
+            recorded[i].crossed = true
+            recorded[i].epoch = epoch
+            recorded[i].wallMsToCross = cumulativeWallMs
+            recorded[i].gpuMsToCross = cumulativeGpuMs
+        }
+    }
+
+    public var crossings: [HighOrderComplexityCrossing] { recorded }
+}
+
 // MARK: - Result
 
 /// One per-epoch kinetics sample in the machine-readable output.
@@ -242,6 +312,12 @@ public struct EpochSample: Equatable, Sendable, Codable {
     public var deltaHFromInitial: Double
     public var transitionRate: Double
     public var compressionProxyRatio: Double?
+    /// Paper Brotli 1.1.0 q2 bits/byte at this epoch; `nil` unless `--brotli` and
+    /// this epoch was a Brotli measurement point on a 1.1.0 encoder.
+    public var brotliBitsPerByte: Double?
+    /// Paper high-order complexity `entropyBitsPerByte − brotliBitsPerByte`; `nil`
+    /// exactly when `brotliBitsPerByte` is.
+    public var highOrderComplexity: Double?
 }
 
 /// The full machine-readable result for one benchmark config. Codable so the CLI can
@@ -307,6 +383,21 @@ public struct BenchmarkResult: Sendable, Codable {
     public var finalCompressionProxyRatio: Double?
     public var thresholdCrossings: [ThresholdCrossing]
 
+    // Paper-aligned high-order complexity (whole run). All `nil`/empty unless
+    // `--brotli` is on and the linked Brotli is 1.1.0 (else honest "not computed").
+    // H0 itself is already reported as `initial/finalEntropyBitsPerByte`.
+    /// Brotli 1.1.0 q2 bits/byte of the initial (epoch-0) soup.
+    public var initialBrotliBitsPerByte: Double?
+    /// High-order complexity `H0 − brotli_bpb` of the initial soup.
+    public var initialHighOrderComplexity: Double?
+    /// Brotli 1.1.0 q2 bits/byte of the final soup.
+    public var finalBrotliBitsPerByte: Double?
+    /// High-order complexity `H0 − brotli_bpb` of the final soup.
+    public var finalHighOrderComplexity: Double?
+    /// First-crossing records for the configured high-order-complexity thresholds
+    /// (default paper threshold `>= 1`). Empty unless `--brotli` measured complexity.
+    public var highOrderComplexityCrossings: [HighOrderComplexityCrossing]
+
     // Correctness spot check (whole run)
     public var shadowCheckedTotal: Int
     public var shadowMismatchTotal: Int
@@ -348,11 +439,26 @@ extension ThresholdCrossing {
     }
 }
 
+extension HighOrderComplexityCrossing {
+    enum CodingKeys: String, CodingKey {
+        case complexity, crossed, epoch, wallMsToCross, gpuMsToCross
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(complexity, forKey: .complexity)
+        try c.encode(crossed, forKey: .crossed)
+        try c.encodeOrNull(epoch, forKey: .epoch)
+        try c.encodeOrNull(wallMsToCross, forKey: .wallMsToCross)
+        try c.encodeOrNull(gpuMsToCross, forKey: .gpuMsToCross)
+    }
+}
+
 extension EpochSample {
     enum CodingKeys: String, CodingKey {
         case epoch, phase, wallMs, gpuMs, hostResidualMs, rawSteps, commandSteps,
              copyWrites, entropyBitsPerByte, meanProgramEntropyBitsPerByte,
-             deltaHFromInitial, transitionRate, compressionProxyRatio
+             deltaHFromInitial, transitionRate, compressionProxyRatio,
+             brotliBitsPerByte, highOrderComplexity
     }
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -369,6 +475,8 @@ extension EpochSample {
         try c.encode(deltaHFromInitial, forKey: .deltaHFromInitial)
         try c.encode(transitionRate, forKey: .transitionRate)
         try c.encodeOrNull(compressionProxyRatio, forKey: .compressionProxyRatio)
+        try c.encodeOrNull(brotliBitsPerByte, forKey: .brotliBitsPerByte)
+        try c.encodeOrNull(highOrderComplexity, forKey: .highOrderComplexity)
     }
 }
 
@@ -382,6 +490,9 @@ extension BenchmarkResult {
              haltUnknown, signalsAnalyzed, initialEntropyBitsPerByte,
              finalEntropyBitsPerByte, finalDeltaH, finalMeanProgramEntropyBitsPerByte,
              finalTransitionRate, finalCompressionProxyRatio, thresholdCrossings,
+             initialBrotliBitsPerByte, initialHighOrderComplexity,
+             finalBrotliBitsPerByte, finalHighOrderComplexity,
+             highOrderComplexityCrossings,
              shadowCheckedTotal, shadowMismatchTotal, maxRSSBytes, samples, finalDigest
     }
     public func encode(to encoder: Encoder) throws {
@@ -418,6 +529,11 @@ extension BenchmarkResult {
         try c.encodeOrNull(finalTransitionRate, forKey: .finalTransitionRate)
         try c.encodeOrNull(finalCompressionProxyRatio, forKey: .finalCompressionProxyRatio)
         try c.encode(thresholdCrossings, forKey: .thresholdCrossings)
+        try c.encodeOrNull(initialBrotliBitsPerByte, forKey: .initialBrotliBitsPerByte)
+        try c.encodeOrNull(initialHighOrderComplexity, forKey: .initialHighOrderComplexity)
+        try c.encodeOrNull(finalBrotliBitsPerByte, forKey: .finalBrotliBitsPerByte)
+        try c.encodeOrNull(finalHighOrderComplexity, forKey: .finalHighOrderComplexity)
+        try c.encode(highOrderComplexityCrossings, forKey: .highOrderComplexityCrossings)
         try c.encode(shadowCheckedTotal, forKey: .shadowCheckedTotal)
         try c.encode(shadowMismatchTotal, forKey: .shadowMismatchTotal)
         try c.encodeOrNull(maxRSSBytes, forKey: .maxRSSBytes)
@@ -498,10 +614,23 @@ public enum BenchmarkAggregator {
         // we emit no thresholds, no samples, and nil kinetics rather than fabricating
         // a flat ΔH == 0 trajectory.
         var tracker = ThresholdTracker(thresholds: signalsAnalyzed ? config.deltaHThresholds : [])
+        // Paper high-order-complexity crossings run over the Brotli-measured epochs
+        // only (Brotli is sparse by construction), so — unlike ΔH — this tracker is
+        // fed just the epochs that carry a `highOrderComplexity`, and its crossing
+        // epoch is resolved to that measurement cadence (documented on the struct).
+        var highOrderTracker = HighOrderComplexityTracker(
+            thresholds: signalsAnalyzed ? config.highOrderComplexityThresholds : [])
         var cumWall = 0.0
         var cumGpu: Double? = 0.0
         var samples: [EpochSample] = []
         if signalsAnalyzed, let initialH {
+            // Epoch-0 reference: if the initial soup was Brotli-measured, an already
+            // high-order-complex starting soup registers a crossing at epoch 0
+            // (cumulative wall/GPU = 0, nothing has run yet).
+            if let initialC = initialSignals?.highOrderComplexity {
+                highOrderTracker.observe(epoch: 0, complexity: initialC,
+                                         cumulativeWallMs: 0, cumulativeGpuMs: 0)
+            }
             for o in observations {
                 cumWall += o.wallSeconds
                 if let g = o.gpuSeconds, cumGpu != nil { cumGpu! += g } else { cumGpu = nil }
@@ -510,6 +639,11 @@ public enum BenchmarkAggregator {
                 tracker.observe(epoch: o.epoch, deltaH: deltaH,
                                 cumulativeWallMs: cumWall * 1000,
                                 cumulativeGpuMs: cumGpu.map { $0 * 1000 })
+                if let c = s.highOrderComplexity {
+                    highOrderTracker.observe(epoch: o.epoch, complexity: c,
+                                             cumulativeWallMs: cumWall * 1000,
+                                             cumulativeGpuMs: cumGpu.map { $0 * 1000 })
+                }
 
                 let isSamplePoint = (o.epoch % config.sampleInterval == 0)
                     || o.epoch == observations.last?.epoch
@@ -528,7 +662,9 @@ public enum BenchmarkAggregator {
                         meanProgramEntropyBitsPerByte: s.meanProgramEntropyBitsPerByte,
                         deltaHFromInitial: deltaH,
                         transitionRate: s.transitionRate,
-                        compressionProxyRatio: s.compressionProxyRatio))
+                        compressionProxyRatio: s.compressionProxyRatio,
+                        brotliBitsPerByte: s.brotliBitsPerByte,
+                        highOrderComplexity: s.highOrderComplexity))
                 }
             }
         }
@@ -551,6 +687,15 @@ public enum BenchmarkAggregator {
             ? (last?.transitionRate ?? initialSignals?.transitionRate) : nil
         let finalCompression: Double? = signalsAnalyzed
             ? (last?.compressionProxyRatio ?? initialSignals?.compressionProxyRatio) : nil
+        // Paper high-order complexity: the final soup's Brotli reading falls back to
+        // the initial one only if the final epoch carried no Brotli measurement (it
+        // always does when `--brotli` is on, since the final epoch is a sample point).
+        let initialBrotli: Double? = signalsAnalyzed ? initialSignals?.brotliBitsPerByte : nil
+        let initialHighOrder: Double? = signalsAnalyzed ? initialSignals?.highOrderComplexity : nil
+        let finalBrotli: Double? = signalsAnalyzed
+            ? (last?.brotliBitsPerByte ?? initialSignals?.brotliBitsPerByte) : nil
+        let finalHighOrder: Double? = signalsAnalyzed
+            ? (last?.highOrderComplexity ?? initialSignals?.highOrderComplexity) : nil
 
         let shadowChecked = observations.reduce(0) { $0 + $1.shadowChecked }
         let shadowMismatch = observations.reduce(0) { $0 + $1.shadowMismatches }
@@ -584,6 +729,11 @@ public enum BenchmarkAggregator {
             finalTransitionRate: finalTransition,
             finalCompressionProxyRatio: finalCompression,
             thresholdCrossings: tracker.crossings,
+            initialBrotliBitsPerByte: initialBrotli,
+            initialHighOrderComplexity: initialHighOrder,
+            finalBrotliBitsPerByte: finalBrotli,
+            finalHighOrderComplexity: finalHighOrder,
+            highOrderComplexityCrossings: highOrderTracker.crossings,
             shadowCheckedTotal: shadowChecked,
             shadowMismatchTotal: shadowMismatch,
             maxRSSBytes: maxRSSBytes,

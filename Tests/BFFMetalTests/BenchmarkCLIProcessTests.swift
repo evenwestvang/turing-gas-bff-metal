@@ -76,8 +76,8 @@ final class BenchmarkCLIProcessTests: XCTestCase {
     // MARK: - --no-samples propagation and schema behavior
 
     /// `--no-samples` is accepted and propagated; on a non-Metal host the run emits a
-    /// schemaVersion-2 envelope with an empty `results` array and exits 2. On a Metal
-    /// host the same invocation actually runs, so we only require schemaVersion 2 and a
+    /// schemaVersion-3 envelope with an empty `results` array and exits 2. On a Metal
+    /// host the same invocation actually runs, so we only require schemaVersion 3 and a
     /// documented exit code.
     func testNoSamplesFlagPropagatesAndSchemaIsStable() throws {
         let r = try runBench(["--programs", "2", "--seed", "1",
@@ -86,7 +86,7 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         #if canImport(Metal)
         // Metal host: it ran. Require the schema marker and one of the valid codes.
         let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
-        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3)
         XCTAssertTrue([BenchmarkExitCodeValue.success,
                        BenchmarkExitCodeValue.runtimeFailure,
                        BenchmarkExitCodeValue.gpuTimingUnavailable].contains(r.status),
@@ -95,7 +95,7 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         // No Metal: nothing ran — exit 2 with an explicit empty results array.
         XCTAssertEqual(r.status, 2, "non-Metal valid config exits 2 (nothing ran)")
         let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
-        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2, "schemaVersion 2 emitted")
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3, "schemaVersion 3 emitted")
         XCTAssertEqual((obj?["results"] as? [Any])?.count, 0, "empty results array")
         XCTAssertTrue(r.stderr.contains("analyzeSignals=false"),
                       "--no-samples propagated to the resolved config")
@@ -113,7 +113,7 @@ final class BenchmarkCLIProcessTests: XCTestCase {
                               "--compression", "--sample-interval", "2"])
         #if canImport(Metal)
         let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
-        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3)
         #else
         XCTAssertEqual(r.status, 2, "compression does not change the no-Metal exit code")
         XCTAssertTrue(r.stderr.contains("compression=true"),
@@ -129,6 +129,48 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         #if !canImport(Metal)
         XCTAssertEqual(ignored.status, 2)
         #endif
+    }
+
+    // MARK: - --brotli (paper metric) propagation and gating
+
+    /// `--brotli` is accepted and propagated; it does not change the exit-code mapping
+    /// (still 2 on a non-Metal host) and is distinct from `--compression`. Under
+    /// `--no-samples` it is ignored with an explicit stderr note.
+    func testBrotliPropagationAndIgnoreUnderNoSamples() throws {
+        let r = try runBench(["--programs", "2", "--seed", "1",
+                              "--warmup", "0", "--epochs", "1", "--brotli"])
+        #if canImport(Metal)
+        let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3)
+        #else
+        XCTAssertEqual(r.status, 2, "brotli does not change the no-Metal exit code")
+        XCTAssertTrue(r.stderr.contains("brotli=true"),
+                      "--brotli propagated to the resolved config")
+        #endif
+
+        // --brotli under --no-samples: accepted, but explicitly ignored.
+        let ignored = try runBench(["--programs", "2", "--seed", "1",
+                                    "--warmup", "0", "--epochs", "1",
+                                    "--no-samples", "--brotli"])
+        XCTAssertTrue(ignored.stderr.contains("--brotli is ignored under --no-samples"),
+                      "brotli-under-no-samples emits the documented note")
+        #if !canImport(Metal)
+        XCTAssertEqual(ignored.status, 2)
+        #endif
+    }
+
+    /// `--high-order-thresholds` parses like the ΔH thresholds; a non-numeric level is a
+    /// usage error (exit 64) decided during argument parsing on every platform.
+    func testHighOrderThresholdsParsing() throws {
+        let bad = try runBench(["--programs", "2", "--seed", "1",
+                                "--warmup", "0", "--epochs", "1",
+                                "--brotli", "--high-order-thresholds", "1,abc"])
+        XCTAssertEqual(bad.status, 64, "non-numeric high-order threshold is a usage error")
+
+        let ok = try runBench(["--programs", "2", "--seed", "1",
+                               "--warmup", "0", "--epochs", "2",
+                               "--brotli", "--high-order-thresholds", "0.5,1,2"])
+        XCTAssertNotEqual(ok.status, 64, "valid high-order thresholds are accepted")
     }
 
     // MARK: - --signal-interval cadence: parsing, propagation, exit-code policy
@@ -168,7 +210,7 @@ final class BenchmarkCLIProcessTests: XCTestCase {
                               "--signal-interval", "3"])
         #if canImport(Metal)
         let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
-        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3)
         XCTAssertNotEqual(r.status, 64, "cadence-only analysis is not a usage error")
         #else
         XCTAssertEqual(r.status, 2, "cadence-only signal analysis does not change the exit code")

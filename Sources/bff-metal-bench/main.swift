@@ -23,6 +23,7 @@
 
 import BFFMetal
 import BFFOracle
+import BrotliMetrics
 import Foundation
 import Dispatch
 
@@ -53,6 +54,9 @@ var variant: BFFVariant = .noheads
 var initMode: SoupConfig.InitMode = .uniform
 var shadowSampleArg: String? = nil     // nil => 0 (throughput mode)
 var deltaHThresholds: [Double] = []
+// Paper high-order-complexity (`H0 − brotli_bpb`) thresholds; the paper's regime of
+// interest is `>= 1`, so that is the default. Only used when `--brotli` is on.
+var highOrderThresholds: [Double] = [PaperComplexity.defaultThreshold]
 var sampleInterval = 1
 // Signal-measurement cadence (distinct from `--sample-interval`, which is the JSON
 // emission cadence). `1` = per-epoch (default); `N > 1` = cadence-only signal analysis.
@@ -63,6 +67,10 @@ var allowMissingGPUTiming = false
 // opts the O(n·window) LZ proxy in; it is ignored when analysis is off.
 var analyzeSignals = true
 var includeCompression = false
+// `--brotli` opts in to the paper-aligned Brotli 1.1.0 q2 measurement (distinct from
+// the deterministic LZ proxy). Bounded to the LZ-proxy cadence; ignored when analysis
+// is off; emitted only when the linked Brotli is exactly 1.1.0 (else "not computed").
+var includeBrotli = false
 
 let usageExit = BenchmarkExitCode.usage
 
@@ -120,11 +128,13 @@ while cursor < arguments.count {
     case "--mutation-p32": mutationP32 = u32Arg(argument, nextValue(argument))
     case "--shadow-sample": shadowSampleArg = nextValue(argument)
     case "--delta-h-thresholds": deltaHThresholds = doubleList(argument, nextValue(argument))
+    case "--high-order-thresholds": highOrderThresholds = doubleList(argument, nextValue(argument))
     case "--sample-interval": sampleInterval = intArg(argument, nextValue(argument))
     case "--signal-interval": signalInterval = intArg(argument, nextValue(argument))
     case "--allow-missing-gpu-timing": allowMissingGPUTiming = true
     case "--no-samples": analyzeSignals = false
     case "--compression": includeCompression = true
+    case "--brotli": includeBrotli = true
     case "--variant":
         let raw = nextValue(argument)
         guard let v = BFFVariant(rawValue: raw) else {
@@ -152,6 +162,18 @@ while cursor < arguments.count {
           --shadow-sample N|all   pairs CPU-shadowed per epoch; 0/omit = throughput mode
           --delta-h-thresholds L  comma bits/byte ΔH levels to time (e.g. 0.25,0.5,1.0);
                                   requires per-epoch signals (--signal-interval 1)
+          --brotli                opt in to the paper-aligned Brotli 1.1.0 quality-2
+                                  metric: reports brotli bits/byte and high-order
+                                  complexity H0 - brotli_bpb (cubff's higher_entropy).
+                                  DISTINCT from --compression (the LZ proxy). Runs only
+                                  on the LZ-proxy cadence, outside the epoch wall; the
+                                  number is emitted only when the linked Brotli is
+                                  exactly 1.1.0, else reported as null (not computed).
+                                  Ignored under --no-samples.
+          --high-order-thresholds L  comma bits/byte high-order-complexity levels whose
+                                  first-crossing epoch/time to record (default 1, the
+                                  paper threshold). Only with --brotli; the crossing
+                                  epoch is resolved to the Brotli measurement cadence.
           --sample-interval N     JSON emission cadence: emit a kinetics sample every N
                                   epochs (+ the final epoch) (default 1). It is also the
                                   LZ-proxy MEASUREMENT cadence when --compression is on
@@ -204,11 +226,29 @@ if analyzeSignals {
 if includeCompression && !analyzeSignals {
     warn("--compression is ignored under --no-samples (no signal analysis runs)")
 }
+if includeBrotli && !analyzeSignals {
+    warn("--brotli is ignored under --no-samples (no signal analysis runs)")
+}
 if signalInterval > 1 && !analyzeSignals {
     warn("--signal-interval is ignored under --no-samples (no signal analysis runs)")
 }
 if !deltaHThresholds.isEmpty && !analyzeSignals {
     warn("--delta-h-thresholds is ignored under --no-samples (no signal analysis runs)")
+}
+// High-order-complexity thresholds need the Brotli measurement; without --brotli they
+// are inert. (A `--high-order-thresholds` explicitly set to empty is silent.)
+if !includeBrotli && !highOrderThresholds.isEmpty
+    && highOrderThresholds != [PaperComplexity.defaultThreshold] {
+    warn("--high-order-thresholds is ignored without --brotli (no complexity measured)")
+}
+// The paper metric is defined against Brotli 1.1.0 exactly; refuse to fabricate it
+// from any other encoder. On a non-1.1.0 host the run still proceeds — the brotli
+// fields are reported as null (honest "not computed").
+if includeBrotli && analyzeSignals && !BrotliCompressor.isPaperPinned {
+    warn("--brotli requested but the linked Brotli is "
+         + "\(BrotliCompressor.encoderVersionString) (need 1.1.0); brotli bits/byte and "
+         + "high-order complexity will be reported as null (not computed). Install "
+         + "Brotli 1.1.0 (brew install brotli / build the pinned tag) for the paper metric.")
 }
 
 // Build the matrix (programs outer, seeds inner) and validate every cell up front so
@@ -227,6 +267,10 @@ for programs in programsList {
             mutationP32: mutationP32, variant: variant, initMode: initMode,
             shadowSampleCount: shadow, warmupEpochs: warmupEpochs,
             measuredEpochs: measuredEpochs, deltaHThresholds: deltaHThresholds,
+            // High-order thresholds are only meaningful when Brotli is measured; keep
+            // them out of the config (and thus out of the crossing tracker) otherwise,
+            // so `highOrderComplexityCrossings` stays empty without --brotli.
+            highOrderComplexityThresholds: includeBrotli ? highOrderThresholds : [],
             sampleInterval: sampleInterval)
         do {
             _ = try cfg.soupConfig()   // validate bounds now
@@ -273,9 +317,13 @@ func emit(_ results: [BenchmarkResult]) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     do {
-        // schemaVersion 2: kinetics fields are now optional (nil under --no-samples),
-        // signalsAnalyzed + signalAnalysisMsTotal added (see Docs/Benchmarking.md).
-        let data = try encoder.encode(Envelope(schemaVersion: 2, results: results))
+        // schemaVersion 3: paper-aligned high-order complexity added — per-sample
+        // brotliBitsPerByte/highOrderComplexity, result initial/final Brotli bpb +
+        // high-order complexity, and highOrderComplexityCrossings, plus the config
+        // key highOrderComplexityThresholds. All null/empty unless --brotli measured
+        // against Brotli 1.1.0. Schema 2's key set is otherwise unchanged and every
+        // optional stays an explicit null (see Docs/Benchmarking.md).
+        let data = try encoder.encode(Envelope(schemaVersion: 3, results: results))
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))
     } catch {
@@ -303,7 +351,15 @@ do {
 
 let runOptions = BenchmarkRunner.Options(analyzeSignals: analyzeSignals,
                                          includeCompression: includeCompression,
-                                         signalInterval: signalInterval)
+                                         signalInterval: signalInterval,
+                                         includeBrotli: includeBrotli)
+
+// The paper Brotli reading, injected so BFFMetal never links Brotli. Returns nil
+// (honest "not computed") unless the linked encoder is exactly 1.1.0; the runner
+// calls this only on the bounded LZ-proxy cadence, outside the epoch wall.
+let measureBrotli: (_ soup: [UInt8]) -> Double? = { soup in
+    BrotliCompressor.paperBitsPerByte(soup: soup)
+}
 
 var results: [BenchmarkResult] = []
 var anyShadowMismatch = false
@@ -329,6 +385,7 @@ for config in configs {
                 SoupSignals.measure(soup: soup, programCount: config.programCount,
                                     includeCompression: includeComp)
             },
+            measureBrotliBitsPerByte: measureBrotli,
             onEpoch: { report in
                 for mm in report.shadowMismatches { warn("SHADOW MISMATCH " + mm.summary) }
             })
@@ -368,6 +425,7 @@ for config in configs {
          + "budget=\(config.stepBudget) init=\(config.initMode.rawValue) "
          + "variant=\(config.variant.rawValue) shadowSample=\(config.shadowSampleCount) "
          + "analyzeSignals=\(analyzeSignals) compression=\(includeCompression) "
+         + "brotli=\(includeBrotli) brotliVersion=\(BrotliCompressor.encoderVersionString) "
          + "sampleInterval=\(config.sampleInterval) signalInterval=\(signalInterval) "
          + "rng=\(BFFRandom.contractID)")
 }

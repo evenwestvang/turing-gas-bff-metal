@@ -24,6 +24,22 @@ let package = Package(
         // Shared host/MSL layout of the render uniform block; same C-header
         // pattern so its layout asserts are checked on every platform.
         .target(name: "CSoupRender"),
+        // System Brotli encoder (module map over <brotli/encode.h>). Resolved via
+        // pkg-config on Linux and Homebrew on macOS arm64. Depended on ONLY by
+        // BrotliMetrics, its tests, and bff-metal-bench — never by the oracle,
+        // the Metal evaluator, or the app. Requires libbrotli-dev (apt) /
+        // `brew install brotli`; the encoder version is verified at runtime
+        // (pinned to 1.1.0) before any paper metric is emitted.
+        .systemLibrary(
+            name: "CBrotli",
+            path: "Sources/CBrotli",
+            pkgConfig: "libbrotlienc",
+            providers: [.apt(["libbrotli-dev"]), .brew(["brotli"])]
+        ),
+        // Paper-aligned Brotli measurement (the exact cubff q2/lgwin24/generic
+        // call), isolated so Brotli is a dependency of the benchmark only. The
+        // pure H0 − brotli_bpb arithmetic lives in BFFOracle.PaperComplexity.
+        .target(name: "BrotliMetrics", dependencies: ["CBrotli", "BFFOracle"]),
         // Metal evaluator host + platform-independent fixture planning/checking.
         // Builds everywhere; the Metal dispatch paths are #if canImport(Metal).
         .target(
@@ -40,7 +56,7 @@ let package = Package(
         // Headless measurement-first benchmark harness / matrix runner sized for
         // native M4 Max runs (exits 2 on non-Metal hosts).
         .executableTarget(name: "bff-metal-bench",
-                          dependencies: ["BFFMetal", "BFFOracle"]),
+                          dependencies: ["BFFMetal", "BFFOracle", "BrotliMetrics"]),
         // Platform-independent app core: grid/camera/LOD/normalization/opcode/
         // batcher/HUD/snapshot pure models + launch-option parsing. Depends on
         // BFFMetal for the soup runner and epoch types; builds and is tested on
@@ -67,6 +83,15 @@ let package = Package(
         .testTarget(
             name: "BFFMetalTests",
             dependencies: ["BFFMetal", "BFFOracle", "CBFFShared"]
+        ),
+        // Fixture + version-gate coverage for the Brotli 1.1.0 q2 integration.
+        // Requires libbrotli (apt/brew); the exact-byte-count assertions hold on
+        // any 1.0.9/1.1.0 host (verified version-stable for these small inputs),
+        // and the provenance gate is asserted directly.
+        .testTarget(
+            name: "BrotliMetricsTests",
+            dependencies: ["BrotliMetrics", "BFFOracle"],
+            resources: [.copy("Fixtures")]
         ),
     ]
 )
