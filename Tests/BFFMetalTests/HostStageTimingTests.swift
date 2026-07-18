@@ -166,6 +166,34 @@ final class HostStageTimingTests: XCTestCase {
                        1000, accuracy: 1e-9)
     }
 
+    func testTopLevelAttributionOverrunToleranceBoundary() throws {
+        let tolerance = TimingReconciliationTolerance.seconds(enclosingSeconds: 1.0,
+                                                              classifiedSeconds: 1.0)
+        let edgeStep = tolerance * 1e-6
+        let within = tolerance - edgeStep
+        let beyond = tolerance + edgeStep
+
+        let withinSpans = spans(mut: 1.0 + within, pack: 0, eval: 0, scat: 0,
+                                counter: 0, metrics: 0, shadow: 0, digest: 0)
+        let withinAttribution = try XCTUnwrap(HostStageAttribution.aggregate(
+            measured: [(wallSeconds: 1.0, spans: withinSpans)]))
+        XCTAssertLessThan(withinAttribution.unclassifiedMsPerEpoch!, 0)
+        XCTAssertEqual(withinAttribution.unclassifiedMsPerEpoch!, -within * 1000,
+                       accuracy: 1e-12)
+        XCTAssertTrue(withinAttribution.reconciliationValid)
+        XCTAssertNil(withinAttribution.reconciliationError)
+
+        let beyondSpans = spans(mut: 1.0 + beyond, pack: 0, eval: 0, scat: 0,
+                                counter: 0, metrics: 0, shadow: 0, digest: 0)
+        let beyondAttribution = try XCTUnwrap(HostStageAttribution.aggregate(
+            measured: [(wallSeconds: 1.0, spans: beyondSpans)]))
+        XCTAssertLessThan(beyondAttribution.unclassifiedMsPerEpoch!, 0)
+        XCTAssertEqual(beyondAttribution.unclassifiedMsPerEpoch!, -beyond * 1000,
+                       accuracy: 1e-12)
+        XCTAssertFalse(beyondAttribution.reconciliationValid)
+        XCTAssertNotNil(beyondAttribution.reconciliationError)
+    }
+
     /// Instrumented attribution requires every measured epoch to carry spans. A mixed
     /// set is surfaced as incomplete with stable null measurements, never compacted into
     /// a subset that reconciles against the all-epoch wall.
@@ -259,6 +287,38 @@ final class HostStageTimingTests: XCTestCase {
         XCTAssertEqual(a.evaluatorUnclassifiedMsPerEpoch!, -200, accuracy: 1e-9)
         XCTAssertEqual(a.evaluatorReconciliationValid, false)
         XCTAssertNotNil(a.evaluatorReconciliationError)
+    }
+
+    func testEvaluatorSubstageOverrunToleranceBoundary() throws {
+        let tolerance = TimingReconciliationTolerance.seconds(enclosingSeconds: 1.0,
+                                                              classifiedSeconds: 1.0)
+        let edgeStep = tolerance * 1e-6
+        let within = tolerance - edgeStep
+        let beyond = tolerance + edgeStep
+
+        func attribution(overrun: Double) throws -> HostStageAttribution {
+            let profile = EvaluatorStageProfile(
+                bufferAllocSeconds: 1.0 + overrun, uploadSeconds: 0,
+                encodeSeconds: 0, submitWaitSeconds: 0, readbackSeconds: 0)
+            let s = spans(mut: 0, pack: 0, eval: 1.0, scat: 0, counter: 0,
+                          metrics: 0, shadow: 0, digest: 0, profile: profile)
+            return try XCTUnwrap(HostStageAttribution.aggregate(
+                measured: [(wallSeconds: 1.1, spans: s)]))
+        }
+
+        let withinAttribution = try attribution(overrun: within)
+        XCTAssertLessThan(withinAttribution.evaluatorUnclassifiedMsPerEpoch!, 0)
+        XCTAssertEqual(withinAttribution.evaluatorUnclassifiedMsPerEpoch!,
+                       -within * 1000, accuracy: 1e-12)
+        XCTAssertEqual(withinAttribution.evaluatorReconciliationValid, true)
+        XCTAssertNil(withinAttribution.evaluatorReconciliationError)
+
+        let beyondAttribution = try attribution(overrun: beyond)
+        XCTAssertLessThan(beyondAttribution.evaluatorUnclassifiedMsPerEpoch!, 0)
+        XCTAssertEqual(beyondAttribution.evaluatorUnclassifiedMsPerEpoch!,
+                       -beyond * 1000, accuracy: 1e-12)
+        XCTAssertEqual(beyondAttribution.evaluatorReconciliationValid, false)
+        XCTAssertNotNil(beyondAttribution.evaluatorReconciliationError)
     }
 
     /// The retained GPU command-buffer time is separate from the CPU submit+wait span and

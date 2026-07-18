@@ -1,4 +1,5 @@
 import XCTest
+import BFFMetal
 @testable import SoupScopeCore
 
 /// Pure, platform-independent coverage for the app-frame host-stage timing model. No
@@ -83,6 +84,34 @@ final class AppFrameStageTimingTests: XCTestCase {
         XCTAssertEqual(s.classifiedFrameFraction, 4, accuracy: 1e-9)
         XCTAssertFalse(s.reconciliationValid)
         XCTAssertNotNil(s.reconciliationError)
+    }
+
+    func testAppFrameOverrunToleranceBoundary() throws {
+        let tolerance = TimingReconciliationTolerance.seconds(enclosingSeconds: 1.0,
+                                                              classifiedSeconds: 1.0)
+        let edgeStep = tolerance * 1e-6
+        let within = tolerance - edgeStep
+        let beyond = tolerance + edgeStep
+
+        var withinAccumulator = AppFrameStageAccumulator()
+        withinAccumulator.record(AppFrameStageSample(
+            frameSeconds: 1.0, epochBatchSeconds: 1.0 + within))
+        let withinSummary = try XCTUnwrap(withinAccumulator.summary())
+        XCTAssertLessThan(withinSummary.unclassifiedMsPerFrame, 0)
+        XCTAssertEqual(withinSummary.unclassifiedMsPerFrame, -within * 1000,
+                       accuracy: 1e-12)
+        XCTAssertTrue(withinSummary.reconciliationValid)
+        XCTAssertNil(withinSummary.reconciliationError)
+
+        var beyondAccumulator = AppFrameStageAccumulator()
+        beyondAccumulator.record(AppFrameStageSample(
+            frameSeconds: 1.0, epochBatchSeconds: 1.0 + beyond))
+        let beyondSummary = try XCTUnwrap(beyondAccumulator.summary())
+        XCTAssertLessThan(beyondSummary.unclassifiedMsPerFrame, 0)
+        XCTAssertEqual(beyondSummary.unclassifiedMsPerFrame, -beyond * 1000,
+                       accuracy: 1e-12)
+        XCTAssertFalse(beyondSummary.reconciliationValid)
+        XCTAssertNotNil(beyondSummary.reconciliationError)
     }
 
     /// The one-line summary is deterministic and prints unmeasured stages as `null`.

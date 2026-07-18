@@ -1,4 +1,5 @@
 import Foundation
+import BFFMetal
 
 /// Opt-in per-frame host-stage timing for the interactive app's render loop, mirroring
 /// the headless benchmark's `HostStageAttribution` but scoped to the app-only stages the
@@ -16,7 +17,8 @@ import Foundation
 /// Reconciliation invariant (checked by tests): the available stage means plus
 /// `unclassifiedMsPerFrame` equal the mean frame wall (ms/frame). The remainder is
 /// signed; a negative value means classified stages exceeded the enclosing frame wall and
-/// `reconciliationValid` is false. A stage is "available" only if it was recorded on
+/// `reconciliationValid` is false only when the overrun exceeds
+/// `TimingReconciliationTolerance`. A stage is "available" only if it was recorded on
 /// *every* folded frame; otherwise its mean is `nil` and its time falls into the
 /// remainder, so the key set stays stable.
 
@@ -154,7 +156,9 @@ public struct AppFrameStageAccumulator: Equatable, Sendable {
         let unclassified = wallSum - classifiedSum
         let fraction = wallSum > 0 ? classifiedSum / wallSum : 0
         let overrunMs = -unclassified * ms
-        let valid = overrunMs <= 0
+        let valid = !TimingReconciliationTolerance.isOverrun(
+            overrunMs / 1000.0, enclosingSeconds: wallSum / n,
+            classifiedSeconds: classifiedSum / n)
         let error = valid ? nil
             : String(format: "classified app frame stages exceed frame wall by %.6f ms/frame",
                      overrunMs)

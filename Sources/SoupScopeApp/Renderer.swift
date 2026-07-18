@@ -47,9 +47,10 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         // Opt-in per-frame host-stage timing: measure the frame wall and the Metal-only
         // spans (soup-buffer allocation/copy, metric-texture population/upload, render
-        // encode+submit) here where they are technically measurable, then fold them with
-        // the epoch-batch/snapshot spans `stepFrame` measured. All reads are gated on the
-        // flag, so the default frame path takes no clock and is unchanged.
+        // command encoding after encoder creation + submit) here where they are
+        // technically measurable, then fold them with the epoch-batch/snapshot spans
+        // `stepFrame` measured. All reads are gated on the flag, so the default frame
+        // path takes no clock and is unchanged.
         let timing = appModel.frameStageTimingEnabled
         let frameStart = timing ? AppMonotonicClock.nowSeconds() : 0
         var soupBufferSeconds: Double? = nil
@@ -65,6 +66,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
+        // Encoder creation happened above; by design that setup cost is outside this
+        // span and remains in the explicit app-frame unclassified remainder.
         let encodeStart = timing ? AppMonotonicClock.nowSeconds() : 0
         if let snapshot {
             let soupStart = timing ? AppMonotonicClock.nowSeconds() : 0
@@ -99,9 +102,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         commandBuffer.commit()
 
         if timing {
-            // Render encode + submit span: from encoder construction through commit,
-            // minus soup-buffer and metric-texture work already attributed to their own
-            // stages, so the app-frame stages are non-overlapping.
+            // Render encode + submit span: from just after encoder construction through
+            // commit, minus soup-buffer and metric-texture work already attributed to
+            // their own stages. Encoder creation remains in the explicit app-frame
+            // unclassified remainder.
             renderSubmitSeconds = AppMonotonicClock.nowSeconds() - encodeStart
                 - (soupBufferSeconds ?? 0) - (metricTextureSeconds ?? 0)
             appModel.recordFrameStages(

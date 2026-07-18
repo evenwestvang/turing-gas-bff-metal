@@ -1,6 +1,30 @@
 import Foundation
 import BFFOracle
 
+/// Shared tolerance for host timing reconciliation checks.
+///
+/// Host timings are `Double` seconds from monotonic clocks, usually nanosecond counters
+/// converted to seconds. Reconciliation values stay signed and unmodified; this tolerance
+/// is used only to decide whether a tiny overrun is floating-point noise or an invalid
+/// attribution. The absolute term admits one nanosecond of clock/conversion granularity;
+/// the relative term admits a small number of `Double` ulps as intervals grow.
+public enum TimingReconciliationTolerance {
+    public static let absoluteSeconds = 1e-9
+    public static let relativeSecondsPerSecond = 64.0 * Double.ulpOfOne
+
+    public static func seconds(enclosingSeconds: Double, classifiedSeconds: Double)
+        -> Double {
+        let scale = max(abs(enclosingSeconds), abs(classifiedSeconds))
+        return max(absoluteSeconds, relativeSecondsPerSecond * scale)
+    }
+
+    public static func isOverrun(_ overrunSeconds: Double, enclosingSeconds: Double,
+                                 classifiedSeconds: Double) -> Bool {
+        overrunSeconds > seconds(enclosingSeconds: enclosingSeconds,
+                                 classifiedSeconds: classifiedSeconds)
+    }
+}
+
 /// Opt-in, bounded host-stage timing attribution for the small-soup epoch loop.
 ///
 /// The benchmark's `hostResidualMsPerEpoch` (epoch wall − GPU) is a single lump: it is
@@ -18,7 +42,8 @@ import BFFOracle
 ///    exclusive. The gap (wall − Σ stages) is the explicit signed
 ///    `unclassifiedMsPerEpoch` remainder. A negative remainder means the measured stage
 ///    sum exceeded the enclosing epoch wall; the stable `reconciliationValid` /
-///    `reconciliationError` fields surface that invalid timing instead of masking it.
+///    `reconciliationError` fields surface overruns beyond
+///    `TimingReconciliationTolerance` instead of masking invalid timing.
 ///    A positive remainder absorbs the tiny per-boundary clock reads, the soup commit,
 ///    and `EpochReport` construction. Stages:
 ///    mutation+pairing, pair packing, evaluate (whole), scatter, counter reduction,
@@ -156,9 +181,10 @@ public struct HostStageSpans: Sendable, Equatable {
 ///
 /// Reconciliation invariant (checked by tests): the eight top-level stage means plus
 /// `unclassifiedMsPerEpoch` equal the mean epoch wall (ms/epoch). When stage timings
-/// overrun the enclosing wall, the signed remainder is negative and
-/// `reconciliationValid` is false. `classifiedWallFraction` is the measured classified
-/// stage sum divided by the measured wall, and can exceed 1 for invalid timing.
+/// overrun the enclosing wall beyond `TimingReconciliationTolerance`, the signed
+/// remainder is negative and `reconciliationValid` is false. `classifiedWallFraction` is
+/// the measured classified stage sum divided by the measured wall, and can exceed 1 for
+/// invalid timing.
 ///
 /// Every optional field encodes as an explicit JSON `null` when unavailable (same
 /// convention as the rest of the schema) so the key set is stable.
@@ -179,12 +205,13 @@ public struct HostStageAttribution: Sendable, Equatable, Codable {
     public var digestMsPerEpoch: Double?
     /// The named unclassified/remainder component: mean(epoch wall − Σ classified
     /// stages) ms/epoch. This is signed; negative means the classified stage sum
-    /// exceeded the enclosing wall and `reconciliationValid` is false.
+    /// exceeded the enclosing wall.
     public var unclassifiedMsPerEpoch: Double?
     /// Classified stage sum divided by epoch wall. Can exceed 1 when timing is invalid.
     public var classifiedWallFraction: Double?
     /// True when all measured epochs carried spans and the classified stage sum did not
-    /// exceed the enclosing wall. False surfaces incomplete or overrun attribution.
+    /// exceed the enclosing wall beyond `TimingReconciliationTolerance`. False surfaces
+    /// incomplete or overrun attribution.
     public var reconciliationValid: Bool
     public var reconciliationError: String?
 
@@ -288,8 +315,11 @@ public struct HostStageAttribution: Sendable, Equatable, Codable {
         let classified = mut + pack + eval + scat + counter + metrics + shadow + digest
         let unclassified = wall - classified
         let classifiedFraction = wall > 0 ? classified / wall : 0
-        let overrunMs = (classified - wall) * ms
-        let reconciliationValid = overrunMs <= 0
+        let overrunSeconds = classified - wall
+        let overrunMs = overrunSeconds * ms
+        let reconciliationValid = !TimingReconciliationTolerance.isOverrun(
+            overrunSeconds / n, enclosingSeconds: wall / n,
+            classifiedSeconds: classified / n)
         let reconciliationError = reconciliationValid ? nil
             : String(format: "classified host stages exceed epoch wall by %.6f ms/epoch",
                      overrunMs)
@@ -328,7 +358,13 @@ public struct HostStageAttribution: Sendable, Equatable, Codable {
                 - (allocMs ?? 0) - (uploadMs ?? 0) - (encodeMs ?? 0)
                 - (submitMs ?? 0) - (readbackMs ?? 0))
             : nil
-        let evaluatorValid = evaluatorUnclassifiedMs.map { $0 >= 0 }
+        let evaluatorClassifiedMs = (allocMs ?? 0) + (uploadMs ?? 0) + (encodeMs ?? 0)
+            + (submitMs ?? 0) + (readbackMs ?? 0)
+        let evaluatorValid = evaluatorUnclassifiedMs.map {
+            !TimingReconciliationTolerance.isOverrun(
+                -$0 / 1000.0, enclosingSeconds: eval / n,
+                classifiedSeconds: evaluatorClassifiedMs / 1000.0)
+        }
         let evaluatorError = evaluatorValid == false
             ? String(format: "evaluator substages exceed evaluate span by %.6f ms/epoch",
                      -(evaluatorUnclassifiedMs ?? 0))
