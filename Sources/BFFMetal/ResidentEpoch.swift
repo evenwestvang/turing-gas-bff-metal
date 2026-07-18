@@ -30,6 +30,9 @@ public struct ResidentEpochConfig: Equatable, Sendable {
     public var visualizationEnabled: Bool
     public var visualizationWidth: Int
 
+    /// Resident planner/pairing mode. This experimental path is not Fisher-Yates
+    /// trajectory-compatible with `Simulation` or `SoupRunner`.
+    public var pairingModeID: String { BFFRandom.residentPairingModeID }
     public var pairCount: Int { programCount / 2 }
     public var soupByteCount: Int { programCount * BFF.tapeSize }
     public var resolvedShadowSampleCount: Int {
@@ -264,8 +267,8 @@ public struct ResidentCPUReferenceRunner: Sendable {
         let e = UInt32(epoch)
         let mutationCount = BFFRandom.mutate(soup: &soup, seed: config.seed,
                                              epoch: e, mutationP32: config.mutationP32)
-        let perm = BFFRandom.pairingPermutation(count: config.programCount,
-                                                seed: config.seed, epoch: e)
+        let perm = BFFRandom.residentPairingPermutation(count: config.programCount,
+                                                        seed: config.seed, epoch: e)
 
         var words = [UInt32](repeating: 0, count: ResidentCounterLayout.wordCount)
         words[ResidentCounterLayout.mutationCount] = UInt32(mutationCount)
@@ -661,8 +664,7 @@ public final class ResidentMetalEpochRunner {
             enc.setComputePipelineState(planPipeline)
             enc.setBuffer(permutationBuffer, offset: 0, index: 0)
             enc.setBytes(&params, length: MemoryLayout<ResidentEpochParams>.stride, index: 1)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            dispatchThreads(count: config.programCount, pipeline: planPipeline, encoder: enc)
         }
     }
 

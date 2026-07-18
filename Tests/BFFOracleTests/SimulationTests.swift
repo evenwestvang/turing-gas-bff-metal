@@ -100,6 +100,49 @@ final class RandomTests: XCTestCase {
         XCTAssertNotEqual(a, BFFRandom.pairingPermutation(count: 64, seed: 11, epoch: 3))
         XCTAssertNotEqual(a, BFFRandom.pairingPermutation(count: 64, seed: 12, epoch: 2))
     }
+
+    func testResidentParallelPairingIsBijectiveForFocusedSizes() {
+        let sizes = [2, 4, 6, 10, 16, 256, 1024]
+        let seeds = [UInt32(0), UInt32(1), UInt32(11), UInt32(0xC0FF_EE)]
+        let epochs = [UInt32(0), UInt32(1), UInt32(7), UInt32(1024)]
+
+        for n in sizes {
+            for seed in seeds {
+                for epoch in epochs {
+                    let perm = BFFRandom.residentPairingPermutation(count: n,
+                                                                    seed: seed,
+                                                                    epoch: epoch)
+                    XCTAssertEqual(perm.count, n, "n \(n) seed \(seed) epoch \(epoch)")
+                    XCTAssertEqual(perm.sorted(), Array(0..<UInt32(n)),
+                                   "n \(n) seed \(seed) epoch \(epoch)")
+
+                    let bySlot = (0..<n).map {
+                        BFFRandom.residentPairingProgramID(outputIndex: UInt32($0),
+                                                           count: UInt32(n),
+                                                           seed: seed,
+                                                           epoch: epoch)
+                    }
+                    XCTAssertEqual(perm, bySlot, "n \(n) seed \(seed) epoch \(epoch)")
+                    XCTAssertEqual(perm, BFFRandom.residentPairingPermutation(count: n,
+                                                                              seed: seed,
+                                                                              epoch: epoch),
+                                   "n \(n) seed \(seed) epoch \(epoch)")
+                }
+            }
+        }
+    }
+
+    func testResidentParallelPairingIsKeyedBySeedAndEpoch() {
+        let baseline = BFFRandom.residentPairingPermutation(count: 256, seed: 11, epoch: 2)
+        XCTAssertNotEqual(baseline,
+                          BFFRandom.residentPairingPermutation(count: 256,
+                                                               seed: 12,
+                                                               epoch: 2))
+        XCTAssertNotEqual(baseline,
+                          BFFRandom.residentPairingPermutation(count: 256,
+                                                               seed: 11,
+                                                               epoch: 3))
+    }
 }
 
 final class SimulationTests: XCTestCase {

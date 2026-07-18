@@ -221,6 +221,7 @@ func runNative(config: ResidentEpochConfig, epochs: Int, seed: UInt32,
     print("resident seed=\(seed) programs=\(config.programCount) pairs=\(config.pairCount) "
           + "epochs=\(epochs) budget=\(config.stepBudget) mutationP32=\(config.mutationP32) "
           + "variant=\(config.variant.rawValue) init=\(config.initMode.rawValue) "
+          + "planner=\(config.pairingModeID) "
           + "checkpointInterval=\(config.checkpointInterval) "
           + "capturePairs=\(config.capturePairTapes) visualize=\(config.visualizationEnabled) "
           + "rng=\(BFFRandom.contractID) device=\"\(gpu.deviceName)\"")
@@ -327,7 +328,8 @@ let config = makeConfig(seed: seeds[0], programs: programs, epochs: epochs)
 print("bff-resident-epoch: Metal is unavailable on this platform; no GPU epoch was executed.")
 print("would-run validation=\(validationMode.rawValue) seed=\(config.seed) programs=\(config.programCount) "
       + "pairs=\(config.pairCount) epochs=\(epochs) budget=\(config.stepBudget) "
-      + "mutationP32=\(config.mutationP32) checkpointInterval=\(config.checkpointInterval) "
+      + "mutationP32=\(config.mutationP32) planner=\(config.pairingModeID) "
+      + "checkpointInterval=\(config.checkpointInterval) "
       + "capturePairs=\(config.capturePairTapes) visualize=\(config.visualizationEnabled)")
 exit(2)
 #endif

@@ -4,48 +4,34 @@ import BFFOracle
 
 final class ResidentEpochTests: XCTestCase {
 
-    func testResidentCPUReferenceMatchesSimulationForRepresentativeTinySizes() throws {
-        let sizes = [2, 4, 6, 8, 64, 1024]
+    func testResidentCPUReferenceIsDeterministicForRepresentativeTinySizes() throws {
+        let sizes = [2, 4, 6, 10, 16, 256, 1024]
         for seed in [UInt32(1), UInt32(0xC0FF_EE)] {
             for programs in sizes {
                 let config = try ResidentEpochConfig(seed: seed,
                                                      programCount: programs,
                                                      checkpointInterval: 1,
                                                      capturePairTapes: true)
-                var resident = ResidentCPUReferenceRunner(config: config)
-                var simulation = Simulation(config: SimulationConfig(
-                    seed: seed,
-                    populationSize: programs,
-                    stepBudget: BFF.stepBudget,
-                    mutationP32: BFF.defaultMutationP32,
-                    variant: .noheads,
-                    bracketMode: .dynamicScan))
+                var a = ResidentCPUReferenceRunner(config: config)
+                var b = ResidentCPUReferenceRunner(config: config)
 
-                let r = resident.runEpoch()
-                let s = simulation.runEpoch()
+                let ra = a.runEpoch()
+                let rb = b.runEpoch()
 
-                XCTAssertEqual(resident.soup, simulation.soup, "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.checkpointSoup, Optional(simulation.soup),
+                XCTAssertEqual(a.soup, b.soup, "seed \(seed) programs \(programs)")
+                XCTAssertEqual(ra.checkpointSoup, Optional(a.soup),
                                "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.digest, Optional(SoupDigest.digest(simulation.soup)),
+                XCTAssertEqual(ra.digest, Optional(SoupDigest.digest(a.soup)),
                                "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.counters.totalRawSteps, s.totalSteps,
+                XCTAssertEqual(ra.counters, rb.counters,
                                "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.counters.totalLoopOps, s.totalLoopOps,
+                XCTAssertEqual(ra.capturedPairs, rb.capturedPairs,
                                "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.counters.totalCopyWrites, s.totalCopyWrites,
+                XCTAssertEqual(ra.counters.haltUnknown, 0,
                                "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.counters.haltBudget, s.haltBudget,
+                XCTAssertEqual(ra.counters.haltAccounted, programs / 2,
                                "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.counters.haltPCOut, s.haltPCOut,
-                               "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.counters.haltUnmatched, s.haltUnmatched,
-                               "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.counters.haltUnknown, 0,
-                               "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.counters.haltAccounted, programs / 2,
-                               "seed \(seed) programs \(programs)")
-                XCTAssertEqual(r.shadowMismatches, [],
+                XCTAssertEqual(ra.shadowMismatches, [],
                                "seed \(seed) programs \(programs)")
             }
         }
@@ -58,20 +44,15 @@ final class ResidentEpochTests: XCTestCase {
                                              checkpointInterval: 1,
                                              capturePairTapes: true)
         var resident = ResidentCPUReferenceRunner(config: config)
-        var simulation = Simulation(config: SimulationConfig(
-            seed: 7,
-            populationSize: 32,
-            variant: .seededHeads,
-            bracketMode: .dynamicScan))
+        var repeatResident = ResidentCPUReferenceRunner(config: config)
 
         for epoch in 0..<3 {
             let r = resident.runEpoch()
-            let s = simulation.runEpoch()
+            let rr = repeatResident.runEpoch()
             XCTAssertEqual(r.counters.epoch, epoch)
-            XCTAssertEqual(resident.soup, simulation.soup)
-            XCTAssertEqual(r.counters.totalRawSteps, s.totalSteps)
-            XCTAssertEqual(r.counters.totalLoopOps, s.totalLoopOps)
-            XCTAssertEqual(r.counters.totalCopyWrites, s.totalCopyWrites)
+            XCTAssertEqual(resident.soup, repeatResident.soup)
+            XCTAssertEqual(r.counters, rr.counters)
+            XCTAssertEqual(r.capturedPairs, rr.capturedPairs)
             XCTAssertEqual(r.shadowMismatches, [])
         }
     }
@@ -86,7 +67,7 @@ final class ResidentEpochTests: XCTestCase {
         var runner = ResidentCPUReferenceRunner(config: config)
         let initial = runner.soup
         let report = runner.runEpoch()
-        let perm = BFFRandom.pairingPermutation(count: 8, seed: 11, epoch: 0)
+        let perm = BFFRandom.residentPairingPermutation(count: 8, seed: 11, epoch: 0)
 
         XCTAssertEqual(report.capturedPairs.count, 4)
         XCTAssertEqual(report.shadowChecked, 4)
@@ -138,6 +119,7 @@ final class ResidentEpochTests: XCTestCase {
     func testResidentConfigRejectsOddSmallAndInvalidSizingInputs() {
         XCTAssertThrowsError(try ResidentEpochConfig(seed: 1, programCount: 0))
         XCTAssertThrowsError(try ResidentEpochConfig(seed: 1, programCount: 3))
+        XCTAssertThrowsError(try ResidentEpochConfig(seed: 1, programCount: 5))
         XCTAssertThrowsError(try ResidentEpochConfig(seed: 1, programCount: 2,
                                                      stepBudget: 0))
         XCTAssertThrowsError(try ResidentEpochConfig(seed: 1, programCount: 2,

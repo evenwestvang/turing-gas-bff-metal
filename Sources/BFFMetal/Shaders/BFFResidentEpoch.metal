@@ -2,7 +2,7 @@
 //
 // Kernels:
 //   1. mutate soup in place from counter-pcg-v1
-//   2. build Fisher-Yates-compatible permutation on GPU
+//   2. build the resident parallel-swap-or-not-v1 permutation on GPU
 //   3. evaluate each pair with normative dynamic scanning and scatter by stable ID
 //   4. optionally write an approximate one-pixel-per-program visualization
 //
@@ -42,6 +42,8 @@ using namespace metal;
 #define BFF_COUNTER_HALT_UNMATCHED 7
 #define BFF_COUNTER_HALT_UNKNOWN 8
 
+#define BFF_RESIDENT_PAIRING_ROUNDS 16u
+
 struct ResidentEpochParams {
     uint32_t seed;
     uint32_t epoch;
@@ -72,6 +74,31 @@ static uint32_t bff_rng3(uint32_t seed, uint32_t stream, uint32_t index) {
 
 static uint32_t bff_stream(uint32_t epoch, uint32_t pass) {
     return epoch * 4u + pass;
+}
+
+// Resident experimental pairing mode: parallel-swap-or-not-v1.
+//
+// This is not Fisher-Yates trajectory compatibility. Each round is a keyed
+// involution over the exact programCount domain, so the composition is a true
+// permutation for non-powers-of-two without cycle walking. One GPU thread can
+// evaluate one output slot independently.
+static uint32_t bff_resident_pairing_program_id(uint32_t outputIndex,
+                                                uint32_t programCount,
+                                                uint32_t seed,
+                                                uint32_t epoch) {
+    uint32_t stream = bff_stream(epoch, 1u);
+    uint32_t x = outputIndex;
+    for (uint32_t round = 0u; round < BFF_RESIDENT_PAIRING_ROUNDS; round++) {
+        uint32_t pivot = bff_rng3(seed, stream, 0x40000000u | round) % programCount;
+        uint32_t flip = pivot >= x ? pivot - x : programCount - (x - pivot);
+        uint32_t position = x > flip ? x : flip;
+        uint32_t bitIndex = 0x80000000u | (round << 27u) | (position >> 5u);
+        uint32_t word = bff_rng3(seed, stream, bitIndex);
+        if (((word >> (position & 31u)) & 1u) != 0u) {
+            x = flip;
+        }
+    }
+    return x;
 }
 
 static int bff_scan_forward(thread const uchar *tape, int p) {
@@ -135,21 +162,11 @@ kernel void bff_resident_mutate(device uchar *soup [[buffer(0)]],
 kernel void bff_resident_plan_pairs(device uint32_t *permutation [[buffer(0)]],
                                     constant ResidentEpochParams &params [[buffer(1)]],
                                     uint gid [[thread_position_in_grid]]) {
-    if (gid != 0) return;
-
-    uint32_t n = params.programCount;
-    for (uint32_t i = 0u; i < n; i++) {
-        permutation[i] = i;
-    }
-
-    uint32_t stream = bff_stream(params.epoch, 1u);
-    for (uint32_t i = n - 1u; i > 0u; i--) {
-        uint32_t r = bff_rng3(params.seed, stream, i);
-        uint32_t j = r % (i + 1u);
-        uint32_t tmp = permutation[i];
-        permutation[i] = permutation[j];
-        permutation[j] = tmp;
-    }
+    if (gid >= params.programCount) return;
+    permutation[gid] = bff_resident_pairing_program_id((uint32_t)gid,
+                                                       params.programCount,
+                                                       params.seed,
+                                                       params.epoch);
 }
 
 kernel void bff_resident_eval_scatter(device uchar *soup [[buffer(0)]],

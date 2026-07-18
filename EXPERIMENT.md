@@ -15,7 +15,8 @@ It does not change existing defaults, `bff-metal-soup`, `bff-metal-bench`,
 epoch working state:
 
 - `resident.soup`: canonical `programCount * 64` byte soup, reused across epochs.
-- `resident.permutation`: Fisher-Yates permutation, generated on GPU each epoch.
+- `resident.permutation`: `parallel-swap-or-not-v1` resident permutation, generated
+  on GPU each epoch.
 - `resident.pairResults`: 5 `UInt32` words per pair (`steps`, `noopSteps`,
   `copyWrites`, `loopOps`, `halt`).
 - `resident.counters`: per-epoch aggregate counters updated with GPU atomics.
@@ -29,9 +30,12 @@ The epoch command sequence is:
 
 1. `bff_resident_mutate`: deterministic byte mutation in place using the existing
    `counter-pcg-v1` stream contract.
-2. `bff_resident_plan_pairs`: one GPU thread builds the exact Fisher-Yates-compatible
-   permutation. This is not optimized, but it removes the per-epoch CPU permutation
-   upload and preserves exact pairing.
+2. `bff_resident_plan_pairs`: one GPU thread per output slot evaluates
+   `parallel-swap-or-not-v1`, a keyed swap-or-not bijection over `0..<programCount`.
+   This is intentionally NOT Fisher-Yates trajectory compatibility. It is an
+   experimental parallel deterministic pairing distribution; acceptance of the
+   distribution remains statistical, while exact no-duplicate/no-omission coverage is
+   guaranteed by construction for even non-power-of-two program counts.
 3. `bff_resident_eval_scatter`: one GPU thread per pair copies the two stable-ID
    programs into a 128-byte local tape, runs the normative dynamic-scan evaluator, writes
    result counters, writes pair activity to both stable IDs, and scatters both 64-byte
@@ -82,7 +86,9 @@ That is intentionally measurement-friendly rather than throughput-optimal.
 ## Validation Modes
 
 Linux must not attempt Metal execution. The CLI parses arguments and exits 2 there.
-Platform-independent tests exercise the resident CPU reference against `Simulation`.
+Platform-independent tests exercise the resident CPU reference and the resident
+permutation contract. `Simulation` remains the Fisher-Yates oracle and is no longer a
+trajectory oracle for this resident planner.
 
 Native commands:
 
@@ -91,7 +97,8 @@ Native commands:
 swift test --filter ResidentEpochTests
 swift test --filter ResidentMetalEpochTests
 
-# Exhaustive tiny GPU-vs-CPU parity for every even population 2...1024.
+# Exhaustive tiny GPU-vs-CPU parity for every even population 2...1024 using the
+# resident planner.
 swift run -c release bff-resident-epoch --validate tiny --epochs 1
 
 # Medium 16K stress: several seeds, full checkpoint digest/counters, captured tapes,
@@ -124,12 +131,14 @@ tape through `BFFInterpreter` and reports:
 - steps, noop steps, copy writes, loop ops, and halt divergence.
 
 Validation modes compare GPU counters, checkpoint soup bytes, digest, and captured pair
-records against `ResidentCPUReferenceRunner`.
+records against `ResidentCPUReferenceRunner`, which implements the identical resident
+pairing algorithm.
 
 ## Known Risks
 
-- The Fisher-Yates plan kernel is single-threaded. It is semantically useful and removes
-  the CPU round trip, but it is not a final large-soup planner.
+- `parallel-swap-or-not-v1` is not Fisher-Yates-compatible. It is a fast experimental
+  resident planner; distribution quality must be judged statistically before any
+  scientific claim depends on it.
 - Aggregate counters are `UInt32`; the bounded 131K/default-budget smoke fits, but much
   larger populations or budgets need wider reductions.
 - Pair capture currently captures all pairs, not only the sampled shadow pairs.

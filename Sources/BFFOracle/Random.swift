@@ -171,4 +171,68 @@ public enum BFFRandom {
         }
         return perm
     }
+
+    /// Resident experimental pairing mode identifier.
+    ///
+    /// This is NOT Fisher-Yates trajectory compatibility. It is a parallel,
+    /// deterministic, random-looking bijection over program IDs for the GPU-resident
+    /// experiment. Scientific acceptance of its pairing distribution remains a
+    /// statistical question; the hard contract here is determinism and exact
+    /// one-to-one coverage of `0..<count`.
+    public static let residentPairingModeID = "parallel-swap-or-not-v1"
+
+    /// Number of swap-or-not rounds used by `residentPairingPermutation`.
+    ///
+    /// Each round is an independently keyed involution over the exact `count`-sized
+    /// domain: `flip = (pivot - x) mod count`; one keyed bit decides whether the
+    /// unordered pair `{x, flip}` is swapped. Because every round is a bijection for
+    /// arbitrary positive `count`, the composition is a true permutation for
+    /// non-powers-of-two without rejection sampling or cycle walking. Sixteen rounds
+    /// keeps the planner O(1) per output slot and cheap enough for the resident
+    /// throughput experiment.
+    public static let residentPairingRoundCount = 16
+
+    /// Program ID assigned to one resident permutation output slot.
+    ///
+    /// This evaluates the documented `parallel-swap-or-not-v1` bijection independently
+    /// for a single output index. The Metal resident planner mirrors this function
+    /// line-for-line so GPU-vs-CPU parity can be checked on tiny exhaustive runs.
+    public static func residentPairingProgramID(outputIndex: UInt32, count: UInt32,
+                                                seed: UInt32, epoch: UInt32) -> UInt32 {
+        precondition(count > 0 && count % 2 == 0, "population must be positive and even")
+        precondition(outputIndex < count, "output index out of range")
+
+        let s = stream(epoch: epoch, pass: .pairing)
+        var x = outputIndex
+        for round in 0..<residentPairingRoundCount {
+            let r = UInt32(round)
+            let pivot = rng3(seed: seed, stream: s, index: 0x4000_0000 | r) % count
+            let flip = pivot >= x ? pivot - x : count - (x - pivot)
+            let position = max(x, flip)
+            let bitIndex = 0x8000_0000 | (r << 27) | (position >> 5)
+            let word = rng3(seed: seed, stream: s, index: bitIndex)
+            if ((word >> (position & 31)) & 1) != 0 {
+                x = flip
+            }
+        }
+        return x
+    }
+
+    /// Parallel resident pairing permutation over `0..<count`.
+    ///
+    /// Consecutive entries `(2i, 2i+1)` form resident pair `i`, exactly as in the
+    /// Fisher-Yates path, but the permutation trajectory is intentionally different.
+    /// Use `pairingPermutation` for the original serial Fisher-Yates contract.
+    public static func residentPairingPermutation(count: Int, seed: UInt32,
+                                                  epoch: UInt32) -> [UInt32] {
+        precondition(count > 0 && count % 2 == 0, "population must be positive and even")
+        precondition(count <= Int(UInt32.max), "population exceeds UInt32 domain")
+        let n = UInt32(count)
+        var perm = [UInt32](repeating: 0, count: count)
+        for i in 0..<count {
+            perm[i] = residentPairingProgramID(outputIndex: UInt32(i), count: n,
+                                               seed: seed, epoch: epoch)
+        }
+        return perm
+    }
 }
