@@ -17,6 +17,7 @@ final class SharedMetalContext {
     let queue: MTLCommandQueue
     let evaluator: MetalBFFEvaluator
     let renderPipeline: MTLRenderPipelineState
+    let residentRenderPipeline: MTLRenderPipelineState
 
     var deviceName: String { device.name }
 
@@ -73,6 +74,9 @@ final class SharedMetalContext {
         guard let fragmentFn = library.makeFunction(name: "soup_fragment") else {
             throw ContextError.functionMissing("soup_fragment")
         }
+        guard let residentFragmentFn = library.makeFunction(name: "soup_resident_fragment") else {
+            throw ContextError.functionMissing("soup_resident_fragment")
+        }
 
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.vertexFunction = vertexFn
@@ -82,6 +86,16 @@ final class SharedMetalContext {
             self.renderPipeline = try device.makeRenderPipelineState(descriptor: descriptor)
         } catch {
             throw ContextError.pipelineFailed("\(error)")
+        }
+        let residentDescriptor = MTLRenderPipelineDescriptor()
+        residentDescriptor.vertexFunction = vertexFn
+        residentDescriptor.fragmentFunction = residentFragmentFn
+        residentDescriptor.colorAttachments[0].pixelFormat = colorPixelFormat
+        do {
+            self.residentRenderPipeline = try device.makeRenderPipelineState(
+                descriptor: residentDescriptor)
+        } catch {
+            throw ContextError.pipelineFailed("resident: \(error)")
         }
 
         try Self.verifyVizLayout(device: device, queue: queue, library: library)

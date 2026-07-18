@@ -57,7 +57,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         var metricTextureSeconds: Double? = nil
         var renderSubmitSeconds: Double? = nil
 
-        let snapshot = appModel.stepFrame()
+        let snapshot = appModel.usesResidentRendering ? nil : appModel.stepFrame()
 
         guard let descriptor = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable,
@@ -69,7 +69,16 @@ final class Renderer: NSObject, MTKViewDelegate {
         // Encoder creation happened above; by design that setup cost is outside this
         // span and remains in the explicit app-frame unclassified remainder.
         let encodeStart = timing ? AppMonotonicClock.nowSeconds() : 0
-        if let snapshot {
+        if appModel.usesResidentRendering {
+            if let texture = appModel.residentVisualizationTexture {
+                var uniforms = appModel.makeUniforms()
+                encoder.setRenderPipelineState(context.residentRenderPipeline)
+                encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VizUniforms>.stride, index: 0)
+                encoder.setFragmentTexture(texture, index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                appModel.noteResidentDisplayedEpoch(appModel.latestResidentSourceEpoch)
+            }
+        } else if let snapshot {
             let soupStart = timing ? AppMonotonicClock.nowSeconds() : 0
             let soupBuffer = makeSoupBuffer(snapshot)
             if timing { soupBufferSeconds = AppMonotonicClock.nowSeconds() - soupStart }

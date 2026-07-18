@@ -49,6 +49,8 @@ public struct HUDModel: Equatable, Sendable {
 
     /// A visible error state; non-nil means advancement has stopped.
     public var errorState: String?
+    /// Resident-only diagnostics. `nil` on the default CPU-snapshot app path.
+    public var resident: ResidentHUDDiagnostics?
 
     public init(deviceName: String = "—", programCount: Int = 0) {
         self.deviceName = deviceName
@@ -68,6 +70,7 @@ public struct HUDModel: Equatable, Sendable {
         self.shadowChecked = 0
         self.shadowMismatch = 0
         self.errorState = nil
+        self.resident = nil
     }
 
     /// Fold one completed batch of epoch reports (in order) plus its measured
@@ -96,6 +99,52 @@ public struct HUDModel: Equatable, Sendable {
             haltUnknown = c.haltUnknown
             copyWrites = c.totalCopyWrites
         }
+    }
+
+    public mutating func record(resident report: ResidentEpochReport,
+                                planner: ResidentPairingPlanner,
+                                checkpointInterval: Int,
+                                displayedEpoch: Int,
+                                failureCount: Int) {
+        let c = report.counters
+        epoch = c.epoch + 1
+        lastBatchEpochs = 1
+        lastBatchMs = report.instrumentation.epochWallSeconds * 1000
+        msPerEpoch = lastBatchMs
+        rawSteps = c.totalRawSteps
+        noopSteps = c.totalNoopSteps
+        commandSteps = c.totalCommandSteps
+        haltBudget = c.haltBudget
+        haltPCOut = c.haltPCOut
+        haltUnmatched = c.haltUnmatched
+        haltUnknown = c.haltUnknown
+        copyWrites = c.totalCopyWrites
+        shadowChecked += report.shadowChecked
+        shadowMismatch += report.shadowMismatches.count
+
+        func gpuMs(_ name: String) -> Double? {
+            report.instrumentation.kernelTimings
+                .first { $0.name == name }?
+                .gpuSeconds
+                .map { $0 * 1000 }
+        }
+
+        resident = ResidentHUDDiagnostics(
+            sourceEpoch: c.epoch + 1,
+            displayedEpoch: displayedEpoch,
+            plannerCLI: planner.cliValue,
+            plannerModeID: planner.identifier,
+            plannerProvenance: planner.provenanceLabel,
+            epochWallMs: report.instrumentation.epochWallSeconds * 1000,
+            mutationGpuMs: gpuMs("mutate"),
+            plannerGpuMs: report.instrumentation.plannerGPUSeconds.map { $0 * 1000 },
+            evalGpuMs: gpuMs("eval-scatter"),
+            visualizationGpuMs: gpuMs("visualize"),
+            checkpointInterval: checkpointInterval,
+            checkpointBytes: report.checkpointSoup?.count ?? 0,
+            readbackBytes: report.instrumentation.readbackBytes,
+            failureCount: failureCount,
+            unknownHalts: c.haltUnknown)
     }
 
     /// Set (or clear) the visible error state.

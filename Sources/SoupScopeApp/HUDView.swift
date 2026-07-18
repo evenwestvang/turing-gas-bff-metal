@@ -14,6 +14,10 @@ struct HUDView: View {
         String(format: "%.\(p)f", x)
     }
 
+    private func opt(_ x: Double?) -> String {
+        x.map { f($0) } ?? "nil"
+    }
+
     private var channelName: String {
         switch metricChannel {
         case 0: return "activity"
@@ -36,6 +40,17 @@ struct HUDView: View {
                  + "macro/micro \(f(lod.macroBlend, 2))/\(f(lod.microBlend, 2))   "
                  + "glyph \(f(lod.glyphBlend, 2))")
             Text("shadow checked \(hud.shadowChecked)  mismatch \(hud.shadowMismatch)")
+            if let resident = hud.resident {
+                Text("resident src \(resident.sourceEpoch)  shown \(resident.displayedEpoch)  "
+                     + "planner \(resident.plannerCLI) \(resident.plannerModeID)")
+                Text("resident epoch \(f(resident.epochWallMs)) ms  "
+                     + "gpu m/p/e/v "
+                     + "\(opt(resident.mutationGpuMs))/\(opt(resident.plannerGpuMs))/"
+                     + "\(opt(resident.evalGpuMs))/\(opt(resident.visualizationGpuMs))")
+                Text("checkpoint every \(resident.checkpointInterval)  "
+                     + "checkpointBytes \(resident.checkpointBytes)  "
+                     + "readbackBytes \(resident.readbackBytes)  failures \(resident.failureCount)")
+            }
             Text("programs \(hud.programCount)   \(hud.deviceName)")
             if let error = hud.errorState {
                 Text("ERROR: \(error)")

@@ -213,12 +213,7 @@ func diagnosticsText(_ diagnostics: PairingDistributionDiagnostics?) -> String {
 }
 
 func plannerLabel(_ planner: ResidentPairingPlanner) -> String {
-    switch planner {
-    case .keyed:
-        return "statistical-random-looking-not-fisher-yates-identical"
-    case .cpuUpload:
-        return "canonical-fisher-yates-trajectory"
-    }
+    planner.provenanceLabel
 }
 
 func ms(_ seconds: Double?) -> String {

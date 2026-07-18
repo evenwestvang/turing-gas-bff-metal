@@ -14,9 +14,11 @@ import CSoupRender
 /// MTKView's `draw(in:)`, so command encoding stays serial and understandable and
 /// SwiftUI is never blocked for more than one bounded (~10 ms) batch.
 @MainActor
-final class AppModel: ObservableObject {
+final class AppModel: ObservableObject, @unchecked Sendable {
     let options: AppLaunchOptions
+    let residentPlan: ResidentAppRunPlan
     let config: SoupConfig
+    private let residentConfig: ResidentEpochConfig?
     let grid: ProgramGrid
     let lod = LODModel()
     let normalization: MetricNormalization
@@ -40,6 +42,8 @@ final class AppModel: ObservableObject {
 
     let context: SharedMetalContext?
     private var runner: SoupRunner
+    private var residentDriver: ResidentSimulationDriver?
+    private var residentDisplayedEpoch = 0
     private(set) var lastSnapshot: RenderSnapshot?
 
     // Opt-in per-frame host-stage timing (`--frame-stage-timing`). `nil` (off) unless the
@@ -83,6 +87,8 @@ final class AppModel: ObservableObject {
             startupError = "launch args: \(error)"
         }
         self.options = parsed
+        let resolvedResidentPlan = parsed.residentRunPlan()
+        self.residentPlan = resolvedResidentPlan
 
         let resolvedConfig: SoupConfig
         do {
@@ -98,6 +104,16 @@ final class AppModel: ObservableObject {
             startupError = (startupError.map { $0 + "; " } ?? "") + "config: \(error)"
         }
         self.config = resolvedConfig
+        if resolvedResidentPlan.enabled {
+            do {
+                self.residentConfig = try parsed.residentConfig()
+            } catch {
+                self.residentConfig = nil
+                startupError = (startupError.map { $0 + "; " } ?? "") + "resident config: \(error)"
+            }
+        } else {
+            self.residentConfig = nil
+        }
         self.grid = ProgramGrid(programCount: resolvedConfig.programCount)
         self.normalization = MetricNormalization(stepBudget: resolvedConfig.stepBudget)
         self.runner = SoupRunner(config: resolvedConfig)
@@ -119,12 +135,19 @@ final class AppModel: ObservableObject {
 
         self.frameStages = parsed.frameStageTiming ? AppFrameStageAccumulator() : nil
 
-        self.lastSnapshot = try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
-                                                        soup: runner.soup)
+        self.lastSnapshot = resolvedResidentPlan.enabled
+            ? nil
+            : (try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
+                                           soup: runner.soup))
 
         // Arm the display-independent validation watchdog (no-op for interactive
         // launch, which omits --validation-seconds).
         beginValidationIfNeeded()
+        startResidentIfNeeded()
+    }
+
+    deinit {
+        residentDriver?.stopAndWait()
     }
 
     // MARK: - Frame driving
@@ -134,6 +157,7 @@ final class AppModel: ObservableObject {
     /// error visible (never spins/retries). Returns the latest snapshot regardless
     /// so the last good frame stays on screen.
     func stepFrame() -> RenderSnapshot? {
+        guard !residentPlan.enabled else { return lastSnapshot }
         // Clear this frame's stashed stage spans up front (only when timing), so a frame
         // that does not advance (finished / paused / error) honestly folds `nil` for the
         // epoch-batch and snapshot stages rather than a previous frame's values.
@@ -239,7 +263,11 @@ final class AppModel: ObservableObject {
 
     func fitAll() { camera.fitAll(cameraGeometry()) }
     func togglePause() {
-        isRunning.toggle()
+        if let residentDriver {
+            isRunning = residentDriver.togglePause()
+        } else {
+            isRunning.toggle()
+        }
         objectWillChange.send()          // reflect the paused flag immediately
     }
     func cycleMetricChannel() {
@@ -259,6 +287,126 @@ final class AppModel: ObservableObject {
         return VizLayout.makeUniforms(readout: frame.readout, camera: camera, grid: grid,
                                       metricChannel: metricChannel,
                                       viewPxWidth: drawablePxW, viewPxHeight: drawablePxH)
+    }
+
+    var usesResidentRendering: Bool {
+        residentDriver != nil
+    }
+
+    var residentVisualizationTexture: MTLTexture? {
+        residentDriver?.texture
+    }
+
+    var latestResidentSourceEpoch: Int {
+        residentDriver?.latestCompletedEpoch ?? 0
+    }
+
+    func noteResidentDisplayedEpoch(_ epoch: Int) {
+        residentDisplayedEpoch = epoch
+        if var resident = hud.resident {
+            resident.displayedEpoch = epoch
+            hud.resident = resident
+        }
+    }
+
+    private func startResidentIfNeeded() {
+        guard residentPlan.enabled else { return }
+        guard let context else {
+            hud.setError((hud.errorState.map { $0 + "; " } ?? "")
+                         + "resident mode requires Metal")
+            if residentPlan.limit.isBounded || residentPlan.tinyValidation {
+                print(residentDiagnosticLine(reason: .failure, epoch: 0))
+                exit(2)
+            }
+            return
+        }
+        guard let residentConfig else {
+            if residentPlan.limit.isBounded || residentPlan.tinyValidation {
+                print(residentDiagnosticLine(reason: .failure, epoch: 0))
+                exit(1)
+            }
+            return
+        }
+        do {
+            let driver = try ResidentSimulationDriver(
+                config: residentConfig,
+                plan: residentPlan,
+                device: context.device,
+                commandQueue: context.queue,
+                onReport: { [weak self] report, failures in
+                    self?.receiveResidentReport(report, failureCount: failures)
+                },
+                onFailure: { [weak self] message in
+                    self?.hud.setError(message)
+                },
+                onStop: { [weak self] reason, epoch in
+                    self?.residentDidStop(reason: reason, epoch: epoch)
+                })
+            residentDriver = driver
+            isRunning = true
+            driver.start()
+        } catch {
+            hud.setError((hud.errorState.map { $0 + "; " } ?? "")
+                         + "resident start failed: \(error)")
+        }
+    }
+
+    private func receiveResidentReport(_ report: ResidentEpochReport, failureCount: Int) {
+        guard let residentConfig else { return }
+        hud.record(resident: report,
+                   planner: residentPlan.planner,
+                   checkpointInterval: residentConfig.checkpointInterval,
+                   displayedEpoch: residentDisplayedEpoch,
+                   failureCount: failureCount)
+        if report.shadowMismatches.isEmpty == false {
+            hud.setError("resident CPU-shadow mismatch: "
+                         + (report.shadowMismatches.first?.summary ?? "divergence"))
+        }
+        objectWillChange.send()
+    }
+
+    private func residentDidStop(reason: ResidentDriverStopReason, epoch: Int) {
+        isRunning = false
+        objectWillChange.send()
+        guard residentPlan.limit.isBounded || residentPlan.tinyValidation || reason == .failure else {
+            return
+        }
+        print(residentDiagnosticLine(reason: reason, epoch: epoch))
+        exit(reason == .failure || hud.errorState != nil ? 1 : 0)
+    }
+
+    private func residentDiagnosticLine(reason: ResidentDriverStopReason, epoch: Int) -> String {
+        let d = hud.resident
+        func f(_ x: Double?) -> String {
+            x.map { String(format: "%.3f", $0) } ?? "nil"
+        }
+        let reasonText: String
+        switch reason {
+        case .requested: reasonText = "requested"
+        case .epochLimit: reasonText = "epochLimit"
+        case .secondsLimit: reasonText = "secondsLimit"
+        case .failure: reasonText = "failure"
+        }
+        return "resident outcome=\(hud.errorState == nil ? "ok" : "error") "
+            + "reason=\(reasonText) finalEpoch=\(epoch) "
+            + "sourceEpoch=\(d?.sourceEpoch ?? 0) displayedEpoch=\(d?.displayedEpoch ?? 0) "
+            + "planner=\(residentPlan.planner.cliValue) "
+            + "plannerMode=\(residentPlan.planner.identifier) "
+            + "plannerLabel=\(residentPlan.planner.provenanceLabel) "
+            + "epochWallMs=\(f(d?.epochWallMs)) "
+            + "gpu[mutateMs=\(f(d?.mutationGpuMs)),planMs=\(f(d?.plannerGpuMs)),"
+            + "evalMs=\(f(d?.evalGpuMs)),visualizeMs=\(f(d?.visualizationGpuMs))] "
+            + "checkpointInterval=\(residentConfig?.checkpointInterval ?? 0) "
+            + "checkpointBytes=\(d?.checkpointBytes ?? 0) "
+            + "readbackBytes=\(d?.readbackBytes ?? 0) "
+            + "failures=\(d?.failureCount ?? 0) "
+            + "haltUnknown=\(d?.unknownHalts ?? hud.haltUnknown) "
+            + "programs=\(hud.programCount) device=\"\(hud.deviceName)\" "
+            + "error=\(hud.errorState ?? "none")"
+    }
+
+    func stopResidentSimulation() {
+        residentDriver?.stopAndWait()
     }
 
     // MARK: - Bounded native validation

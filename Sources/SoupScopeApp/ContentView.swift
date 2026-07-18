@@ -16,6 +16,9 @@ struct ContentView: View {
                     running: appModel.isRunning)
         }
         .frame(minWidth: 640, minHeight: 480)
+        .onDisappear {
+            appModel.stopResidentSimulation()
+        }
     }
 }
 #endif

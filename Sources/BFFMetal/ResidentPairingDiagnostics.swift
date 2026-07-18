@@ -43,6 +43,19 @@ public enum ResidentPairingPlanner: String, Equatable, Sendable, Codable {
         }
     }
 
+    /// Human label used by the first resident CLI/app diagnostics. Keep these exact
+    /// strings stable so M4 measurement logs can distinguish the experimental keyed
+    /// planner from the canonical Fisher-Yates counterfactual without reinterpreting
+    /// `identifier`.
+    public var provenanceLabel: String {
+        switch self {
+        case .keyed:
+            return "statistical-random-looking-not-fisher-yates-identical"
+        case .cpuUpload:
+            return "canonical-fisher-yates-trajectory"
+        }
+    }
+
     public func permutation(count: Int, seed: UInt32, epoch: UInt32) -> [UInt32] {
         switch self {
         case .keyed:

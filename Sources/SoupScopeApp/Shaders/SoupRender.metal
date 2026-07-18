@@ -206,6 +206,36 @@ fragment float4 soup_fragment(VSOut in [[stage_in]],
     return float4(c, 1.0);
 }
 
+fragment float4 soup_resident_fragment(VSOut in [[stage_in]],
+                                       constant VizUniforms &u [[buffer(0)]],
+                                       texture2d<float> residentTex [[texture(0)]]) {
+    constexpr sampler nearestSampler(filter::nearest, address::clamp_to_edge);
+
+    float2 frag = in.pos.xy;
+    float2 b = float2(u.originByteX, u.originByteY) + frag / max(u.bytePx, 1e-4);
+
+    float soupW = float(u.gridWidth * 8u);
+    float soupH = float(u.gridHeight * 8u);
+    if (b.x < 0.0 || b.y < 0.0 || b.x >= soupW || b.y >= soupH) {
+        return float4(kBackground, 1.0);
+    }
+
+    uint2 cellByte = uint2(floor(b));
+    uint col = cellByte.x / 8u;
+    uint row = cellByte.y / 8u;
+    uint prog = row * u.gridWidth + col;
+    if (prog >= u.programCount) {
+        return float4(kBackground, 1.0);
+    }
+
+    uint texWidth = residentTex.get_width();
+    uint2 texel = uint2(prog % texWidth, prog / texWidth);
+    float2 texUV = float2((float(texel.x) + 0.5) / float(texWidth),
+                          (float(texel.y) + 0.5) / float(residentTex.get_height()));
+    float4 m = residentTex.sample(nearestSampler, texUV);
+    return float4(m.rgb, 1.0);
+}
+
 // Layer-3 layout probe: reports sizeof/alignof/field offsets of VizUniforms as the
 // Metal compiler actually laid them out. Word order matches VizLayout.hostProbeWords().
 kernel void viz_layout_probe(device uint *out [[buffer(0)]],

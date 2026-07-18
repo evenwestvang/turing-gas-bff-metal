@@ -487,6 +487,7 @@ public final class ResidentMetalEpochRunner {
     private let bufferSizes: ResidentBufferSizes
 
     public var deviceName: String { device.name }
+    public var residentVisualizationTexture: MTLTexture? { visualizationTexture }
 
     public convenience init(config: ResidentEpochConfig) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
