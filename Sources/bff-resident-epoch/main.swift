@@ -31,12 +31,14 @@ var budget = BFF.stepBudget
 var mutationP32 = BFF.defaultMutationP32
 var variant: BFFVariant = .noheads
 var initMode: SoupConfig.InitMode = .uniform
+var planner: ResidentPairingPlanner = .keyed
 var shadowSample: Int? = 0
 var shadowSampleWasSet = false
 var checkpointInterval = 0
 var capturePairs = false
 var visualization = false
 var visualizationWidth = 512
+var pairingDiagnostics = false
 var validationMode = ValidationMode.none
 
 let usageExit: Int32 = 64
@@ -103,6 +105,15 @@ while cursor < args.count {
                  exitCode: usageExit)
         }
         initMode = parsed
+    case "--planner":
+        let raw = nextValue(arg)
+        do {
+            planner = try ResidentPairingPlanner(cliValue: raw)
+        } catch let e as ResidentPairingPlanner.ParseError {
+            fail(e.description, exitCode: usageExit)
+        } catch {
+            fail("\(error)", exitCode: usageExit)
+        }
     case "--shadow-sample":
         let raw = nextValue(arg)
         shadowSample = raw == "all" ? nil : intArg(arg, raw)
@@ -115,6 +126,8 @@ while cursor < args.count {
         visualization = true
     case "--visualization-width":
         visualizationWidth = intArg(arg, nextValue(arg))
+    case "--pairing-diagnostics":
+        pairingDiagnostics = true
     case "--validate":
         let raw = nextValue(arg)
         guard let parsed = ValidationMode(rawValue: raw) else {
@@ -132,11 +145,13 @@ while cursor < args.count {
           --mutation-p32 N            mutation threshold, default \(BFF.defaultMutationP32)
           --variant noheads|bff       initial head mode, default noheads
           --init uniform|constant|opcode
+          --planner keyed|cpu-upload  resident planner, default keyed
           --shadow-sample N|all       CPU-shadow captured pairs; omit/0 for throughput
           --checkpoint-interval N     full soup readback cadence; 0 disables
           --capture-pairs             keep/read pre/post pair tapes for diagnostics
           --visualize                 emit approximate GPU visualization texture/buffer
           --visualization-width N     visualization texture width, default 512
+          --pairing-diagnostics       print CPU-side permutation distribution diagnostics
           --validate tiny|medium|smoke|none
 
         validation:
@@ -167,11 +182,13 @@ guard epochs >= 0 else { fail("epochs must be >= 0", exitCode: usageExit) }
             mutationP32: mutationP32,
             variant: variant,
             initMode: initMode,
+            planner: planner,
             shadowSampleCount: resolvedShadow,
             checkpointInterval: checkpoint ?? checkpointInterval,
             capturePairTapes: requestedCapture || shadowNeedsCapture,
             visualizationEnabled: visualize ?? visualization,
-            visualizationWidth: visualizationWidth)
+            visualizationWidth: visualizationWidth,
+            pairingDiagnosticsEnabled: pairingDiagnostics)
     } catch let e as ResidentEpochConfig.ConfigError {
         fail(e.description, exitCode: usageExit)
     } catch {
@@ -184,12 +201,32 @@ func hexDigest(_ digest: UInt64?) -> String {
     return "0x" + SoupDigest.hexString(digest)
 }
 
+func diagnosticsText(_ diagnostics: PairingDistributionDiagnostics?) -> String {
+    guard let diagnostics else { return "none" }
+    let histogram = diagnostics.distanceHistogram
+        .map { "\($0.label)=\($0.count)" }
+        .joined(separator: ",")
+    return "fixed=\(diagnostics.fixedPointCount),"
+        + "adjacent=\(diagnostics.adjacentIDPairCount),"
+        + "meanAbsDistance=\(String(format: "%.3f", diagnostics.meanAbsolutePairIDDistance)),"
+        + "hist[\(histogram)]"
+}
+
+func plannerLabel(_ planner: ResidentPairingPlanner) -> String {
+    switch planner {
+    case .keyed:
+        return "statistical-random-looking-not-fisher-yates-identical"
+    case .cpuUpload:
+        return "canonical-fisher-yates-trajectory"
+    }
+}
+
 func ms(_ seconds: Double?) -> String {
     guard let seconds else { return "nil" }
     return String(format: "%.3f", seconds * 1000)
 }
 
-func printReport(seed: UInt32, report: ResidentEpochReport) {
+func printReport(seed: UInt32, config: ResidentEpochConfig, report: ResidentEpochReport) {
     let c = report.counters
     let kernelText = report.instrumentation.kernelTimings.map {
         "\($0.name):hostMs=\(ms($0.hostSeconds)),gpuMs=\(ms($0.gpuSeconds))"
@@ -200,11 +237,19 @@ func printReport(seed: UInt32, report: ResidentEpochReport) {
           + "loopOps=\(c.totalLoopOps) copyWrites=\(c.totalCopyWrites) "
           + "halt[budget=\(c.haltBudget),pcOut=\(c.haltPCOut),"
           + "unmatched=\(c.haltUnmatched),unknown=\(c.haltUnknown)] "
+          + "planner=\(config.pairingModeID) "
+          + "plannerLabel=\(plannerLabel(config.planner)) "
           + "digest=\(hexDigest(report.digest)) "
           + "shadowChecked=\(report.shadowChecked) "
           + "shadowMismatch=\(report.shadowMismatches.count) "
+          + "permutationFingerprint=\(hexDigest(report.permutationFingerprint)) "
+          + "pairingDiagnostics=\(diagnosticsText(report.pairingDiagnostics)) "
           + "epochWallMs=\(ms(report.instrumentation.epochWallSeconds)) "
           + "checkpointMs=\(ms(report.instrumentation.checkpointSeconds)) "
+          + "plannerCpuGenMs=\(ms(report.instrumentation.plannerCPUGenerationSeconds)) "
+          + "permutationUploadMs=\(ms(report.instrumentation.permutationUploadSeconds)) "
+          + "permutationUploadBytes=\(report.instrumentation.permutationUploadBytes) "
+          + "plannerGpuMs=\(ms(report.instrumentation.plannerGPUSeconds)) "
           + "epochsPerSec=\(String(format: "%.3f", report.instrumentation.epochsPerSecond)) "
           + "uploadBytes=\(report.instrumentation.uploadBytes) "
           + "readbackBytes=\(report.instrumentation.readbackBytes) "
@@ -222,6 +267,7 @@ func runNative(config: ResidentEpochConfig, epochs: Int, seed: UInt32,
           + "epochs=\(epochs) budget=\(config.stepBudget) mutationP32=\(config.mutationP32) "
           + "variant=\(config.variant.rawValue) init=\(config.initMode.rawValue) "
           + "planner=\(config.pairingModeID) "
+          + "plannerLabel=\(plannerLabel(config.planner)) "
           + "checkpointInterval=\(config.checkpointInterval) "
           + "capturePairs=\(config.capturePairTapes) visualize=\(config.visualizationEnabled) "
           + "rng=\(BFFRandom.contractID) device=\"\(gpu.deviceName)\"")
@@ -230,7 +276,7 @@ func runNative(config: ResidentEpochConfig, epochs: Int, seed: UInt32,
     var mismatchCount = 0
     for _ in 0..<epochs {
         let g = try gpu.runEpoch()
-        printReport(seed: seed, report: g)
+        printReport(seed: seed, config: config, report: g)
         for mm in g.shadowMismatches {
             warn("SHADOW MISMATCH \(mm.summary)")
         }
@@ -248,12 +294,23 @@ func runNative(config: ResidentEpochConfig, epochs: Int, seed: UInt32,
                 warn("CPU PARITY MISMATCH seed=\(seed) epoch=\(g.counters.epoch) soup firstByte=\(first)")
                 mismatchCount += 1
             }
+            if g.permutationFingerprint != c.permutationFingerprint {
+                warn("CPU PARITY MISMATCH seed=\(seed) epoch=\(g.counters.epoch) permutationFingerprint gpu=\(hexDigest(g.permutationFingerprint)) cpu=\(hexDigest(c.permutationFingerprint))")
+                mismatchCount += 1
+            }
+            if g.pairingDiagnostics != c.pairingDiagnostics {
+                warn("CPU PARITY MISMATCH seed=\(seed) epoch=\(g.counters.epoch) pairingDiagnostics gpu=\(diagnosticsText(g.pairingDiagnostics)) cpu=\(diagnosticsText(c.pairingDiagnostics))")
+                mismatchCount += 1
+            }
             if g.capturedPairs.count == c.capturedPairs.count {
                 for i in g.capturedPairs.indices where g.capturedPairs[i] != c.capturedPairs[i] {
                     warn("PAIR CAPTURE MISMATCH seed=\(seed) epoch=\(g.counters.epoch) pair=\(i)")
                     mismatchCount += 1
                     break
                 }
+            } else {
+                warn("PAIR CAPTURE COUNT MISMATCH seed=\(seed) epoch=\(g.counters.epoch) gpu=\(g.capturedPairs.count) cpu=\(c.capturedPairs.count)")
+                mismatchCount += 1
             }
         }
     }
@@ -329,6 +386,7 @@ print("bff-resident-epoch: Metal is unavailable on this platform; no GPU epoch w
 print("would-run validation=\(validationMode.rawValue) seed=\(config.seed) programs=\(config.programCount) "
       + "pairs=\(config.pairCount) epochs=\(epochs) budget=\(config.stepBudget) "
       + "mutationP32=\(config.mutationP32) planner=\(config.pairingModeID) "
+      + "plannerLabel=\(plannerLabel(config.planner)) "
       + "checkpointInterval=\(config.checkpointInterval) "
       + "capturePairs=\(config.capturePairTapes) visualize=\(config.visualizationEnabled)")
 exit(2)

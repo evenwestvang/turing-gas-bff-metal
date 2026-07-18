@@ -18,6 +18,9 @@ public struct ResidentEpochConfig: Equatable, Sendable {
     public var mutationP32: UInt32
     public var variant: BFFVariant
     public var initMode: SoupConfig.InitMode
+    /// Experimental resident pairing planner. Defaults to the existing keyed GPU
+    /// bijection so prior invocations keep their behavior unless explicitly changed.
+    public var planner: ResidentPairingPlanner
     /// Number of pairs to CPU-shadow per epoch. `nil` means all pairs.
     public var shadowSampleCount: Int?
     /// Read the full soup back every N epochs. `0` disables full checkpoints.
@@ -29,10 +32,14 @@ public struct ResidentEpochConfig: Equatable, Sendable {
     /// texture and byte buffer.
     public var visualizationEnabled: Bool
     public var visualizationWidth: Int
+    /// Opt-in CPU-side pairing distribution diagnostics. These require reading or
+    /// retaining the permutation and are deliberately off for throughput runs.
+    public var pairingDiagnosticsEnabled: Bool
 
     /// Resident planner/pairing mode. This experimental path is not Fisher-Yates
-    /// trajectory-compatible with `Simulation` or `SoupRunner`.
-    public var pairingModeID: String { BFFRandom.residentPairingModeID }
+    /// trajectory-compatible with `Simulation` or `SoupRunner` unless the
+    /// `cpu-upload-fisher-yates-v1` counterfactual planner is selected.
+    public var pairingModeID: String { planner.identifier }
     public var pairCount: Int { programCount / 2 }
     public var soupByteCount: Int { programCount * BFF.tapeSize }
     public var resolvedShadowSampleCount: Int {
@@ -71,11 +78,13 @@ public struct ResidentEpochConfig: Equatable, Sendable {
                 mutationP32: UInt32 = BFF.defaultMutationP32,
                 variant: BFFVariant = .noheads,
                 initMode: SoupConfig.InitMode = .uniform,
+                planner: ResidentPairingPlanner = .keyed,
                 shadowSampleCount: Int? = 0,
                 checkpointInterval: Int = 0,
                 capturePairTapes: Bool = false,
                 visualizationEnabled: Bool = false,
-                visualizationWidth: Int = 512) throws {
+                visualizationWidth: Int = 512,
+                pairingDiagnosticsEnabled: Bool = false) throws {
         guard programCount > 0, programCount % 2 == 0 else {
             throw ConfigError.programCountNotPositiveEven(programCount)
         }
@@ -102,11 +111,13 @@ public struct ResidentEpochConfig: Equatable, Sendable {
         self.mutationP32 = mutationP32
         self.variant = variant
         self.initMode = initMode
+        self.planner = planner
         self.shadowSampleCount = shadowSampleCount
         self.checkpointInterval = checkpointInterval
         self.capturePairTapes = capturePairTapes
         self.visualizationEnabled = visualizationEnabled
         self.visualizationWidth = visualizationWidth
+        self.pairingDiagnosticsEnabled = pairingDiagnosticsEnabled
     }
 
     public func initialSoup() -> [UInt8] {
@@ -153,6 +164,10 @@ public struct ResidentKernelTiming: Equatable, Sendable, Codable {
 public struct ResidentEpochInstrumentation: Equatable, Sendable, Codable {
     public var epochWallSeconds: Double
     public var checkpointSeconds: Double?
+    public var plannerCPUGenerationSeconds: Double
+    public var permutationUploadSeconds: Double
+    public var permutationUploadBytes: Int
+    public var plannerGPUSeconds: Double?
     public var epochsPerSecond: Double
     public var uploadBytes: Int
     public var readbackBytes: Int
@@ -242,6 +257,8 @@ public struct ResidentEpochReport: Sendable {
     public var capturedPairs: [ResidentPairCapture]
     public var shadowChecked: Int
     public var shadowMismatches: [ShadowMismatch]
+    public var permutationFingerprint: UInt64?
+    public var pairingDiagnostics: PairingDistributionDiagnostics?
     public var instrumentation: ResidentEpochInstrumentation
 }
 
@@ -267,8 +284,10 @@ public struct ResidentCPUReferenceRunner: Sendable {
         let e = UInt32(epoch)
         let mutationCount = BFFRandom.mutate(soup: &soup, seed: config.seed,
                                              epoch: e, mutationP32: config.mutationP32)
-        let perm = BFFRandom.residentPairingPermutation(count: config.programCount,
-                                                        seed: config.seed, epoch: e)
+        let plannerStart = ResidentClock.now()
+        let perm = config.planner.permutation(count: config.programCount,
+                                              seed: config.seed, epoch: e)
+        let plannerCPUSeconds = ResidentClock.now() - plannerStart
 
         var words = [UInt32](repeating: 0, count: ResidentCounterLayout.wordCount)
         words[ResidentCounterLayout.mutationCount] = UInt32(mutationCount)
@@ -343,6 +362,14 @@ public struct ResidentCPUReferenceRunner: Sendable {
             && ((epoch + 1) % config.checkpointInterval == 0)
         let checkpoint = checkpointEnabled ? soup : nil
         let digest = checkpoint.map(SoupDigest.digest)
+        let shouldFingerprintPermutation = config.capturePairTapes
+            || config.pairingDiagnosticsEnabled
+        let permutationFingerprint = shouldFingerprintPermutation
+            ? PermutationDigest.digest(perm)
+            : nil
+        let pairingDiagnostics = config.pairingDiagnosticsEnabled
+            ? PairingDistributionDiagnostics.analyze(permutation: perm)
+            : nil
         epoch += 1
 
         let wall = ResidentClock.now() - start
@@ -350,6 +377,10 @@ public struct ResidentCPUReferenceRunner: Sendable {
         let instr = ResidentEpochInstrumentation(
             epochWallSeconds: wall,
             checkpointSeconds: checkpointEnabled ? 0 : nil,
+            plannerCPUGenerationSeconds: plannerCPUSeconds,
+            permutationUploadSeconds: 0,
+            permutationUploadBytes: 0,
+            plannerGPUSeconds: nil,
             epochsPerSecond: wall > 0 ? 1.0 / wall : 0,
             uploadBytes: epoch == 1 ? config.soupByteCount : 0,
             readbackBytes: (checkpoint?.count ?? 0)
@@ -365,6 +396,8 @@ public struct ResidentCPUReferenceRunner: Sendable {
                                    capturedPairs: captures,
                                    shadowChecked: shadowSample.count,
                                    shadowMismatches: mismatches,
+                                   permutationFingerprint: permutationFingerprint,
+                                   pairingDiagnostics: pairingDiagnostics,
                                    instrumentation: instr)
     }
 }
@@ -554,9 +587,24 @@ public final class ResidentMetalEpochRunner {
         var timings: [ResidentKernelTiming] = []
         var readbackBytes = 0
         var parameterBytes = 0
+        var plannerCPUGenerationSeconds = 0.0
+        var permutationUploadSeconds = 0.0
+        var permutationUploadBytes = 0
+        var plannerGPUSeconds: Double?
 
         try runMutate(into: &timings, parameterBytes: &parameterBytes)
-        try runPlan(into: &timings, parameterBytes: &parameterBytes)
+        switch config.planner {
+        case .keyed:
+            try runPlan(into: &timings, parameterBytes: &parameterBytes)
+            if let planTiming = timings.last, planTiming.name == "plan" {
+                plannerGPUSeconds = planTiming.gpuSeconds
+            }
+        case .cpuUpload:
+            let upload = uploadCPUFisherYatesPermutation()
+            plannerCPUGenerationSeconds = upload.generationSeconds
+            permutationUploadSeconds = upload.copySeconds
+            permutationUploadBytes = upload.byteCount
+        }
         try runEvalScatter(into: &timings, parameterBytes: &parameterBytes)
         if config.visualizationEnabled {
             try runVisualize(into: &timings, parameterBytes: &parameterBytes)
@@ -569,8 +617,13 @@ public final class ResidentMetalEpochRunner {
 
         var captures: [ResidentPairCapture] = []
         captures.reserveCapacity(config.capturePairTapes ? config.pairCount : 0)
-        if config.capturePairTapes {
-            captures = readPairCaptures()
+        var permutationSnapshot: [UInt32]?
+        if config.capturePairTapes || config.pairingDiagnosticsEnabled {
+            permutationSnapshot = readPermutation()
+            readbackBytes += bufferSizes.permutationBytes
+        }
+        if config.capturePairTapes, let permutationSnapshot {
+            captures = readPairCaptures(permutation: permutationSnapshot)
             readbackBytes += bufferSizes.pairInputCaptureBytes
                 + bufferSizes.pairFinalCaptureBytes
                 + bufferSizes.pairResultBytes
@@ -604,14 +657,23 @@ public final class ResidentMetalEpochRunner {
                 }
             }
         }
+        let permutationFingerprint = permutationSnapshot.map(PermutationDigest.digest)
+        let pairingDiagnostics = config.pairingDiagnosticsEnabled
+            ? permutationSnapshot.map { PairingDistributionDiagnostics.analyze(permutation: $0) }
+            : nil
 
         epoch += 1
         let wall = ResidentClock.now() - epochStart
+        let initialUploadBytes = epoch == 1 ? config.soupByteCount : 0
         let instr = ResidentEpochInstrumentation(
             epochWallSeconds: wall,
             checkpointSeconds: checkpointSeconds,
+            plannerCPUGenerationSeconds: plannerCPUGenerationSeconds,
+            permutationUploadSeconds: permutationUploadSeconds,
+            permutationUploadBytes: permutationUploadBytes,
+            plannerGPUSeconds: plannerGPUSeconds,
             epochsPerSecond: wall > 0 ? 1.0 / wall : 0,
-            uploadBytes: epoch == 1 ? config.soupByteCount : 0,
+            uploadBytes: initialUploadBytes + permutationUploadBytes,
             readbackBytes: readbackBytes,
             parameterBytes: parameterBytes,
             bufferSizes: bufferSizes,
@@ -623,6 +685,8 @@ public final class ResidentMetalEpochRunner {
                                    capturedPairs: captures,
                                    shadowChecked: shadowSample.count,
                                    shadowMismatches: mismatches,
+                                   permutationFingerprint: permutationFingerprint,
+                                   pairingDiagnostics: pairingDiagnostics,
                                    instrumentation: instr)
     }
 
@@ -666,6 +730,25 @@ public final class ResidentMetalEpochRunner {
             enc.setBytes(&params, length: MemoryLayout<ResidentEpochParams>.stride, index: 1)
             dispatchThreads(count: config.programCount, pipeline: planPipeline, encoder: enc)
         }
+    }
+
+    private func uploadCPUFisherYatesPermutation()
+        -> (generationSeconds: Double, copySeconds: Double, byteCount: Int) {
+        let generationStart = ResidentClock.now()
+        let perm = BFFRandom.pairingPermutation(count: config.programCount,
+                                                seed: config.seed,
+                                                epoch: UInt32(epoch))
+        let generationSeconds = ResidentClock.now() - generationStart
+
+        let byteCount = perm.count * MemoryLayout<UInt32>.stride
+        let copyStart = ResidentClock.now()
+        perm.withUnsafeBufferPointer { buf in
+            permutationBuffer.contents().copyMemory(from: buf.baseAddress!,
+                                                    byteCount: byteCount)
+        }
+        permutationBuffer.didModifyRange(0..<byteCount)
+        let copySeconds = ResidentClock.now() - copyStart
+        return (generationSeconds, copySeconds, byteCount)
     }
 
     private func runEvalScatter(into timings: inout [ResidentKernelTiming],
@@ -784,17 +867,20 @@ public final class ResidentMetalEpochRunner {
                                        count: config.soupByteCount))
     }
 
-    private func readPairCaptures() -> [ResidentPairCapture] {
+    private func readPermutation() -> [UInt32] {
+        (0..<config.programCount).map { i in
+            permutationBuffer.contents()
+                .load(fromByteOffset: i * MemoryLayout<UInt32>.stride, as: UInt32.self)
+        }
+    }
+
+    private func readPairCaptures(permutation: [UInt32]) -> [ResidentPairCapture] {
         var out: [ResidentPairCapture] = []
         out.reserveCapacity(config.pairCount)
         let resultStride = 5 * MemoryLayout<UInt32>.stride
         for pairIndex in 0..<config.pairCount {
-            let a = permutationBuffer.contents()
-                .load(fromByteOffset: (2 * pairIndex) * MemoryLayout<UInt32>.stride,
-                      as: UInt32.self)
-            let b = permutationBuffer.contents()
-                .load(fromByteOffset: (2 * pairIndex + 1) * MemoryLayout<UInt32>.stride,
-                      as: UInt32.self)
+            let a = permutation[2 * pairIndex]
+            let b = permutation[2 * pairIndex + 1]
             let tapeOffset = pairIndex * BFF.pairTapeSize
             let input = [UInt8](UnsafeRawBufferPointer(
                 start: inputCaptureBuffer.contents().advanced(by: tapeOffset),

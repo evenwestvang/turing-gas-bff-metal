@@ -15,8 +15,10 @@ It does not change existing defaults, `bff-metal-soup`, `bff-metal-bench`,
 epoch working state:
 
 - `resident.soup`: canonical `programCount * 64` byte soup, reused across epochs.
-- `resident.permutation`: `parallel-swap-or-not-v1` resident permutation, generated
-  on GPU each epoch.
+- `resident.permutation`: resident permutation buffer. In the default
+  `parallel-swap-or-not-v1` planner it is generated on GPU each epoch; in the
+  `cpu-upload-fisher-yates-v1` counterfactual it is filled by a CPU Fisher-Yates
+  permutation upload each epoch.
 - `resident.pairResults`: 5 `UInt32` words per pair (`steps`, `noopSteps`,
   `copyWrites`, `loopOps`, `halt`).
 - `resident.counters`: per-epoch aggregate counters updated with GPU atomics.
@@ -30,12 +32,19 @@ The epoch command sequence is:
 
 1. `bff_resident_mutate`: deterministic byte mutation in place using the existing
    `counter-pcg-v1` stream contract.
-2. `bff_resident_plan_pairs`: one GPU thread per output slot evaluates
-   `parallel-swap-or-not-v1`, a keyed swap-or-not bijection over `0..<programCount`.
-   This is intentionally NOT Fisher-Yates trajectory compatibility. It is an
-   experimental parallel deterministic pairing distribution; acceptance of the
-   distribution remains statistical, while exact no-duplicate/no-omission coverage is
-   guaranteed by construction for even non-power-of-two program counts.
+2. Planner:
+   - `parallel-swap-or-not-v1` (`--planner keyed`, default): one GPU thread per
+     output slot evaluates a keyed swap-or-not bijection over `0..<programCount`.
+     This is intentionally NOT Fisher-Yates trajectory compatibility. It is an
+     experimental parallel deterministic pairing distribution; acceptance of the
+     distribution remains statistical/random-looking only, while exact
+     no-duplicate/no-omission coverage is guaranteed by construction for even
+     non-power-of-two program counts.
+   - `cpu-upload-fisher-yates-v1` (`--planner cpu-upload`): the host generates the
+     existing canonical `BFFRandom.pairingPermutation(count:seed:epoch:)`
+     Fisher-Yates permutation and copies it into `resident.permutation` before
+     eval-scatter. This is a narrow counterfactual for measuring the cost of
+     preserving the original Fisher-Yates trajectory.
 3. `bff_resident_eval_scatter`: one GPU thread per pair copies the two stable-ID
    programs into a 128-byte local tape, runs the normative dynamic-scan evaluator, writes
    result counters, writes pair activity to both stable IDs, and scatters both 64-byte
@@ -60,8 +69,9 @@ Still on the host:
 - CPU-shadow diagnostics when captured tapes are available.
 - Digest computation after a checkpoint readback.
 
-No soup upload, mutation table upload, permutation upload, packed pair-tape upload, or
-post-evaluation soup scatter happens per epoch in the normal resident path.
+No soup upload, mutation table upload, packed pair-tape upload, or post-evaluation
+soup scatter happens per epoch in the normal resident path. Per-epoch permutation
+upload happens only under `--planner cpu-upload` and is counted in `uploadBytes`.
 
 The buffers use `.storageModeShared` for this first Apple-silicon learning slice. The
 canonical state is the Metal buffer; Swift does not mutate it between epochs except for
@@ -73,15 +83,26 @@ if profiling shows that matters.
 Each report prints:
 
 - epoch wall time and epochs/sec;
+- exact planner identifier;
+- planner CPU generation time, permutation upload/copy time and bytes, and planner
+  GPU time when a GPU planner actually ran and timestamps are available;
 - command-buffer GPU time per resident kernel when Metal timestamps are available;
 - host-observed time per kernel command buffer;
 - checkpoint time when checkpointing fires;
 - upload/readback/parameter bytes;
 - persistent buffer sizes and total bytes;
 - aggregate counters and halt buckets.
+- optional permutation fingerprint and CPU-side pairing distribution diagnostics.
 
 Per-kernel GPU timing is implemented by putting each kernel in its own command buffer.
 That is intentionally measurement-friendly rather than throughput-optimal.
+
+`--pairing-diagnostics` enables CPU-side permutation diagnostics for either planner:
+fixed-point count, adjacent-ID pair count, mean absolute pair-ID distance, and a coarse
+distance histogram. Histogram bins are absolute pair-ID distances:
+`0`, `1`, `2...3`, `4...7`, `8...15`, `16...31`, `32...63`, `64...127`,
+`128...255`, `256...511`, `512...1023`, and `1024...`. This read/scan is opt-in so
+normal throughput epochs do not pay for it.
 
 ## Validation Modes
 
@@ -98,8 +119,11 @@ swift test --filter ResidentEpochTests
 swift test --filter ResidentMetalEpochTests
 
 # Exhaustive tiny GPU-vs-CPU parity for every even population 2...1024 using the
-# resident planner.
+# selected resident planner.
 swift run -c release bff-resident-epoch --validate tiny --epochs 1
+
+# The Fisher-Yates counterfactual: CPU-generate and upload the canonical permutation.
+swift run -c release bff-resident-epoch --planner cpu-upload --validate tiny --epochs 1
 
 # Medium 16K stress: several seeds, full checkpoint digest/counters, captured tapes,
 # and sampled CPU shadow.
@@ -118,6 +142,10 @@ swift run -c release bff-resident-epoch \
 
 swift run bff-resident-epoch \
   --programs 32 --epochs 4 --checkpoint-interval 1 --capture-pairs --shadow-sample all
+
+swift run bff-resident-epoch \
+  --planner cpu-upload --programs 32 --epochs 4 --checkpoint-interval 1 \
+  --capture-pairs --shadow-sample all --pairing-diagnostics
 ```
 
 ## Mismatch Diagnostics
@@ -130,15 +158,15 @@ tape through `BFFInterpreter` and reports:
 - first final-tape byte divergence;
 - steps, noop steps, copy writes, loop ops, and halt divergence.
 
-Validation modes compare GPU counters, checkpoint soup bytes, digest, and captured pair
-records against `ResidentCPUReferenceRunner`, which implements the identical resident
-pairing algorithm.
+Validation modes compare GPU counters, checkpoint soup bytes, digest, permutation
+fingerprint, optional pairing diagnostics, and captured pair records against
+`ResidentCPUReferenceRunner`, which implements the selected resident pairing algorithm.
 
 ## Known Risks
 
 - `parallel-swap-or-not-v1` is not Fisher-Yates-compatible. It is a fast experimental
-  resident planner; distribution quality must be judged statistically before any
-  scientific claim depends on it.
+  resident planner that is only statistically compatible/random-looking; distribution
+  quality must be judged statistically before any scientific claim depends on it.
 - Aggregate counters are `UInt32`; the bounded 131K/default-budget smoke fits, but much
   larger populations or budgets need wider reductions.
 - Pair capture currently captures all pairs, not only the sampled shadow pairs.
