@@ -42,6 +42,17 @@ final class AppModel: ObservableObject {
     private var runner: SoupRunner
     private(set) var lastSnapshot: RenderSnapshot?
 
+    // Opt-in per-frame host-stage timing (`--frame-stage-timing`). `nil` (off) unless the
+    // launch option requested it, so the default frame path is byte-for-byte unchanged.
+    // `stepFrame` stashes the epoch-batch and snapshot-build spans it measures; the
+    // renderer folds them together with the frame wall and the Metal-only texture/submit
+    // spans into one `AppFrameStageSample`.
+    private var frameStages: AppFrameStageAccumulator?
+    private var lastEpochBatchSeconds: Double?
+    private var lastSnapshotBuildSeconds: Double?
+    /// Whether per-frame host-stage timing is active (renderer gate).
+    var frameStageTimingEnabled: Bool { frameStages != nil }
+
     // Drawable geometry (pixels), set by the renderer on resize.
     private var drawablePxW: Double = 0
     private var drawablePxH: Double = 0
@@ -50,7 +61,7 @@ final class AppModel: ObservableObject {
     // Bounded-validation state (the verdict logic lives in the pure
     // `ValidationRun`/`ValidationPolicy` state machine in SoupScopeCore).
     private var validationRun: ValidationRun?
-    private var validationStart: CFAbsoluteTime?
+    private var validationStart: Double?
     private var validationTimer: Timer?
     private var completedDraws = 0
     private var lastCommandBuffer: MTLCommandBuffer?
@@ -102,6 +113,8 @@ final class AppModel: ObservableObject {
         self.hud = initialHUD
         self.lodReadout = LODReadout(camera: camera, lod: lod)
 
+        self.frameStages = parsed.frameStageTiming ? AppFrameStageAccumulator() : nil
+
         self.lastSnapshot = try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
                                                         soup: runner.soup)
 
@@ -117,13 +130,20 @@ final class AppModel: ObservableObject {
     /// error visible (never spins/retries). Returns the latest snapshot regardless
     /// so the last good frame stays on screen.
     func stepFrame() -> RenderSnapshot? {
+        // Clear this frame's stashed stage spans up front (only when timing), so a frame
+        // that does not advance (finished / paused / error) honestly folds `nil` for the
+        // epoch-batch and snapshot stages rather than a previous frame's values.
+        if frameStages != nil {
+            lastEpochBatchSeconds = nil
+            lastSnapshotBuildSeconds = nil
+        }
         guard validationFinished == false else { return lastSnapshot }
         guard hud.errorState == nil, isRunning, let evaluator = context?.evaluator else {
             return lastSnapshot
         }
 
         let epochsToRun = batcher.nextBatchEpochs()
-        let t0 = CFAbsoluteTimeGetCurrent()
+        let t0 = AppMonotonicClock.nowSeconds()
         var reports: [EpochReport] = []
         reports.reserveCapacity(epochsToRun)
         do {
@@ -134,7 +154,7 @@ final class AppModel: ObservableObject {
             hud.setError("epoch execution failed: \(error)")
             return lastSnapshot
         }
-        let batchMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        let batchMs = (AppMonotonicClock.nowSeconds() - t0) * 1000
         batcher.record(batchMs: batchMs, epochs: reports.count)
 
         // A shadow mismatch is a hard stop — surface it, do not keep advancing.
@@ -148,12 +168,35 @@ final class AppModel: ObservableObject {
         hud.record(batch: reports, epoch: runner.epoch, batchMs: batchMs)
 
         let metrics = reports.last?.metrics
+        var snapshotBuildSeconds: Double? = nil
         if let metrics {
+            let s0 = frameStages != nil ? AppMonotonicClock.nowSeconds() : 0
             lastSnapshot = try? RenderSnapshot.build(epoch: runner.epoch,
                                                      programCount: config.programCount,
                                                      soup: runner.soup, metrics: metrics)
+            if frameStages != nil { snapshotBuildSeconds = AppMonotonicClock.nowSeconds() - s0 }
+        }
+        // Stash this frame's app-stage spans for the renderer to fold (only when timing).
+        if frameStages != nil {
+            lastEpochBatchSeconds = batchMs / 1000
+            lastSnapshotBuildSeconds = snapshotBuildSeconds
         }
         return lastSnapshot
+    }
+
+    /// Fold one frame's app-stage spans into the accumulator, pairing the renderer's
+    /// frame wall + Metal-only spans with the epoch-batch and snapshot-build spans
+    /// `stepFrame` measured. No-op unless `--frame-stage-timing` is on.
+    func recordFrameStages(frameSeconds: Double, soupBufferSeconds: Double?,
+                           metricTextureSeconds: Double?, renderSubmitSeconds: Double?) {
+        guard frameStages != nil else { return }
+        frameStages?.record(AppFrameStageSample(
+            frameSeconds: frameSeconds,
+            epochBatchSeconds: lastEpochBatchSeconds,
+            snapshotBuildSeconds: lastSnapshotBuildSeconds,
+            soupBufferSeconds: soupBufferSeconds,
+            metricTextureSeconds: metricTextureSeconds,
+            renderSubmitSeconds: renderSubmitSeconds))
     }
 
     // MARK: - Geometry / camera
@@ -231,7 +274,7 @@ final class AppModel: ObservableObject {
         guard let seconds = options.validationSeconds, validationRun == nil else { return }
         let policy = ValidationPolicy(requestedSeconds: seconds, metalAvailable: context != nil)
         validationRun = ValidationRun(policy: policy)
-        validationStart = CFAbsoluteTimeGetCurrent()
+        validationStart = AppMonotonicClock.nowSeconds()
         let deadline = policy.metalAvailable ? policy.graceDeadline : 0
         let timer = Timer(timeInterval: max(0, deadline), repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.evaluateValidation() }
@@ -259,7 +302,7 @@ final class AppModel: ObservableObject {
     private func evaluateValidation() {
         guard let start = validationStart, validationRun != nil, !validationFinished else { return }
         let inputs = ValidationInputs(
-            elapsedSeconds: CFAbsoluteTimeGetCurrent() - start,
+            elapsedSeconds: AppMonotonicClock.nowSeconds() - start,
             completedDraws: completedDraws,
             hasError: hud.errorState != nil,
             shadowMismatch: hud.shadowMismatch)
@@ -295,7 +338,10 @@ final class AppModel: ObservableObject {
             + "shadowChecked=\(h.shadowChecked) shadowMismatch=\(h.shadowMismatch) "
             + "programs=\(h.programCount) device=\"\(h.deviceName)\" "
             + "error=\(h.errorState ?? "none")"
-        print(line)
+        // Append the opt-in per-frame host-stage attribution when enabled and any frame
+        // was folded; absent otherwise so the default diagnostic line is unchanged.
+        let stageLine = frameStages?.summary().map { " frameStages[\($0.summaryLine)]" }
+        print(line + (stageLine ?? ""))
         // C `exit` flushes stdio: 0 success, 1 error/mismatch/no-progress, 2 no Metal.
         exit(outcome.exitCode)
     }

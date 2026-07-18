@@ -71,6 +71,9 @@ var includeCompression = false
 // the deterministic LZ proxy). Bounded to the LZ-proxy cadence; ignored when analysis
 // is off; emitted only when the linked Brotli is exactly 1.1.0 (else "not computed").
 var includeBrotli = false
+// Opt-in host-stage timing attribution. Off by default; when on, each epoch's runEpoch
+// is timed at stage boundaries and the result carries `hostStageAttribution`.
+var instrumentStages = false
 
 let usageExit = BenchmarkExitCode.usage
 
@@ -135,6 +138,7 @@ while cursor < arguments.count {
     case "--no-samples": analyzeSignals = false
     case "--compression": includeCompression = true
     case "--brotli": includeBrotli = true
+    case "--host-stage-timing": instrumentStages = true
     case "--variant":
         let raw = nextValue(argument)
         guard let v = BFFVariant(rawValue: raw) else {
@@ -195,6 +199,18 @@ while cursor < arguments.count {
           --compression           opt in to the O(n·window) LZ proxy (sampled epochs
                                   only, and only where signals are measured; off by
                                   default; ignored under --no-samples)
+          --host-stage-timing     opt in to bounded host-stage timing attribution: time
+                                  each epoch's runEpoch at stage boundaries (mutation+
+                                  pairing, packing, evaluate, scatter, counters, program
+                                  metrics, shadow, digest) plus a named signed
+                                  unclassified remainder and reconciliation validity,
+                                  emitted as `hostStageAttribution`. Off by
+                                  default; never changes the soup/RNG/counters/digest or
+                                  the reported throughput. Metal evaluator substages
+                                  (buffer alloc/upload/encode/submit+wait/readback) are
+                                  populated only on a Metal host; null otherwise. Mixed
+                                  measured span availability is surfaced as incomplete
+                                  attribution, never compacted silently.
           --allow-missing-gpu-timing  exit 0 even if GPU timestamps are unavailable
         Seeds are strict unsigned decimals in 0...\(UInt32.max); malformed/overflowing
         tokens are a usage error (exit \(BenchmarkExitCode.usage)), never truncated.
@@ -321,17 +337,29 @@ func emit(_ results: [BenchmarkResult]) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     do {
-        // schemaVersion 3: paper-aligned high-order complexity added — per-sample
-        // brotliBitsPerByte/highOrderComplexity, result initial/final Brotli bpb +
-        // high-order complexity, and highOrderComplexityCrossings (each record
-        // carries observedEpoch, previousMeasuredEpoch, and crossingEpochCensoring
-        // so the true crossing epoch cannot be mistaken for exact under sparse
-        // measurement), plus the config key highOrderComplexityThresholds. All
-        // null/empty unless --brotli measured against Brotli 1.1.0. Schema 2's key
-        // set is otherwise unchanged and every optional stays an explicit null
-        // (see Docs/Benchmarking.md). Custom init(from:) accepts schema-2-shaped
-        // JSON missing every new key, defaulting optionals to nil and arrays to [].
-        let data = try encoder.encode(Envelope(schemaVersion: 3, results: results))
+        // schemaVersion 4: composes host-stage attribution (schema 3, host-attribution
+        // branch) with paper-aligned high-order complexity (schema 3, paper branch).
+        // The two schema-3 predecessors each added a disjoint set of keys to the
+        // schema-2 baseline; schema 4 carries both. Per result:
+        //   - instrumentationEnabled (always present; bool) and hostStageAttribution
+        //     (explicit null unless --host-stage-timing) — from the host-attribution
+        //     schema-3 shape.
+        //   - initialBrotliBitsPerByte / initialHighOrderComplexity /
+        //     finalBrotliBitsPerByte / finalHighOrderComplexity /
+        //     highOrderComplexityCrossings (each record carries observedEpoch,
+        //     previousMeasuredEpoch, and crossingEpochCensoring so the true crossing
+        //     epoch cannot be mistaken for exact under sparse measurement) and the
+        //     config key highOrderComplexityThresholds — from the paper schema-3 shape.
+        //     Per sample: brotliBitsPerByte / highOrderComplexity. All null/empty
+        //     unless --brotli is on and the linked Brotli is exactly 1.1.0.
+        // All null/empty unless the respective flag is on. Schema 2's key set is
+        // otherwise unchanged and every optional stays an explicit null
+        // (see Docs/Benchmarking.md). Custom init(from:) accepts schema-2-shaped JSON
+        // missing every new key, defaulting optionals to nil and arrays to []; it also
+        // accepts either predecessor schema-3 shape (host-attribution JSON missing the
+        // Brotli keys, or paper JSON missing instrumentationEnabled/hostStageAttribution)
+        // by defaulting the absent side's keys the same way.
+        let data = try encoder.encode(Envelope(schemaVersion: 4, results: results))
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))
     } catch {
@@ -360,7 +388,8 @@ do {
 let runOptions = BenchmarkRunner.Options(analyzeSignals: analyzeSignals,
                                          includeCompression: includeCompression,
                                          signalInterval: signalInterval,
-                                         includeBrotli: includeBrotli)
+                                         includeBrotli: includeBrotli,
+                                         instrumentStages: instrumentStages)
 
 // The paper Brotli reading, injected so BFFMetal never links Brotli. Returns nil
 // (honest "not computed") unless the linked encoder is exactly 1.1.0; the runner
@@ -434,6 +463,7 @@ for config in configs {
          + "variant=\(config.variant.rawValue) shadowSample=\(config.shadowSampleCount) "
          + "analyzeSignals=\(analyzeSignals) compression=\(includeCompression) "
          + "brotli=\(includeBrotli) brotliVersion=\(BrotliCompressor.encoderVersionString) "
+         + "hostStageTiming=\(instrumentStages) "
          + "sampleInterval=\(config.sampleInterval) signalInterval=\(signalInterval) "
          + "rng=\(BFFRandom.contractID)")
 }

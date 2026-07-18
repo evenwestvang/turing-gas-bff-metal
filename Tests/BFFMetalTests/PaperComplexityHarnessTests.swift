@@ -6,7 +6,7 @@ import BFFOracle
 /// Coverage for the paper-aligned observability layer wired into the benchmark
 /// harness: the high-order-complexity crossing tracker, the Brotli measurement
 /// cadence (epoch 0 + sample∩signal points + final), deterministic-trajectory
-/// equivalence with Brotli on vs off, and the schema-3 null/JSON behavior.
+/// equivalence with Brotli on vs off, and the schema-4 null/JSON behavior.
 ///
 /// The real Brotli codec is exercised in `BrotliMetricsTests`; here the injected
 /// `measureBrotliBitsPerByte` closure is synthetic, so the plumbing is testable on
@@ -234,9 +234,9 @@ final class PaperComplexityHarnessTests: XCTestCase {
         XCTAssertNotNil(r.finalEntropyBitsPerByte)
     }
 
-    // MARK: - Schema-3 JSON: new keys present; explicit nulls when off
+    // MARK: - Schema-4 JSON: paper keys present; explicit nulls when off
 
-    func testSchema3EmitsPaperKeysAndExplicitNulls() throws {
+    func testSchema4EmitsPaperKeysAndExplicitNulls() throws {
         // Off run: paper fields must be explicit nulls / empty arrays, not missing keys.
         let cfgOff = BenchmarkConfig(seed: 9, programCount: 8, warmupEpochs: 0,
                                      measuredEpochs: 1)
@@ -419,7 +419,7 @@ final class PaperComplexityHarnessTests: XCTestCase {
     /// decode without error: optional scalar metrics default to `nil`, arrays and
     /// thresholds default to empty, and no existing field's meaning is changed.
     func testSchemaTwoShapedJSONDecodesBackwardCompatible() throws {
-        // Minimal schema-2 result: every schema-2 key present, every schema-3 key
+        // Minimal schema-2 result: every schema-2 key present, every later key
         // (Brotli, high-order, crossings, highOrderComplexityThresholds) absent.
         let schemaTwoJSON = """
         {
@@ -493,7 +493,7 @@ final class PaperComplexityHarnessTests: XCTestCase {
         XCTAssertEqual(back.thresholdCrossings[0].epoch, 3)
         XCTAssertEqual(back.finalDigest, "abc123")
 
-        // New schema-3 keys default: optional scalars to nil, arrays/thresholds to empty.
+        // Newer keys default: optional scalars to nil, arrays/thresholds to empty.
         XCTAssertNil(back.initialBrotliBitsPerByte)
         XCTAssertNil(back.initialHighOrderComplexity)
         XCTAssertNil(back.finalBrotliBitsPerByte)

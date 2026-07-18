@@ -174,7 +174,23 @@ public final class MetalBFFEvaluator {
     public func evaluate(pairTapes: [[UInt8]],
                          variant: BFFVariant,
                          stepBudget: Int) throws -> [GPUPairOutcome] {
-        guard !pairTapes.isEmpty else { return [] }
+        // The default path passes no clock, so `evaluateCore` takes no timing marks and
+        // runs byte-for-byte as before (the profile it returns is discarded).
+        try evaluateCore(pairTapes: pairTapes, variant: variant,
+                         stepBudget: stepBudget, clock: nil).outcomes
+    }
+
+    /// Shared evaluate implementation. When `clock` is non-nil it records host-side
+    /// substage timings into an `EvaluatorStageProfile`; when nil it takes no marks and
+    /// the returned profile is all-nil. The GPU command-buffer timestamp is read and
+    /// stored regardless (it is the existing honest GPU time), and is retained in the
+    /// profile *separately* from the CPU submit+wait span — never subtracted from it.
+    private func evaluateCore(pairTapes: [[UInt8]], variant: BFFVariant, stepBudget: Int,
+                              clock: (() -> Double)?)
+        throws -> (outcomes: [GPUPairOutcome], profile: EvaluatorStageProfile) {
+        func mark() -> Double? { clock?() }
+
+        guard !pairTapes.isEmpty else { return ([], EvaluatorStageProfile()) }
         for (i, tape) in pairTapes.enumerated() where tape.count != BFF.pairTapeSize {
             throw EvaluatorError.invalidInput(
                 "tape \(i) is \(tape.count) bytes, expected \(BFF.pairTapeSize)")
@@ -186,13 +202,18 @@ public final class MetalBFFEvaluator {
 
         let count = pairTapes.count
         let resultStride = MemoryLayout<BFFEvalResult>.stride
+
+        // --- Buffer allocation ---
+        let b0 = mark()
         guard let tapeBuffer = device.makeBuffer(length: count * BFF.pairTapeSize,
                                                  options: .storageModeShared),
               let resultBuffer = device.makeBuffer(length: count * resultStride,
                                                    options: .storageModeShared) else {
             throw EvaluatorError.bufferAllocationFailed
         }
+        let b1 = mark()
 
+        // --- Upload / marshalling ---
         for (i, tape) in pairTapes.enumerated() {
             tape.withUnsafeBytes { raw in
                 tapeBuffer.contents()
@@ -201,7 +222,9 @@ public final class MetalBFFEvaluator {
             }
         }
         memset(resultBuffer.contents(), 0, count * resultStride)
+        let b2 = mark()
 
+        // --- Command encoding ---
         var params = BFFEvalParams(pairCount: UInt32(count),
                                    stepBudget: UInt32(stepBudget),
                                    variant: BFFEvalLayout.variantCode(variant),
@@ -224,8 +247,12 @@ public final class MetalBFFEvaluator {
         encoder.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         encoder.endEncoding()
+        let b3 = mark()
+
+        // --- Submit + synchronous wait (CPU-observed) ---
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        let b4 = mark()
         if let error = commandBuffer.error {
             throw EvaluatorError.gpuExecutionFailed("\(error)")
         }
@@ -233,10 +260,14 @@ public final class MetalBFFEvaluator {
         // Honest command-buffer GPU time. `gpuStartTime`/`gpuEndTime` are valid only
         // after completion; treat a non-positive or non-increasing interval as "no
         // usable timestamp" (nil) rather than reporting a bogus 0, so the benchmark
-        // harness can fail clearly instead of silently trusting a fake number.
-        let span = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
-        lastGPUCommandBufferSeconds = (commandBuffer.gpuStartTime > 0 && span > 0) ? span : nil
+        // harness can fail clearly instead of silently trusting a fake number. This is
+        // retained SEPARATELY from the submit+wait CPU span above; the two are never
+        // combined (no wait-minus-GPU is ever computed).
+        let gpuSpan = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+        let gpuSeconds = (commandBuffer.gpuStartTime > 0 && gpuSpan > 0) ? gpuSpan : nil
+        lastGPUCommandBufferSeconds = gpuSeconds
 
+        // --- Readback / materialization ---
         var outcomes: [GPUPairOutcome] = []
         outcomes.reserveCapacity(count)
         for i in 0..<count {
@@ -252,7 +283,32 @@ public final class MetalBFFEvaluator {
                                            loopOps: record.loopOps,
                                            halt: record.halt))
         }
-        return outcomes
+        let b5 = mark()
+
+        func span(_ a: Double?, _ b: Double?) -> Double? {
+            guard let a, let b else { return nil }
+            return b - a
+        }
+        let profile = EvaluatorStageProfile(
+            bufferAllocSeconds: span(b0, b1),
+            uploadSeconds: span(b1, b2),
+            encodeSeconds: span(b2, b3),
+            submitWaitSeconds: span(b3, b4),
+            readbackSeconds: span(b4, b5),
+            gpuCommandBufferSeconds: gpuSeconds)
+        return (outcomes, profile)
+    }
+}
+
+/// The Metal host can decompose its own evaluate span into host substages, so it is a
+/// `StageProfilingEvaluator`. This is opt-in: the runner only calls `evaluateProfiled`
+/// when stage instrumentation is requested; the default `evaluate` path is unchanged.
+extension MetalBFFEvaluator: StageProfilingEvaluator {
+    public func evaluateProfiled(pairTapes: [[UInt8]], variant: BFFVariant,
+                                 stepBudget: Int, clock: @escaping () -> Double)
+        throws -> (outcomes: [GPUPairOutcome], profile: EvaluatorStageProfile) {
+        try evaluateCore(pairTapes: pairTapes, variant: variant,
+                         stepBudget: stepBudget, clock: clock)
     }
 }
 

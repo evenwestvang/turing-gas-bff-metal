@@ -45,6 +45,18 @@ final class Renderer: NSObject, MTKViewDelegate {
         // buffer is torn down while the pending exit waits on the last one.
         if appModel.validationFinished { return }
 
+        // Opt-in per-frame host-stage timing: measure the frame wall and the Metal-only
+        // spans (soup-buffer allocation/copy, metric-texture population/upload, render
+        // command encoding after encoder creation + submit) here where they are
+        // technically measurable, then fold them with the epoch-batch/snapshot spans
+        // `stepFrame` measured. All reads are gated on the flag, so the default frame
+        // path takes no clock and is unchanged.
+        let timing = appModel.frameStageTimingEnabled
+        let frameStart = timing ? AppMonotonicClock.nowSeconds() : 0
+        var soupBufferSeconds: Double? = nil
+        var metricTextureSeconds: Double? = nil
+        var renderSubmitSeconds: Double? = nil
+
         let snapshot = appModel.stepFrame()
 
         guard let descriptor = view.currentRenderPassDescriptor,
@@ -54,14 +66,25 @@ final class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
-        if let snapshot, let soupBuffer = makeSoupBuffer(snapshot),
-           let metricTexture = makeMetricTexture(snapshot) {
-            var uniforms = appModel.makeUniforms()
-            encoder.setRenderPipelineState(context.renderPipeline)
-            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VizUniforms>.stride, index: 0)
-            encoder.setFragmentBuffer(soupBuffer, offset: 0, index: 1)
-            encoder.setFragmentTexture(metricTexture, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        // Encoder creation happened above; by design that setup cost is outside this
+        // span and remains in the explicit app-frame unclassified remainder.
+        let encodeStart = timing ? AppMonotonicClock.nowSeconds() : 0
+        if let snapshot {
+            let soupStart = timing ? AppMonotonicClock.nowSeconds() : 0
+            let soupBuffer = makeSoupBuffer(snapshot)
+            if timing { soupBufferSeconds = AppMonotonicClock.nowSeconds() - soupStart }
+
+            let texStart = timing ? AppMonotonicClock.nowSeconds() : 0
+            let metricTexture = makeMetricTexture(snapshot)
+            if timing { metricTextureSeconds = AppMonotonicClock.nowSeconds() - texStart }
+            if let soupBuffer, let metricTexture {
+                var uniforms = appModel.makeUniforms()
+                encoder.setRenderPipelineState(context.renderPipeline)
+                encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VizUniforms>.stride, index: 0)
+                encoder.setFragmentBuffer(soupBuffer, offset: 0, index: 1)
+                encoder.setFragmentTexture(metricTexture, index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            }
         }
         // With no snapshot the pass still clears to the background color.
         encoder.endEncoding()
@@ -77,6 +100,20 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         }
         commandBuffer.commit()
+
+        if timing {
+            // Render encode + submit span: from just after encoder construction through
+            // commit, minus soup-buffer and metric-texture work already attributed to
+            // their own stages. Encoder creation remains in the explicit app-frame
+            // unclassified remainder.
+            renderSubmitSeconds = AppMonotonicClock.nowSeconds() - encodeStart
+                - (soupBufferSeconds ?? 0) - (metricTextureSeconds ?? 0)
+            appModel.recordFrameStages(
+                frameSeconds: AppMonotonicClock.nowSeconds() - frameStart,
+                soupBufferSeconds: soupBufferSeconds,
+                metricTextureSeconds: metricTextureSeconds,
+                renderSubmitSeconds: renderSubmitSeconds)
+        }
     }
 
     /// Fresh shared buffer holding the snapshot's soup bytes (stable-ID order).

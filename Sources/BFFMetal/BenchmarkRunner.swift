@@ -55,16 +55,27 @@ public enum BenchmarkRunner {
         /// that epoch carries a `SoupSignals` reading. Clamped to `>= 1`. Ignored when
         /// `analyzeSignals == false`.
         public var signalInterval: Int
+        /// Opt-in host-stage timing attribution. When `true`, each epoch's `runEpoch` is
+        /// timed with the same monotonic clock at stage boundaries, producing a
+        /// `HostStageAttribution` in the result. Off by default and fully orthogonal to
+        /// signal analysis: it never changes the soup, RNG, counters, digest, shadow, or
+        /// the reported throughput/kinetics. The extra work is a handful of clock reads
+        /// per epoch (bounded and cheap). When `false` the runner passes no stage clock,
+        /// so `runEpoch` runs exactly as it does for the app/oracle and
+        /// `hostStageAttribution` is `null`.
+        public var instrumentStages: Bool
 
         public init(analyzeSignals: Bool, includeCompression: Bool,
-                    signalInterval: Int = 1, includeBrotli: Bool = false) {
+                    signalInterval: Int = 1, includeBrotli: Bool = false,
+                    instrumentStages: Bool = false) {
             self.analyzeSignals = analyzeSignals
             self.includeCompression = includeCompression
             self.signalInterval = Swift.max(1, signalInterval)
             self.includeBrotli = includeBrotli
+            self.instrumentStages = instrumentStages
         }
 
-        /// Pure throughput: no signal analysis at all.
+        /// Pure throughput: no signal analysis at all (and no stage instrumentation).
         public static let throughputOnly = Options(analyzeSignals: false,
                                                    includeCompression: false)
     }
@@ -83,7 +94,10 @@ public enum BenchmarkRunner {
         deviceName: String?,
         options: Options,
         readMaxRSSBytes: () -> Int?,
-        now: () -> Double,
+        // `@escaping` because, under `--host-stage-timing`, the same clock is handed to
+        // `runEpoch` as the (escaping, optional) stage clock. It is still invoked
+        // synchronously within `run`; nothing retains it past this call.
+        now: @escaping () -> Double,
         gpuSecondsAfterEpoch: () -> Double?,
         measureSignals: (_ soup: [UInt8], _ includeCompression: Bool) -> SoupSignals,
         measureBrotliBitsPerByte: ((_ soup: [UInt8]) -> Double?)? = nil,
@@ -165,8 +179,14 @@ public enum BenchmarkRunner {
             // scatter → counters → digest → configured shadow, and NOT the per-program
             // entropy/activity scan. (The FNV-1a digest is the one unavoidable O(N)
             // timed pass; the counters are O(pairs).)
+            // Pass the SAME monotonic clock as the stage clock when instrumentation is
+            // on, so the stage-boundary reads and the enclosing wall come from one clock
+            // and reconcile exactly. When off, no stage clock is passed and `runEpoch`
+            // is byte-for-byte the uninstrumented call — proven equivalent by test.
+            let stageClock: (() -> Double)? = options.instrumentStages ? now : nil
             let t0 = now()
-            let report = try runner.runEpoch(using: evaluator, metrics: .disabled)
+            let report = try runner.runEpoch(using: evaluator, metrics: .disabled,
+                                             stageClock: stageClock)
             let wall = now() - t0
             let gpu = gpuSecondsAfterEpoch()
 
@@ -196,7 +216,8 @@ public enum BenchmarkRunner {
                 epoch: completed, isWarmup: isWarmup, wallSeconds: wall, gpuSeconds: gpu,
                 counters: report.counters, shadowChecked: report.shadowChecked,
                 shadowMismatches: report.shadowMismatches.count,
-                signals: signals, analysisSeconds: analysisSeconds))
+                signals: signals, analysisSeconds: analysisSeconds,
+                hostStageSpans: report.stageBreakdown))
         }
 
         rss.sample(readMaxRSSBytes())                       // post-cell
@@ -206,7 +227,8 @@ public enum BenchmarkRunner {
             initialSignals: initialSignals, observations: observations,
             finalDigestHex: SoupDigest.hexString(runner.digest),
             maxRSSBytes: rss.peakBytes,
-            initialAnalysisSeconds: initialAnalysisSeconds)
+            initialAnalysisSeconds: initialAnalysisSeconds,
+            instrumentationEnabled: options.instrumentStages)
     }
 }
 

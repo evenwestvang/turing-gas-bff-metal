@@ -14,42 +14,64 @@ Everything here uses the full **8192-step** budget by default, exactly as produc
 |---|---|---|
 | **GPU ms/epoch** | `MTLCommandBuffer.gpuEndTime − gpuStartTime` | *Command-buffer* GPU time, one command buffer per epoch. Not a per-kernel or per-encoder breakdown, not a CPU profile. `nil` (and the run fails, exit 3) if the hardware reports no usable timestamp. |
 | **Epoch wall ms/epoch** (`wallMsPerEpoch`) | monotonic clock **strictly enclosing `runEpoch`** | The epoch execution wall, and the sole basis for raw simulation throughput. It encloses mutation, pairing, packing, GPU dispatch + wait + readback, scatter, counter reduction, the post-epoch FNV-1a digest, and the CPU shadow (if on). The benchmark runs `runEpoch` with **per-program metric collection disabled** (`MetricsPolicy.disabled`), so the per-program entropy/activity scan is **not** in this wall — in raw mode it is not computed at all, and in kinetics mode per-program entropy comes from the external `SoupSignals.measure` timed separately (below). The digest is the one unavoidable O(N) pass inside the wall; counters are O(pairs). |
-| **Host residual ms/epoch** | `epoch wall − GPU` | *Everything in the epoch wall that is not GPU command-buffer time.* An attribution, **not** a CPU profiler: it is a single lump and does **not** isolate planning, allocation, marshalling, encode, readback, scatter, counter/program-metric reduction, the shadow, or queue latency. |
+| **Host residual ms/epoch** | `epoch wall − GPU` | *Everything in the epoch wall that is not GPU command-buffer time.* An attribution, **not** a CPU profiler: it is a single lump and does **not** isolate planning, allocation, marshalling, encode, readback, scatter, counter/program-metric reduction, the shadow, or queue latency. The **opt-in** `--host-stage-timing` decomposes exactly this wall into named stages (below). |
+| **Host-stage attribution** (`hostStageAttribution`) | monotonic clock at stage boundaries **inside** `runEpoch` | Opt-in (`--host-stage-timing`). Decomposes the epoch wall into eight mutually-exclusive host stages plus an explicit signed `unclassifiedMsPerEpoch` remainder; the stage sum plus remainder reconciles to `wallMsPerEpoch`. If classified stages exceed the enclosing wall, the remainder is negative and `reconciliationValid` / `reconciliationError` surface the invalid timing. On a Metal host the `evaluate` stage further carries evaluator substages (buffer alloc / upload / encode / submit+wait / readback); off-Metal those are `null` (only the whole-evaluate span is known). `null` unless the flag is given. It never changes the soup/RNG/counters/digest or the throughput numbers — a handful of clock reads per epoch. |
 | **Signal analysis ms (total)** (`signalAnalysisMsTotal`) | monotonic clock around `SoupSignals.measure`, **outside** the epoch wall | Host analysis cost of the sampled entropy/transition/LZ metrics. Whole-run total. **`null` under `--no-samples`** — that mode computes no signals, so there is nothing to time (honest "not computed", never a fabricated 0). |
 | epochs/s, pairs/s, raw/command steps/s | measured epochs ÷ measured **epoch** wall | Warmup epochs excluded; signal analysis never mixed in. |
 | halt buckets, copy writes | `EpochCounters` reduced from the GPU records | The existing science counters, summed over measured epochs. Reduced inside `runEpoch`, so part of the epoch wall. |
 | max RSS (`maxRSSBytes`) | `getrusage(RUSAGE_SELF).ru_maxrss` | Process **peak / high-water** RSS (bytes; normalized from KiB on Linux, native bytes on Darwin). It is cumulative for the whole process/matrix — **not** cell-exclusive and **not** current resident memory. Sampled at three points per cell (pre-cell, post-`SoupRunner` allocation, post-cell) and reduced to the **maximum available** reading (`PeakRSSSampler`); `null` only if every reading was unavailable. One ceiling for the whole run, best-effort. |
 
-Output is one JSON document `{ "schemaVersion": 3, "results": [ … ] }` on stdout; all
+Output is one JSON document `{ "schemaVersion": 4, "results": [ … ] }` on stdout; all
 diagnostics and warnings go to stderr. One `results[]` entry per matrix cell. Pipe to `jq`.
 
-**Schema 3** (from 2): paper-aligned high-order-complexity fields (see
-"Paper-aligned observability" below). Per sample: `brotliBitsPerByte`,
-`highOrderComplexity`. Per result: `initialBrotliBitsPerByte`,
-`initialHighOrderComplexity`, `finalBrotliBitsPerByte`, `finalHighOrderComplexity`,
-and `highOrderComplexityCrossings` — an array of first-crossing records shaped
-`{complexity, crossed, observedEpoch, previousMeasuredEpoch, crossingEpochCensoring,
-wallMsToCross, gpuMsToCross}`. The observation interval is encoded explicitly so
-machine-readable output cannot imply the true crossing epoch is exact: the true
-crossing lies in the half-open interval `(previousMeasuredEpoch, observedEpoch]`,
-and `crossingEpochCensoring` is `"exact"` (every epoch in the interval was
-measured — always the case at measurement cadence 1, or when the crossing is
-first observed at epoch 0), `"interval"` (Brotli was measured sparsely; the true
-crossing is somewhere in the interval but not pinpointed), or `"notCrossed"`
-(threshold not reached by the last measurement; `observedEpoch` is `null` and
-`previousMeasuredEpoch` holds the last measured epoch). When `--brotli` is on but
-no `highOrderComplexity` observation exists (e.g. the linked Brotli is not 1.1.0
-so the injected closure returns `nil`), `highOrderComplexityCrossings` is `[]` —
-never a list of false "not crossed" records. Per config:
-`highOrderComplexityThresholds`. **All are `null`/`[]` unless `--brotli` is on
-and the linked Brotli is exactly 1.1.0** — the same explicit-null discipline as
-schema 2 (keys always present; `null` = "not computed", never a fabricated 0).
-Schema 2's key set is otherwise unchanged; `H0` itself is the already-present
-whole-soup entropy (`initial/finalEntropyBitsPerByte`, per-sample
-`entropyBitsPerByte`). Custom `init(from:)` on `BenchmarkConfig` and
-`BenchmarkResult` accepts schema-2-shaped JSON missing every new Brotli/config/
-crossing key: optional scalar metrics default to `nil`, arrays/thresholds to `[]`,
-and no existing field's meaning is changed.
+**Schema 4** (from 3): composes the two predecessor schema-3 shapes — host-stage
+attribution and paper-aligned high-order complexity — into one envelope. Both
+predecessor schema-3 branches added a *disjoint* set of keys to the schema-2 baseline;
+schema 4 carries both, and each side stays `null`/`[]` unless its flag is on. A
+document from **either** predecessor schema-3 shape (host-attribution JSON missing the
+Brotli keys, or paper JSON missing `instrumentationEnabled`/`hostStageAttribution`)
+decodes losslessly into a schema-4 `BenchmarkResult`, the absent side surfaced as
+"off / not computed"; schema-2 JSON decodes the same way.
+
+- **Host-stage attribution side** (from the host-attribution schema 3): adds
+  `instrumentationEnabled` (always-present bool — was `--host-stage-timing` on?) and
+  the opt-in `hostStageAttribution` object (an explicit JSON `null` unless the flag is
+  given and there are measured epochs). Every schema-2 key is preserved unchanged, so
+  a schema-2 consumer keeps working; a schema-4 consumer additionally reads the
+  attribution. The attribution object always carries coverage and reconciliation keys:
+  `measuredEpochCount`, `attributedEpochCount`, `attributionComplete`,
+  `attributionError`, `reconciliationValid`, and `reconciliationError`. If any measured
+  epoch lacks spans, the attribution object is incomplete and the per-stage
+  means/remainders are explicit `null` rather than computed from a compacted subset.
+  The Metal-only evaluator substage and evaluator-reconciliation fields follow the same
+  explicit-`null` rule (present as `null` off a Metal host). See
+  [Host-stage timing attribution](#host-stage-timing-attribution---host-stage-timing).
+- **Paper high-order-complexity side** (from the paper schema 3): per sample
+  `brotliBitsPerByte`, `highOrderComplexity`. Per result: `initialBrotliBitsPerByte`,
+  `initialHighOrderComplexity`, `finalBrotliBitsPerByte`, `finalHighOrderComplexity`,
+  and `highOrderComplexityCrossings` — an array of first-crossing records shaped
+  `{complexity, crossed, observedEpoch, previousMeasuredEpoch, crossingEpochCensoring,
+  wallMsToCross, gpuMsToCross}`. The observation interval is encoded explicitly so
+  machine-readable output cannot imply the true crossing epoch is exact: the true
+  crossing lies in the half-open interval `(previousMeasuredEpoch, observedEpoch]`,
+  and `crossingEpochCensoring` is `"exact"` (every epoch in the interval was
+  measured — always the case at measurement cadence 1, or when the crossing is
+  first observed at epoch 0), `"interval"` (Brotli was measured sparsely; the true
+  crossing is somewhere in the interval but not pinpointed), or `"notCrossed"`
+  (threshold not reached by the last measurement; `observedEpoch` is `null` and
+  `previousMeasuredEpoch` holds the last measured epoch). When `--brotli` is on but
+  no `highOrderComplexity` observation exists (e.g. the linked Brotli is not 1.1.0
+  so the injected closure returns `nil`), `highOrderComplexityCrossings` is `[]` —
+  never a list of false "not crossed" records. Per config:
+  `highOrderComplexityThresholds`. **All are `null`/`[]` unless `--brotli` is on
+  and the linked Brotli is exactly 1.1.0** — the same explicit-null discipline as
+  schema 2 (keys always present; `null` = "not computed", never a fabricated 0).
+  Schema 2's key set is otherwise unchanged; `H0` itself is the already-present
+  whole-soup entropy (`initial/finalEntropyBitsPerByte`, per-sample
+  `entropyBitsPerByte`). Custom `init(from:)` on `BenchmarkConfig` and
+  `BenchmarkResult` accepts schema-2-shaped JSON missing every new Brotli/config/
+  crossing key: optional scalar metrics default to `nil`, arrays/thresholds to `[]`,
+  and no existing field's meaning is changed.
 
 **Schema 2** (from 1): entropy-kinetics fields (`initialEntropyBitsPerByte`,
 `finalEntropyBitsPerByte`, `finalDeltaH`, `finalMeanProgramEntropyBitsPerByte`,
@@ -143,6 +165,61 @@ Read all three as relative, same-alphabet, same-length signals.
   (`--signal-interval`) coincide — i.e. a subset of what a per-epoch run would compute —
   and never on an epoch where signals were not measured at all. The final epoch is always
   both, so `finalCompressionProxyRatio` is still populated when `--compression` is on.
+
+## Host-stage timing attribution (`--host-stage-timing`)
+
+`hostResidualMsPerEpoch` (epoch wall − GPU) is honest but coarse — a single lump. The
+**opt-in** `--host-stage-timing` flag decomposes the epoch wall into named host stages so
+a native run can answer *where the host time goes*, without ever changing the simulation.
+Off by default; when off, `hostStageAttribution` is `null` and `runEpoch` runs exactly as
+it does for the app/oracle (no stage clock is passed).
+
+**Two levels, no double counting.**
+
+1. **Top-level epoch stages** — measured by `SoupRunner.runEpoch` from monotonic-clock
+   boundaries taken *between* stages, so they are mutually exclusive: `mutationPairing`
+   (mutation planning + Fisher–Yates pairing), `packing` (pair packing / nested-array
+   construction), `evaluate` (the whole evaluator call), `scatter`, `counterReduction`,
+   `programMetrics` (≈ 0 in the benchmark — it runs `MetricsPolicy.disabled`), `shadow`,
+   and `digest` (the full-soup FNV-1a). The gap between the enclosing epoch wall and the
+   stage sum is the explicit signed **`unclassifiedMsPerEpoch`** remainder. The eight
+   stage means **plus** the signed remainder equal `wallMsPerEpoch` exactly. If the stage
+   sum exceeds the wall, the remainder is negative, `classifiedWallFraction` can exceed
+   1, and `reconciliationValid` is `false` with `reconciliationError` populated.
+   Instrumented aggregation requires spans for every measured epoch; mixed availability
+   is reported via `attributionComplete:false` and null measurements, never by
+   reconciling a compacted subset.
+
+2. **Evaluator substages** — a *sub*-decomposition of the single `evaluate` span,
+   reported only by an evaluator that profiles (the Metal host):
+   `evaluatorBufferAlloc`, `evaluatorUpload`, `evaluatorEncode`, `evaluatorSubmitWait`,
+   `evaluatorReadback`, and the evaluate-internal `evaluatorUnclassified` remainder. They
+   decompose the evaluate span only and are **not** added to the top-level sum — no
+   overlapping inclusive/exclusive accounting. The evaluator remainder is signed too:
+   if reported substages exceed the enclosing evaluate span,
+   `evaluatorReconciliationValid` is `false` and `evaluatorReconciliationError` is
+   populated. On a non-Metal host the CPU reference does not profile, so
+   `evaluatorProfileAvailable` is `false` and every substage/reconciliation field is an
+   explicit `null` (never a fabricated breakdown).
+
+**GPU time stays separate.** The GPU command-buffer time is retained as the existing
+`gpuMsPerEpoch` (and, in the profile, alongside the CPU substages). The submit+wait span
+is the CPU-observed wall of `commit` + `waitUntilCompleted`; it *contains* the GPU
+execution time, and the two are **never** combined — no `wait − GPU` is ever computed to
+synthesize "precise CPU work".
+
+**Cost & honesty.** The instrumentation is a handful of monotonic reads per epoch, so the
+uninstrumented and instrumented runs produce byte-for-byte identical soup, digest,
+counters, shadow results, and throughput denominators (pinned by an equivalence test).
+`instrumentationEnabled` is always present so a consumer can tell "flag off" (attribution
+`null`) from "flag on, no measured epochs" (`true`, attribution still `null`). The app
+has a parallel opt-in (`--frame-stage-timing`, `SoupScopeCore.AppFrameStageAccumulator`)
+for the app-only stages the benchmark cannot see — bounded epoch batch, snapshot creation,
+soup-buffer allocation/copy, metric-texture population/upload, render encode/submit —
+appended to the validation diagnostic; the reconciliation math is unit-tested off-Metal,
+uses the same monotonic source throughout the app shell, and surfaces invalid signed
+remainders instead of clamping. The Metal-only spans stay `null` where a frame was never
+encoded.
 
 ## Entropy kinetics
 
@@ -453,6 +530,54 @@ trajectory and is rejected under a sparse `--signal-interval`. High-order-comple
 crossings are resolved to the Brotli cadence (documented above). Interpret against the
 honest limitations: parity with cubff is **statistical**, not exact-trajectory, because
 of the `counter-pcg-v1` vs SplitMix64 RNG difference.
+
+### Combined: host-stage attribution + paper high-order complexity
+
+The two opt-in paths are fully orthogonal and may be combined in one run. Host-stage
+attribution times `runEpoch` at stage boundaries (inside the epoch wall); Brotli runs on
+the sample∩signal cadence outside the epoch wall. They never share a timer and neither
+contaminates the other's numbers:
+
+```sh
+swift run -c release bff-metal-bench \
+  --programs 131072 --seed 1 --warmup 2 --epochs 200 \
+  --init uniform --brotli --signal-interval 25 --sample-interval 25 \
+  --high-order-thresholds 1 --host-stage-timing \
+  > paper-and-stages-131k.json
+jq '.results[0] | {h0:.finalEntropyBitsPerByte, brotliBpb:.finalBrotliBitsPerByte,
+  highOrder:.finalHighOrderComplexity, cross:.highOrderComplexityCrossings,
+  attribution:.hostStageAttribution}' paper-and-stages-131k.json
+```
+
+### Host-stage timing attribution (native M4, opt-in)
+
+Decompose the epoch wall into named host stages at the sizes of interest. Instrumentation
+is opt-in and cheap; validate its overhead once against an uninstrumented baseline:
+
+```sh
+# baseline (uninstrumented) vs instrumented at 131072 — same seed/warmup/epochs
+swift run -c release bff-metal-bench --programs 131072 --seed 1 \
+  --warmup 2 --epochs 20 --shadow-sample 0 --no-samples > stage-off.json
+swift run -c release bff-metal-bench --programs 131072 --seed 1 \
+  --warmup 2 --epochs 20 --shadow-sample 0 --no-samples --host-stage-timing > stage-on.json
+
+# overhead check: instrumented wall must be within ~5% of the uninstrumented wall
+jq -s '{off:.[0].results[0].wallMsPerEpoch, on:.[1].results[0].wallMsPerEpoch,
+        overheadPct: (((.[1].results[0].wallMsPerEpoch/.[0].results[0].wallMsPerEpoch)-1)*100)}' \
+  stage-off.json stage-on.json
+
+# the attribution + reconciliation (validity/error, classified fraction, signed remainder, substages)
+jq '.results[0].hostStageAttribution' stage-on.json
+```
+
+The eight top-level stage means plus signed `unclassifiedMsPerEpoch` reconcile to
+`wallMsPerEpoch`; `reconciliationValid:false` means classified timing exceeded the
+enclosing wall. On Metal the `evaluator*` substage fields are populated and
+`evaluatorProfileAvailable` is `true`. Acceptance for the native pass: the named stages
+explain ≥ 95% of the wall **or** the remainder is explicitly reported (it always is),
+instrumentation overhead < 5% at 131072, uninstrumented wall ≤ 5% regression across the
+1K/4K/16K/65K/131K release matrix, valid JSON, empty stderr, positive GPU time, zero
+`haltUnknown`, and no thermal pressure.
 
 ### Shadow-on correctness spot checks
 

@@ -21,6 +21,14 @@ public struct AppLaunchOptions: Equatable, Sendable {
     /// Finite render/advance interval in seconds for bounded native validation;
     /// `nil` means interactive (run until the window closes).
     public var validationSeconds: Double?
+    /// Opt-in per-frame host-stage timing (`--frame-stage-timing`). Off by default. When
+    /// on, the app folds `AppFrameStageSample`s and appends an `AppFrameStageAttribution`
+    /// summary to the validation diagnostic line, including a separate soup-buffer
+    /// allocation/copy stage and signed reconciliation validity. It never changes
+    /// rendering, the soup, or the simulation — a handful of monotonic reads per frame —
+    /// and is only wired into the Metal shell (a non-Metal host produces no frames to
+    /// time).
+    public var frameStageTiming: Bool
 
     public init(seed: UInt32 = 0xB00F,
                 programCount: Int = 1_024,
@@ -28,7 +36,8 @@ public struct AppLaunchOptions: Equatable, Sendable {
                 mutationP32: UInt32 = BFF.defaultMutationP32,
                 variant: BFFVariant = .noheads,
                 shadowSampleCount: Int = 8,
-                validationSeconds: Double? = nil) {
+                validationSeconds: Double? = nil,
+                frameStageTiming: Bool = false) {
         self.seed = seed
         self.programCount = programCount
         self.stepBudget = stepBudget
@@ -36,6 +45,7 @@ public struct AppLaunchOptions: Equatable, Sendable {
         self.variant = variant
         self.shadowSampleCount = shadowSampleCount
         self.validationSeconds = validationSeconds
+        self.frameStageTiming = frameStageTiming
     }
 
     public enum ParseError: Error, Equatable, CustomStringConvertible {
@@ -69,6 +79,7 @@ public struct AppLaunchOptions: Equatable, Sendable {
       --variant noheads|bff  initial-state variant (default noheads)
       --shadow-sample N      pairs CPU-shadowed per epoch (default 8; 0 disables)
       --validation-seconds S render for S seconds then print a diagnostic and exit
+      --frame-stage-timing   opt in to per-frame host-stage timing in the diagnostic
     """
 
     /// Parse arguments (already stripped of the executable name). Recognizes the
@@ -115,6 +126,8 @@ public struct AppLaunchOptions: Equatable, Sendable {
                     throw ParseError.notANumber(flag: flag, value: raw)
                 }
                 options.validationSeconds = s
+            case "--frame-stage-timing":
+                options.frameStageTiming = true
             case "--help", "-h":
                 // Recognized but not an error; the shell prints usage and continues.
                 break

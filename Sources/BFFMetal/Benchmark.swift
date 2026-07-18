@@ -206,10 +206,16 @@ public struct EpochObservation: Sendable {
     /// Host wall spent on sampled signal/metric analysis for this epoch, measured
     /// outside the epoch execution wall. `nil` under `--no-samples` (not computed).
     public var analysisSeconds: Double?
+    /// Opt-in host-stage breakdown for this epoch's `runEpoch`, present only when the
+    /// run enabled stage instrumentation; `nil` otherwise. Its spans are all measured
+    /// *inside* `wallSeconds`, so `wallSeconds − stageBreakdown.classifiedSeconds` is the
+    /// per-epoch unclassified remainder the aggregator reconciles.
+    public var hostStageSpans: HostStageSpans?
 
     public init(epoch: Int, isWarmup: Bool, wallSeconds: Double, gpuSeconds: Double?,
                 counters: EpochCounters, shadowChecked: Int, shadowMismatches: Int,
-                signals: SoupSignals?, analysisSeconds: Double? = nil) {
+                signals: SoupSignals?, analysisSeconds: Double? = nil,
+                hostStageSpans: HostStageSpans? = nil) {
         self.epoch = epoch
         self.isWarmup = isWarmup
         self.wallSeconds = wallSeconds
@@ -219,6 +225,7 @@ public struct EpochObservation: Sendable {
         self.shadowMismatches = shadowMismatches
         self.signals = signals
         self.analysisSeconds = analysisSeconds
+        self.hostStageSpans = hostStageSpans
     }
 }
 
@@ -462,6 +469,17 @@ public struct BenchmarkResult: Sendable, Codable {
     /// "not computed", never a fabricated 0.
     public var signalAnalysisMsTotal: Double?
 
+    // Host-stage timing attribution (opt-in, schema 3)
+    /// `true` iff the run enabled host-stage timing (`--host-stage-timing`). Always
+    /// present so a consumer can distinguish "instrumentation off" (attribution `null`)
+    /// from "instrumentation on but no measured epochs" (also `null`, but this is `true`).
+    public var instrumentationEnabled: Bool
+    /// Per-stage mean ms/epoch decomposition of the epoch wall plus the explicit
+    /// unclassified remainder, over measured epochs. `null` when instrumentation was off
+    /// or there were no measured epochs to attribute. On a non-Metal host the evaluator
+    /// substage fields inside it are `null` (only the whole-evaluate span is known).
+    public var hostStageAttribution: HostStageAttribution?
+
     // Throughput (measured epochs)
     public var epochsPerSecond: Double
     public var pairsPerSecond: Double
@@ -525,7 +543,10 @@ public struct BenchmarkResult: Sendable, Codable {
 /// so the key is ALWAYS written. `encodeIfPresent` (the synthesized default) would drop
 /// the key entirely; a stable machine-readable schema requires every documented field
 /// to appear on every run, `null` standing for "unavailable / not computed".
-private extension KeyedEncodingContainer {
+///
+/// Internal (not private) so the host-stage attribution encoder in
+/// `HostStageTiming.swift` shares exactly this explicit-null convention.
+extension KeyedEncodingContainer {
     mutating func encodeOrNull<T: Encodable>(_ value: T?, forKey key: Key) throws {
         if let value { try encode(value, forKey: key) }
         else { try encodeNil(forKey: key) }
@@ -615,7 +636,8 @@ extension BenchmarkResult {
     enum CodingKeys: String, CodingKey {
         case config, deviceName, rngContractID, warmupEpochs, measuredEpochs,
              gpuTimingAvailable, wallMsPerEpoch, gpuMsPerEpoch, hostResidualMsPerEpoch,
-             gpuBusyFraction, signalAnalysisMsTotal, epochsPerSecond, pairsPerSecond,
+             gpuBusyFraction, signalAnalysisMsTotal,
+             instrumentationEnabled, hostStageAttribution, epochsPerSecond, pairsPerSecond,
              rawStepsPerSecond, commandStepsPerSecond, totalPairs, totalRawSteps,
              totalCommandSteps, totalCopyWrites, haltBudget, haltPCOut, haltUnmatched,
              haltUnknown, signalsAnalyzed, initialEntropyBitsPerByte,
@@ -639,6 +661,8 @@ extension BenchmarkResult {
         try c.encodeOrNull(hostResidualMsPerEpoch, forKey: .hostResidualMsPerEpoch)
         try c.encodeOrNull(gpuBusyFraction, forKey: .gpuBusyFraction)
         try c.encodeOrNull(signalAnalysisMsTotal, forKey: .signalAnalysisMsTotal)
+        try c.encode(instrumentationEnabled, forKey: .instrumentationEnabled)
+        try c.encodeOrNull(hostStageAttribution, forKey: .hostStageAttribution)
         try c.encode(epochsPerSecond, forKey: .epochsPerSecond)
         try c.encode(pairsPerSecond, forKey: .pairsPerSecond)
         try c.encode(rawStepsPerSecond, forKey: .rawStepsPerSecond)
@@ -680,6 +704,15 @@ extension BenchmarkResult {
     /// without altering any existing field's meaning. Existing schema-2 keys are
     /// decoded strictly; `thresholdCrossings`/`samples` tolerate absence (default
     /// `[]`) for trimmed snapshots but their element semantics are unchanged.
+    ///
+    /// Schema 4 composes the two predecessor schema-3 shapes (host-attribution and
+    /// paper). This decoder also accepts *either* predecessor schema-3 shape:
+    /// `instrumentationEnabled` defaults to `false` when absent (paper schema-3 and
+    /// schema-2 JSON never carried it), and `hostStageAttribution` defaults to `nil`
+    /// (it is an explicit null only under `--host-stage-timing`). The Brotli keys
+    /// above default the same way for host-attribution schema-3 and schema-2 JSON.
+    /// So a document from either predecessor decodes losslessly into a schema-4
+    /// `BenchmarkResult`, the absent side surfaced as "off / not computed".
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         config = try c.decode(BenchmarkConfig.self, forKey: .config)
@@ -693,6 +726,10 @@ extension BenchmarkResult {
         hostResidualMsPerEpoch = try c.decodeIfPresent(Double.self, forKey: .hostResidualMsPerEpoch)
         gpuBusyFraction = try c.decodeIfPresent(Double.self, forKey: .gpuBusyFraction)
         signalAnalysisMsTotal = try c.decodeIfPresent(Double.self, forKey: .signalAnalysisMsTotal)
+        // Host-attribution keys (schema 3 host / schema 4). Absent in schema 2 and
+        // the paper schema-3 shape — default to "off" / nil so those decode too.
+        instrumentationEnabled = try c.decodeIfPresent(Bool.self, forKey: .instrumentationEnabled) ?? false
+        hostStageAttribution = try c.decodeIfPresent(HostStageAttribution.self, forKey: .hostStageAttribution)
         epochsPerSecond = try c.decode(Double.self, forKey: .epochsPerSecond)
         pairsPerSecond = try c.decode(Double.self, forKey: .pairsPerSecond)
         rawStepsPerSecond = try c.decode(Double.self, forKey: .rawStepsPerSecond)
@@ -750,7 +787,8 @@ public enum BenchmarkAggregator {
                                  observations: [EpochObservation],
                                  finalDigestHex: String,
                                  maxRSSBytes: Int?,
-                                 initialAnalysisSeconds: Double? = nil) -> BenchmarkResult {
+                                 initialAnalysisSeconds: Double? = nil,
+                                 instrumentationEnabled: Bool = false) -> BenchmarkResult {
         // Signal analysis is "available" (kinetics were computed) when we have the
         // epoch-0 reference and at least one epoch carries signals — i.e. it was not
         // skipped by `--no-samples`. The dense default (`--signal-interval 1`) measures
@@ -884,6 +922,14 @@ public enum BenchmarkAggregator {
         let shadowChecked = observations.reduce(0) { $0 + $1.shadowChecked }
         let shadowMismatch = observations.reduce(0) { $0 + $1.shadowMismatches }
 
+        // --- Host-stage attribution (opt-in, measured epochs only) ---
+        // Built from every measured epoch when instrumentation is enabled. Missing spans
+        // produce a stable incomplete attribution object rather than compacting a subset
+        // and reconciling it against the all-epoch wall.
+        let stageMeasured: [(wallSeconds: Double, spans: HostStageSpans?)] =
+            instrumentationEnabled ? measured.map { ($0.wallSeconds, $0.hostStageSpans) } : []
+        let hostStageAttribution = HostStageAttribution.aggregate(measured: stageMeasured)
+
         return BenchmarkResult(
             config: config,
             deviceName: deviceName,
@@ -896,6 +942,8 @@ public enum BenchmarkAggregator {
             hostResidualMsPerEpoch: hostResidualMsPerEpoch,
             gpuBusyFraction: gpuBusyFraction,
             signalAnalysisMsTotal: signalAnalysisMsTotal,
+            instrumentationEnabled: instrumentationEnabled,
+            hostStageAttribution: hostStageAttribution,
             epochsPerSecond: epochsPerSecond,
             pairsPerSecond: perSec(totalPairs),
             rawStepsPerSecond: perSec(totalRaw),
