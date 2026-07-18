@@ -642,7 +642,7 @@ public final class ResidentMetalEpochRunner {
             guard let blit = cb.makeBlitCommandEncoder() else {
                 throw RunnerError.commandEncodingFailed("mutate counter fill")
             }
-            blit.fill(buffer: countersBuffer, range: 0..<bufferSizes.countersBytes, value: 0)
+            blit.fill(buffer: self.countersBuffer, range: 0..<self.bufferSizes.countersBytes, value: 0)
             blit.endEncoding()
         } encode: { enc in
             enc.setComputePipelineState(mutatePipeline)
@@ -675,8 +675,8 @@ public final class ResidentMetalEpochRunner {
             guard let blit = cb.makeBlitCommandEncoder() else {
                 throw RunnerError.commandEncodingFailed("eval activity fill")
             }
-            blit.fill(buffer: activityBuffer, range: 0..<bufferSizes.programActivityBytes, value: 0)
-            blit.fill(buffer: resultBuffer, range: 0..<bufferSizes.pairResultBytes, value: 0)
+            blit.fill(buffer: self.activityBuffer, range: 0..<self.bufferSizes.programActivityBytes, value: 0)
+            blit.fill(buffer: self.resultBuffer, range: 0..<self.bufferSizes.pairResultBytes, value: 0)
             blit.endEncoding()
         } encode: { enc in
             enc.setComputePipelineState(evalScatterPipeline)
