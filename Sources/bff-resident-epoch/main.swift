@@ -152,7 +152,7 @@ while cursor < args.count {
 
 guard epochs >= 0 else { fail("epochs must be >= 0", exitCode: usageExit) }
 
-func makeConfig(seed: UInt32, programs: Int, epochs _: Int,
+@MainActor func makeConfig(seed: UInt32, programs: Int, epochs _: Int,
                 checkpoint: Int? = nil, capture: Bool? = nil,
                 shadowOverride: Int? = nil, overrideShadow: Bool = false,
                 visualize: Bool? = nil) -> ResidentEpochConfig {
@@ -259,7 +259,7 @@ func runNative(config: ResidentEpochConfig, epochs: Int, seed: UInt32,
     return mismatchCount
 }
 
-func runValidation() throws -> Int {
+@MainActor func runValidation() throws -> Int {
     switch validationMode {
     case .none:
         var total = 0
