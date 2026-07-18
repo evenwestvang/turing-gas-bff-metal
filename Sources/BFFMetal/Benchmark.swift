@@ -581,11 +581,11 @@ public enum BenchmarkAggregator {
         let shadowMismatch = observations.reduce(0) { $0 + $1.shadowMismatches }
 
         // --- Host-stage attribution (opt-in, measured epochs only) ---
-        // Built only from measured epochs that carry a stage breakdown. The remainder
-        // reconciles against the same measured epoch wall used for throughput, so the
-        // attribution and the headline `wallMsPerEpoch` describe the same interval.
-        let stageMeasured: [(wallSeconds: Double, spans: HostStageSpans)] =
-            measured.compactMap { o in o.hostStageSpans.map { (o.wallSeconds, $0) } }
+        // Built from every measured epoch when instrumentation is enabled. Missing spans
+        // produce a stable incomplete attribution object rather than compacting a subset
+        // and reconciling it against the all-epoch wall.
+        let stageMeasured: [(wallSeconds: Double, spans: HostStageSpans?)] =
+            instrumentationEnabled ? measured.map { ($0.wallSeconds, $0.hostStageSpans) } : []
         let hostStageAttribution = HostStageAttribution.aggregate(measured: stageMeasured)
 
         return BenchmarkResult(

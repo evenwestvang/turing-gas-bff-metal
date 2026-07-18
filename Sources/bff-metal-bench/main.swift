@@ -176,12 +176,15 @@ while cursor < arguments.count {
           --host-stage-timing     opt in to bounded host-stage timing attribution: time
                                   each epoch's runEpoch at stage boundaries (mutation+
                                   pairing, packing, evaluate, scatter, counters, program
-                                  metrics, shadow, digest) plus a named unclassified
-                                  remainder, emitted as `hostStageAttribution`. Off by
+                                  metrics, shadow, digest) plus a named signed
+                                  unclassified remainder and reconciliation validity,
+                                  emitted as `hostStageAttribution`. Off by
                                   default; never changes the soup/RNG/counters/digest or
                                   the reported throughput. Metal evaluator substages
                                   (buffer alloc/upload/encode/submit+wait/readback) are
-                                  populated only on a Metal host; null otherwise.
+                                  populated only on a Metal host; null otherwise. Mixed
+                                  measured span availability is surfaced as incomplete
+                                  attribution, never compacted silently.
           --allow-missing-gpu-timing  exit 0 even if GPU timestamps are unavailable
         Seeds are strict unsigned decimals in 0...\(UInt32.max); malformed/overflowing
         tokens are a usage error (exit \(BenchmarkExitCode.usage)), never truncated.

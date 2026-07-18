@@ -23,9 +23,11 @@ public struct AppLaunchOptions: Equatable, Sendable {
     public var validationSeconds: Double?
     /// Opt-in per-frame host-stage timing (`--frame-stage-timing`). Off by default. When
     /// on, the app folds `AppFrameStageSample`s and appends an `AppFrameStageAttribution`
-    /// summary to the validation diagnostic line. It never changes rendering, the soup,
-    /// or the simulation — a handful of monotonic reads per frame — and is only wired
-    /// into the Metal shell (a non-Metal host produces no frames to time).
+    /// summary to the validation diagnostic line, including a separate soup-buffer
+    /// allocation/copy stage and signed reconciliation validity. It never changes
+    /// rendering, the soup, or the simulation — a handful of monotonic reads per frame —
+    /// and is only wired into the Metal shell (a non-Metal host produces no frames to
+    /// time).
     public var frameStageTiming: Bool
 
     public init(seed: UInt32 = 0xB00F,

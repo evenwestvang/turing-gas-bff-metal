@@ -46,12 +46,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         if appModel.validationFinished { return }
 
         // Opt-in per-frame host-stage timing: measure the frame wall and the Metal-only
-        // spans (metric-texture population/upload, render encode+submit) here where they
-        // are technically measurable, then fold them with the epoch-batch/snapshot spans
-        // `stepFrame` measured. All reads are gated on the flag, so the default frame
-        // path takes no clock and is unchanged.
+        // spans (soup-buffer allocation/copy, metric-texture population/upload, render
+        // encode+submit) here where they are technically measurable, then fold them with
+        // the epoch-batch/snapshot spans `stepFrame` measured. All reads are gated on the
+        // flag, so the default frame path takes no clock and is unchanged.
         let timing = appModel.frameStageTimingEnabled
-        let frameStart = timing ? CFAbsoluteTimeGetCurrent() : 0
+        let frameStart = timing ? AppMonotonicClock.nowSeconds() : 0
+        var soupBufferSeconds: Double? = nil
         var metricTextureSeconds: Double? = nil
         var renderSubmitSeconds: Double? = nil
 
@@ -64,12 +65,16 @@ final class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
-        let encodeStart = timing ? CFAbsoluteTimeGetCurrent() : 0
-        if let snapshot, let soupBuffer = makeSoupBuffer(snapshot) {
-            let texStart = timing ? CFAbsoluteTimeGetCurrent() : 0
+        let encodeStart = timing ? AppMonotonicClock.nowSeconds() : 0
+        if let snapshot {
+            let soupStart = timing ? AppMonotonicClock.nowSeconds() : 0
+            let soupBuffer = makeSoupBuffer(snapshot)
+            if timing { soupBufferSeconds = AppMonotonicClock.nowSeconds() - soupStart }
+
+            let texStart = timing ? AppMonotonicClock.nowSeconds() : 0
             let metricTexture = makeMetricTexture(snapshot)
-            if timing { metricTextureSeconds = CFAbsoluteTimeGetCurrent() - texStart }
-            if let metricTexture {
+            if timing { metricTextureSeconds = AppMonotonicClock.nowSeconds() - texStart }
+            if let soupBuffer, let metricTexture {
                 var uniforms = appModel.makeUniforms()
                 encoder.setRenderPipelineState(context.renderPipeline)
                 encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VizUniforms>.stride, index: 0)
@@ -95,11 +100,13 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         if timing {
             // Render encode + submit span: from encoder construction through commit,
-            // minus the metric-texture population already attributed to its own stage.
-            let submit = CFAbsoluteTimeGetCurrent() - encodeStart - (metricTextureSeconds ?? 0)
-            renderSubmitSeconds = max(0, submit)
+            // minus soup-buffer and metric-texture work already attributed to their own
+            // stages, so the app-frame stages are non-overlapping.
+            renderSubmitSeconds = AppMonotonicClock.nowSeconds() - encodeStart
+                - (soupBufferSeconds ?? 0) - (metricTextureSeconds ?? 0)
             appModel.recordFrameStages(
-                frameSeconds: CFAbsoluteTimeGetCurrent() - frameStart,
+                frameSeconds: AppMonotonicClock.nowSeconds() - frameStart,
+                soupBufferSeconds: soupBufferSeconds,
                 metricTextureSeconds: metricTextureSeconds,
                 renderSubmitSeconds: renderSubmitSeconds)
         }

@@ -127,29 +127,91 @@ final class HostStageTimingTests: XCTestCase {
         let a = try XCTUnwrap(HostStageAttribution.aggregate(
             measured: [(wallSeconds: 1.0, spans: s), (wallSeconds: 1.0, spans: s)]))
 
-        XCTAssertEqual(a.mutationPairingMsPerEpoch, 100, accuracy: 1e-9)
-        XCTAssertEqual(a.evaluateMsPerEpoch, 300, accuracy: 1e-9)
-        XCTAssertEqual(a.digestMsPerEpoch, 50, accuracy: 1e-9)
-        XCTAssertEqual(a.unclassifiedMsPerEpoch, 250, accuracy: 1e-6)  // (1.0-0.75)*1000
+        XCTAssertTrue(a.attributionComplete)
+        XCTAssertEqual(a.measuredEpochCount, 2)
+        XCTAssertEqual(a.attributedEpochCount, 2)
+        XCTAssertNil(a.attributionError)
+        XCTAssertEqual(a.mutationPairingMsPerEpoch!, 100, accuracy: 1e-9)
+        XCTAssertEqual(a.evaluateMsPerEpoch!, 300, accuracy: 1e-9)
+        XCTAssertEqual(a.digestMsPerEpoch!, 50, accuracy: 1e-9)
+        XCTAssertEqual(a.unclassifiedMsPerEpoch!, 250, accuracy: 1e-6)  // (1.0-0.75)*1000
 
-        let sumStages = a.mutationPairingMsPerEpoch + a.packingMsPerEpoch
-            + a.evaluateMsPerEpoch + a.scatterMsPerEpoch + a.counterReductionMsPerEpoch
-            + a.programMetricsMsPerEpoch + a.shadowMsPerEpoch + a.digestMsPerEpoch
-        XCTAssertEqual(sumStages + a.unclassifiedMsPerEpoch, 1000, accuracy: 1e-6,
+        let sumStages = a.mutationPairingMsPerEpoch! + a.packingMsPerEpoch!
+            + a.evaluateMsPerEpoch! + a.scatterMsPerEpoch! + a.counterReductionMsPerEpoch!
+            + a.programMetricsMsPerEpoch! + a.shadowMsPerEpoch! + a.digestMsPerEpoch!
+        XCTAssertEqual(sumStages + a.unclassifiedMsPerEpoch!, 1000, accuracy: 1e-6,
                        "stage means + remainder == mean epoch wall")
-        XCTAssertEqual(a.classifiedWallFraction, 0.75, accuracy: 1e-9)
+        XCTAssertEqual(a.classifiedWallFraction!, 0.75, accuracy: 1e-9)
+        XCTAssertTrue(a.reconciliationValid)
+        XCTAssertNil(a.reconciliationError)
         XCTAssertFalse(a.evaluatorProfileAvailable, "no evaluator profile present")
         XCTAssertNil(a.evaluatorBufferAllocMsPerEpoch)
         XCTAssertNil(a.evaluatorUnclassifiedMsPerEpoch)
+        XCTAssertNil(a.evaluatorReconciliationValid)
+        XCTAssertNil(a.evaluatorReconciliationError)
     }
 
-    /// A negative remainder can never be produced: even if a stage sum exceeds the wall
-    /// (a non-monotone synthetic clock), the remainder clamps at 0.
-    func testAttributionRemainderClampsAtZero() throws {
+    /// If classified stages exceed the measured wall, the signed remainder goes
+    /// negative and the stable reconciliation fields surface the invalid timing.
+    func testAttributionRemainderIsSignedWhenClassifiedExceedsWall() throws {
         let s = spans(mut: 0.6, pack: 0.6, eval: 0.6, scat: 0, counter: 0,
                       metrics: 0, shadow: 0, digest: 0)             // classified 1.8
         let a = try XCTUnwrap(HostStageAttribution.aggregate(measured: [(wallSeconds: 1.0, spans: s)]))
-        XCTAssertEqual(a.unclassifiedMsPerEpoch, 0, "never negative")
+        XCTAssertEqual(a.unclassifiedMsPerEpoch!, -800, accuracy: 1e-9)
+        XCTAssertEqual(a.classifiedWallFraction!, 1.8, accuracy: 1e-9)
+        XCTAssertFalse(a.reconciliationValid)
+        XCTAssertNotNil(a.reconciliationError)
+        XCTAssertEqual((a.mutationPairingMsPerEpoch! + a.packingMsPerEpoch!
+                        + a.evaluateMsPerEpoch! + a.unclassifiedMsPerEpoch!),
+                       1000, accuracy: 1e-9)
+    }
+
+    /// Instrumented attribution requires every measured epoch to carry spans. A mixed
+    /// set is surfaced as incomplete with stable null measurements, never compacted into
+    /// a subset that reconciles against the all-epoch wall.
+    func testAttributionSurfacesIncompleteMeasuredSpans() throws {
+        let s = spans(mut: 0.1, pack: 0.1, eval: 0.2, scat: 0, counter: 0,
+                      metrics: 0, shadow: 0, digest: 0)
+        let a = try XCTUnwrap(HostStageAttribution.aggregate(
+            measured: [(wallSeconds: 1.0, spans: s), (wallSeconds: 1.0, spans: nil)]))
+        XCTAssertFalse(a.attributionComplete)
+        XCTAssertEqual(a.measuredEpochCount, 2)
+        XCTAssertEqual(a.attributedEpochCount, 1)
+        XCTAssertNotNil(a.attributionError)
+        XCTAssertFalse(a.reconciliationValid)
+        XCTAssertNotNil(a.reconciliationError)
+        XCTAssertNil(a.mutationPairingMsPerEpoch)
+        XCTAssertNil(a.unclassifiedMsPerEpoch)
+        XCTAssertNil(a.classifiedWallFraction)
+    }
+
+    func testAggregatorDoesNotCompactMixedMeasuredSpanAvailability() throws {
+        let one = GPUPairOutcome(finalTape: [UInt8](repeating: 0, count: BFF.pairTapeSize),
+                                 steps: 10, noopSteps: 2, copyWrites: 1, loopOps: 0,
+                                 halt: UInt32(HaltReason.budget.rawValue))
+        let counters = EpochCounters.reduce(epoch: 1, mutationCount: 0, outcomes: [one])
+        let s = spans(mut: 0.1, pack: 0.1, eval: 0.2, scat: 0, counter: 0,
+                      metrics: 0, shadow: 0, digest: 0)
+        let observations = [
+            EpochObservation(epoch: 1, isWarmup: false, wallSeconds: 1.0,
+                             gpuSeconds: nil, counters: counters, shadowChecked: 0,
+                             shadowMismatches: 0, signals: nil, hostStageSpans: s),
+            EpochObservation(epoch: 2, isWarmup: false, wallSeconds: 1.0,
+                             gpuSeconds: nil, counters: counters, shadowChecked: 0,
+                             shadowMismatches: 0, signals: nil, hostStageSpans: nil)
+        ]
+        let cfg = BenchmarkConfig(seed: 1, programCount: 2, warmupEpochs: 0,
+                                  measuredEpochs: 2)
+        let result = BenchmarkAggregator.aggregate(
+            config: cfg, deviceName: nil, initialSignals: nil, observations: observations,
+            finalDigestHex: "00", maxRSSBytes: nil, instrumentationEnabled: true)
+
+        let a = try XCTUnwrap(result.hostStageAttribution)
+        XCTAssertFalse(a.attributionComplete)
+        XCTAssertEqual(a.measuredEpochCount, 2)
+        XCTAssertEqual(a.attributedEpochCount, 1)
+        XCTAssertNil(a.mutationPairingMsPerEpoch)
+        XCTAssertNil(a.unclassifiedMsPerEpoch)
     }
 
     /// Evaluator substages are reported only when EVERY measured epoch carried a profile;
@@ -171,6 +233,8 @@ final class HostStageTimingTests: XCTestCase {
         XCTAssertEqual(all.evaluatorSubmitWaitMsPerEpoch!, 150, accuracy: 1e-9)
         // evaluate 300 ms − (20+30+50+150+40)=290 => 10 ms unclassified inside evaluate.
         XCTAssertEqual(all.evaluatorUnclassifiedMsPerEpoch!, 10, accuracy: 1e-6)
+        XCTAssertEqual(all.evaluatorReconciliationValid, true)
+        XCTAssertNil(all.evaluatorReconciliationError)
 
         // Mixed: one epoch lacks a profile -> not available, substage means nil.
         let mixed = try XCTUnwrap(HostStageAttribution.aggregate(
@@ -178,6 +242,23 @@ final class HostStageTimingTests: XCTestCase {
         XCTAssertFalse(mixed.evaluatorProfileAvailable)
         XCTAssertNil(mixed.evaluatorBufferAllocMsPerEpoch)
         XCTAssertNil(mixed.evaluatorUnclassifiedMsPerEpoch)
+        XCTAssertNil(mixed.evaluatorReconciliationValid)
+    }
+
+    /// Evaluator substages that exceed the enclosing evaluate span are not masked; the
+    /// signed evaluator remainder goes negative and the evaluator reconciliation fields
+    /// carry the error.
+    func testEvaluatorSubstageOverrunIsSurfaced() throws {
+        let profile = EvaluatorStageProfile(
+            bufferAllocSeconds: 0.10, uploadSeconds: 0.10, encodeSeconds: 0.10,
+            submitWaitSeconds: 0.10, readbackSeconds: 0.10)
+        let s = spans(mut: 0.05, pack: 0.05, eval: 0.30, scat: 0.02, counter: 0.02,
+                      metrics: 0, shadow: 0, digest: 0.01, profile: profile)
+        let a = try XCTUnwrap(HostStageAttribution.aggregate(measured: [(wallSeconds: 0.6, spans: s)]))
+        XCTAssertTrue(a.evaluatorProfileAvailable)
+        XCTAssertEqual(a.evaluatorUnclassifiedMsPerEpoch!, -200, accuracy: 1e-9)
+        XCTAssertEqual(a.evaluatorReconciliationValid, false)
+        XCTAssertNotNil(a.evaluatorReconciliationError)
     }
 
     /// The retained GPU command-buffer time is separate from the CPU submit+wait span and
@@ -214,14 +295,15 @@ final class HostStageTimingTests: XCTestCase {
 
         XCTAssertTrue(r.instrumentationEnabled)
         let a = try XCTUnwrap(r.hostStageAttribution)
-        let sum = a.mutationPairingMsPerEpoch + a.packingMsPerEpoch + a.evaluateMsPerEpoch
-            + a.scatterMsPerEpoch + a.counterReductionMsPerEpoch
-            + a.programMetricsMsPerEpoch + a.shadowMsPerEpoch + a.digestMsPerEpoch
-        XCTAssertEqual(sum + a.unclassifiedMsPerEpoch, r.wallMsPerEpoch, accuracy: 1e-6,
+        let sum = a.mutationPairingMsPerEpoch! + a.packingMsPerEpoch! + a.evaluateMsPerEpoch!
+            + a.scatterMsPerEpoch! + a.counterReductionMsPerEpoch!
+            + a.programMetricsMsPerEpoch! + a.shadowMsPerEpoch! + a.digestMsPerEpoch!
+        XCTAssertEqual(sum + a.unclassifiedMsPerEpoch!, r.wallMsPerEpoch, accuracy: 1e-6,
                        "attribution reconciles to the measured epoch wall")
-        XCTAssertGreaterThanOrEqual(a.unclassifiedMsPerEpoch, 0)
-        XCTAssertGreaterThanOrEqual(a.classifiedWallFraction, 0)
-        XCTAssertLessThanOrEqual(a.classifiedWallFraction, 1)
+        XCTAssertTrue(a.reconciliationValid)
+        XCTAssertNil(a.reconciliationError)
+        XCTAssertGreaterThanOrEqual(a.unclassifiedMsPerEpoch!, 0)
+        XCTAssertGreaterThanOrEqual(a.classifiedWallFraction!, 0)
         XCTAssertFalse(a.evaluatorProfileAvailable, "CPU reference has no substages")
         XCTAssertNil(a.evaluatorSubmitWaitMsPerEpoch)
     }
@@ -297,7 +379,7 @@ final class HostStageTimingTests: XCTestCase {
         let subSum = a.evaluatorBufferAllocMsPerEpoch! + a.evaluatorUploadMsPerEpoch!
             + a.evaluatorEncodeMsPerEpoch! + a.evaluatorSubmitWaitMsPerEpoch!
             + a.evaluatorReadbackMsPerEpoch!
-        XCTAssertLessThanOrEqual(subSum, a.evaluateMsPerEpoch + 1e-6)
+        XCTAssertLessThanOrEqual(subSum, a.evaluateMsPerEpoch! + 1e-6)
         XCTAssertGreaterThan(subSum, 0)
     }
 
@@ -349,9 +431,18 @@ final class HostStageTimingTests: XCTestCase {
                     "\"counterReductionMsPerEpoch\"", "\"programMetricsMsPerEpoch\"",
                     "\"shadowMsPerEpoch\"", "\"digestMsPerEpoch\"",
                     "\"unclassifiedMsPerEpoch\"", "\"classifiedWallFraction\"",
-                    "\"evaluatorProfileAvailable\""] {
+                    "\"reconciliationValid\"", "\"reconciliationError\"",
+                    "\"measuredEpochCount\"", "\"attributedEpochCount\"",
+                    "\"attributionComplete\"", "\"attributionError\"",
+                    "\"evaluatorProfileAvailable\"",
+                    "\"evaluatorReconciliationValid\"",
+                    "\"evaluatorReconciliationError\""] {
             XCTAssertTrue(json.contains(key), "missing \(key)")
         }
+        XCTAssertTrue(json.contains("\"attributionComplete\":true"))
+        XCTAssertTrue(json.contains("\"attributionError\":null"))
+        XCTAssertTrue(json.contains("\"reconciliationValid\":true"))
+        XCTAssertTrue(json.contains("\"reconciliationError\":null"))
         // CPU evaluator: substage fields present as explicit nulls, availability false.
         XCTAssertTrue(json.contains("\"evaluatorProfileAvailable\":false"))
         for nullKey in ["\"evaluatorBufferAllocMsPerEpoch\":null",
@@ -359,7 +450,9 @@ final class HostStageTimingTests: XCTestCase {
                         "\"evaluatorEncodeMsPerEpoch\":null",
                         "\"evaluatorSubmitWaitMsPerEpoch\":null",
                         "\"evaluatorReadbackMsPerEpoch\":null",
-                        "\"evaluatorUnclassifiedMsPerEpoch\":null"] {
+                        "\"evaluatorUnclassifiedMsPerEpoch\":null",
+                        "\"evaluatorReconciliationValid\":null",
+                        "\"evaluatorReconciliationError\":null"] {
             XCTAssertTrue(json.contains(nullKey), "expected explicit \(nullKey)")
         }
 

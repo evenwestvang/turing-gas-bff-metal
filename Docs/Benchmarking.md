@@ -15,7 +15,7 @@ Everything here uses the full **8192-step** budget by default, exactly as produc
 | **GPU ms/epoch** | `MTLCommandBuffer.gpuEndTime − gpuStartTime` | *Command-buffer* GPU time, one command buffer per epoch. Not a per-kernel or per-encoder breakdown, not a CPU profile. `nil` (and the run fails, exit 3) if the hardware reports no usable timestamp. |
 | **Epoch wall ms/epoch** (`wallMsPerEpoch`) | monotonic clock **strictly enclosing `runEpoch`** | The epoch execution wall, and the sole basis for raw simulation throughput. It encloses mutation, pairing, packing, GPU dispatch + wait + readback, scatter, counter reduction, the post-epoch FNV-1a digest, and the CPU shadow (if on). The benchmark runs `runEpoch` with **per-program metric collection disabled** (`MetricsPolicy.disabled`), so the per-program entropy/activity scan is **not** in this wall — in raw mode it is not computed at all, and in kinetics mode per-program entropy comes from the external `SoupSignals.measure` timed separately (below). The digest is the one unavoidable O(N) pass inside the wall; counters are O(pairs). |
 | **Host residual ms/epoch** | `epoch wall − GPU` | *Everything in the epoch wall that is not GPU command-buffer time.* An attribution, **not** a CPU profiler: it is a single lump and does **not** isolate planning, allocation, marshalling, encode, readback, scatter, counter/program-metric reduction, the shadow, or queue latency. The **opt-in** `--host-stage-timing` decomposes exactly this wall into named stages (below). |
-| **Host-stage attribution** (`hostStageAttribution`) | monotonic clock at stage boundaries **inside** `runEpoch` | Opt-in (`--host-stage-timing`). Decomposes the epoch wall into eight mutually-exclusive host stages plus an explicit `unclassifiedMsPerEpoch` remainder; the sum reconciles to `wallMsPerEpoch`. On a Metal host the `evaluate` stage further carries the evaluator substages (buffer alloc / upload / encode / submit+wait / readback); off-Metal those are `null` (only the whole-evaluate span is known). `null` unless the flag is given. It never changes the soup/RNG/counters/digest or the throughput numbers — a handful of clock reads per epoch. |
+| **Host-stage attribution** (`hostStageAttribution`) | monotonic clock at stage boundaries **inside** `runEpoch` | Opt-in (`--host-stage-timing`). Decomposes the epoch wall into eight mutually-exclusive host stages plus an explicit signed `unclassifiedMsPerEpoch` remainder; the stage sum plus remainder reconciles to `wallMsPerEpoch`. If classified stages exceed the enclosing wall, the remainder is negative and `reconciliationValid` / `reconciliationError` surface the invalid timing. On a Metal host the `evaluate` stage further carries evaluator substages (buffer alloc / upload / encode / submit+wait / readback); off-Metal those are `null` (only the whole-evaluate span is known). `null` unless the flag is given. It never changes the soup/RNG/counters/digest or the throughput numbers — a handful of clock reads per epoch. |
 | **Signal analysis ms (total)** (`signalAnalysisMsTotal`) | monotonic clock around `SoupSignals.measure`, **outside** the epoch wall | Host analysis cost of the sampled entropy/transition/LZ metrics. Whole-run total. **`null` under `--no-samples`** — that mode computes no signals, so there is nothing to time (honest "not computed", never a fabricated 0). |
 | epochs/s, pairs/s, raw/command steps/s | measured epochs ÷ measured **epoch** wall | Warmup epochs excluded; signal analysis never mixed in. |
 | halt buckets, copy writes | `EpochCounters` reduced from the GPU records | The existing science counters, summed over measured epochs. Reduced inside `runEpoch`, so part of the epoch wall. |
@@ -26,10 +26,15 @@ diagnostics and warnings go to stderr. One `results[]` entry per matrix cell. Pi
 
 **Schema 3** (from 2): adds `instrumentationEnabled` (always-present bool — was
 `--host-stage-timing` on?) and the opt-in `hostStageAttribution` object (an explicit
-JSON `null` unless the flag is given). Every schema-2 key is preserved unchanged, so a
-schema-2 consumer keeps working; a schema-3 consumer additionally reads the attribution.
-The attribution object's Metal-only evaluator substage fields follow the same
-explicit-`null` rule (present as `null` off a Metal host). See
+JSON `null` unless the flag is given and there are measured epochs). Every schema-2 key
+is preserved unchanged, so a schema-2 consumer keeps working; a schema-3 consumer
+additionally reads the attribution. The attribution object always carries coverage and
+reconciliation keys: `measuredEpochCount`, `attributedEpochCount`,
+`attributionComplete`, `attributionError`, `reconciliationValid`, and
+`reconciliationError`. If any measured epoch lacks spans, the attribution object is
+incomplete and the per-stage means/remainders are explicit `null` rather than computed
+from a compacted subset. The Metal-only evaluator substage and evaluator-reconciliation
+fields follow the same explicit-`null` rule (present as `null` off a Metal host). See
 [Host-stage timing attribution](#host-stage-timing-attribution--host-stage-timing).
 
 **Schema 2** (from 1): entropy-kinetics fields (`initialEntropyBitsPerByte`,
@@ -134,19 +139,25 @@ it does for the app/oracle (no stage clock is passed).
    (mutation planning + Fisher–Yates pairing), `packing` (pair packing / nested-array
    construction), `evaluate` (the whole evaluator call), `scatter`, `counterReduction`,
    `programMetrics` (≈ 0 in the benchmark — it runs `MetricsPolicy.disabled`), `shadow`,
-   and `digest` (the full-soup FNV-1a). Their sum is ≤ the epoch wall the benchmark
-   measures around the whole call; the gap is the explicit **`unclassifiedMsPerEpoch`**
-   remainder (clock-read overhead + the soup commit + report construction). The eight
-   stage means **plus** the remainder equal `wallMsPerEpoch` exactly, and
-   `classifiedWallFraction` is the share the named stages explain.
+   and `digest` (the full-soup FNV-1a). The gap between the enclosing epoch wall and the
+   stage sum is the explicit signed **`unclassifiedMsPerEpoch`** remainder. The eight
+   stage means **plus** the signed remainder equal `wallMsPerEpoch` exactly. If the stage
+   sum exceeds the wall, the remainder is negative, `classifiedWallFraction` can exceed
+   1, and `reconciliationValid` is `false` with `reconciliationError` populated.
+   Instrumented aggregation requires spans for every measured epoch; mixed availability
+   is reported via `attributionComplete:false` and null measurements, never by
+   reconciling a compacted subset.
 
 2. **Evaluator substages** — a *sub*-decomposition of the single `evaluate` span,
    reported only by an evaluator that profiles (the Metal host):
    `evaluatorBufferAlloc`, `evaluatorUpload`, `evaluatorEncode`, `evaluatorSubmitWait`,
    `evaluatorReadback`, and the evaluate-internal `evaluatorUnclassified` remainder. They
    decompose the evaluate span only and are **not** added to the top-level sum — no
-   overlapping inclusive/exclusive accounting. On a non-Metal host the CPU reference does
-   not profile, so `evaluatorProfileAvailable` is `false` and every substage field is an
+   overlapping inclusive/exclusive accounting. The evaluator remainder is signed too:
+   if reported substages exceed the enclosing evaluate span,
+   `evaluatorReconciliationValid` is `false` and `evaluatorReconciliationError` is
+   populated. On a non-Metal host the CPU reference does not profile, so
+   `evaluatorProfileAvailable` is `false` and every substage/reconciliation field is an
    explicit `null` (never a fabricated breakdown).
 
 **GPU time stays separate.** The GPU command-buffer time is retained as the existing
@@ -162,9 +173,11 @@ counters, shadow results, and throughput denominators (pinned by an equivalence 
 `null`) from "flag on, no measured epochs" (`true`, attribution still `null`). The app
 has a parallel opt-in (`--frame-stage-timing`, `SoupScopeCore.AppFrameStageAccumulator`)
 for the app-only stages the benchmark cannot see — bounded epoch batch, snapshot creation,
-metric-texture population/upload, render encode/submit — appended to the validation
-diagnostic; the reconciliation math is unit-tested off-Metal, the Metal-only spans stay
-`null` where a frame was never encoded.
+soup-buffer allocation/copy, metric-texture population/upload, render encode/submit —
+appended to the validation diagnostic; the reconciliation math is unit-tested off-Metal,
+uses the same monotonic source throughout the app shell, and surfaces invalid signed
+remainders instead of clamping. The Metal-only spans stay `null` where a frame was never
+encoded.
 
 ## Entropy kinetics
 
@@ -300,12 +313,13 @@ jq -s '{off:.[0].results[0].wallMsPerEpoch, on:.[1].results[0].wallMsPerEpoch,
         overheadPct: (((.[1].results[0].wallMsPerEpoch/.[0].results[0].wallMsPerEpoch)-1)*100)}' \
   stage-off.json stage-on.json
 
-# the attribution + reconciliation (classified fraction, remainder, substages)
+# the attribution + reconciliation (validity/error, classified fraction, signed remainder, substages)
 jq '.results[0].hostStageAttribution' stage-on.json
 ```
 
-The eight top-level stage means plus `unclassifiedMsPerEpoch` reconcile to
-`wallMsPerEpoch`; on Metal the `evaluator*` substage fields are populated and
+The eight top-level stage means plus signed `unclassifiedMsPerEpoch` reconcile to
+`wallMsPerEpoch`; `reconciliationValid:false` means classified timing exceeded the
+enclosing wall. On Metal the `evaluator*` substage fields are populated and
 `evaluatorProfileAvailable` is `true`. Acceptance for the native pass: the named stages
 explain ≥ 95% of the wall **or** the remainder is explicitly reported (it always is),
 instrumentation overhead < 5% at 131072, uninstrumented wall ≤ 5% regression across the

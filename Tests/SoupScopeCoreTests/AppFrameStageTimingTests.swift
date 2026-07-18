@@ -17,10 +17,11 @@ final class AppFrameStageTimingTests: XCTestCase {
     /// minus the classified sum, and the classified fraction is exact.
     func testFullyPopulatedFramesReconcile() throws {
         var acc = AppFrameStageAccumulator()
-        // Two identical frames: wall 10 ms, classified 4+2+1+2 = 9 ms, remainder 1 ms.
+        // Two identical frames: wall 10 ms, classified 4+2+1+1+1 = 9 ms, remainder 1 ms.
         let sample = AppFrameStageSample(
             frameSeconds: 0.010, epochBatchSeconds: 0.004, snapshotBuildSeconds: 0.002,
-            metricTextureSeconds: 0.001, renderSubmitSeconds: 0.002)
+            soupBufferSeconds: 0.001, metricTextureSeconds: 0.001,
+            renderSubmitSeconds: 0.001)
         acc.record(sample)
         acc.record(sample)
 
@@ -29,14 +30,18 @@ final class AppFrameStageTimingTests: XCTestCase {
         XCTAssertEqual(s.meanFrameMs, 10, accuracy: 1e-9)
         XCTAssertEqual(s.epochBatchMsPerFrame!, 4, accuracy: 1e-9)
         XCTAssertEqual(s.snapshotBuildMsPerFrame!, 2, accuracy: 1e-9)
+        XCTAssertEqual(s.soupBufferMsPerFrame!, 1, accuracy: 1e-9)
         XCTAssertEqual(s.metricTextureMsPerFrame!, 1, accuracy: 1e-9)
-        XCTAssertEqual(s.renderSubmitMsPerFrame!, 2, accuracy: 1e-9)
+        XCTAssertEqual(s.renderSubmitMsPerFrame!, 1, accuracy: 1e-9)
         XCTAssertEqual(s.unclassifiedMsPerFrame, 1, accuracy: 1e-9)
         XCTAssertEqual(s.classifiedFrameFraction, 0.9, accuracy: 1e-9)
+        XCTAssertTrue(s.reconciliationValid)
+        XCTAssertNil(s.reconciliationError)
 
         // Reconciliation: available stage means + remainder == mean frame wall.
         let sum = s.epochBatchMsPerFrame! + s.snapshotBuildMsPerFrame!
-            + s.metricTextureMsPerFrame! + s.renderSubmitMsPerFrame!
+            + s.soupBufferMsPerFrame! + s.metricTextureMsPerFrame!
+            + s.renderSubmitMsPerFrame!
         XCTAssertEqual(sum + s.unclassifiedMsPerFrame, s.meanFrameMs, accuracy: 1e-9)
     }
 
@@ -48,16 +53,18 @@ final class AppFrameStageTimingTests: XCTestCase {
         // Frame 1 has the Metal spans; frame 2 does not (e.g. no drawable that frame).
         acc.record(AppFrameStageSample(
             frameSeconds: 0.010, epochBatchSeconds: 0.004, snapshotBuildSeconds: 0.002,
-            metricTextureSeconds: 0.001, renderSubmitSeconds: 0.002))
+            soupBufferSeconds: 0.001, metricTextureSeconds: 0.001,
+            renderSubmitSeconds: 0.002))
         acc.record(AppFrameStageSample(
             frameSeconds: 0.010, epochBatchSeconds: 0.004, snapshotBuildSeconds: 0.002,
-            metricTextureSeconds: nil, renderSubmitSeconds: nil))
+            soupBufferSeconds: nil, metricTextureSeconds: nil, renderSubmitSeconds: nil))
 
         let s = try XCTUnwrap(acc.summary())
         // epoch + snapshot present on both frames -> available.
         XCTAssertEqual(s.epochBatchMsPerFrame!, 4, accuracy: 1e-9)
         XCTAssertEqual(s.snapshotBuildMsPerFrame!, 2, accuracy: 1e-9)
         // Metal spans present on only one frame -> nil.
+        XCTAssertNil(s.soupBufferMsPerFrame)
         XCTAssertNil(s.metricTextureMsPerFrame)
         XCTAssertNil(s.renderSubmitMsPerFrame)
         // Classified = epoch+snapshot only (6 ms/frame); remainder = 10 - 6 = 4.
@@ -65,13 +72,17 @@ final class AppFrameStageTimingTests: XCTestCase {
         XCTAssertEqual(s.classifiedFrameFraction, 0.6, accuracy: 1e-9)
     }
 
-    /// The remainder never goes negative even if the recorded spans exceed the frame wall.
-    func testRemainderClampsAtZero() throws {
+    /// The remainder is signed when recorded spans exceed the frame wall, and the
+    /// reconciliation fields surface the invalid timing.
+    func testRemainderIsSignedWhenStagesExceedFrameWall() throws {
         var acc = AppFrameStageAccumulator()
         acc.record(AppFrameStageSample(
             frameSeconds: 0.001, epochBatchSeconds: 0.002, snapshotBuildSeconds: 0.002))
         let s = try XCTUnwrap(acc.summary())
-        XCTAssertEqual(s.unclassifiedMsPerFrame, 0, "never negative")
+        XCTAssertEqual(s.unclassifiedMsPerFrame, -3, accuracy: 1e-9)
+        XCTAssertEqual(s.classifiedFrameFraction, 4, accuracy: 1e-9)
+        XCTAssertFalse(s.reconciliationValid)
+        XCTAssertNotNil(s.reconciliationError)
     }
 
     /// The one-line summary is deterministic and prints unmeasured stages as `null`.
@@ -81,9 +92,12 @@ final class AppFrameStageTimingTests: XCTestCase {
                                        snapshotBuildSeconds: 0.002))
         let line = try XCTUnwrap(acc.summary()).summaryLine
         XCTAssertTrue(line.contains("frames=1"))
+        XCTAssertTrue(line.contains("soupBufferMs=null"))
         XCTAssertTrue(line.contains("metricTextureMs=null"))
         XCTAssertTrue(line.contains("renderSubmitMs=null"))
         XCTAssertTrue(line.contains("epochBatchMs=4.0000"), line)   // 0.004 s -> 4 ms
+        XCTAssertTrue(line.contains("reconciliationValid=true"), line)
+        XCTAssertTrue(line.contains("reconciliationError=null"), line)
     }
 
     /// The launch flag defaults off and parses on.

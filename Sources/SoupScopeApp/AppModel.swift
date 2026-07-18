@@ -61,7 +61,7 @@ final class AppModel: ObservableObject {
     // Bounded-validation state (the verdict logic lives in the pure
     // `ValidationRun`/`ValidationPolicy` state machine in SoupScopeCore).
     private var validationRun: ValidationRun?
-    private var validationStart: CFAbsoluteTime?
+    private var validationStart: Double?
     private var validationTimer: Timer?
     private var completedDraws = 0
     private var lastCommandBuffer: MTLCommandBuffer?
@@ -143,7 +143,7 @@ final class AppModel: ObservableObject {
         }
 
         let epochsToRun = batcher.nextBatchEpochs()
-        let t0 = CFAbsoluteTimeGetCurrent()
+        let t0 = AppMonotonicClock.nowSeconds()
         var reports: [EpochReport] = []
         reports.reserveCapacity(epochsToRun)
         do {
@@ -154,7 +154,7 @@ final class AppModel: ObservableObject {
             hud.setError("epoch execution failed: \(error)")
             return lastSnapshot
         }
-        let batchMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        let batchMs = (AppMonotonicClock.nowSeconds() - t0) * 1000
         batcher.record(batchMs: batchMs, epochs: reports.count)
 
         // A shadow mismatch is a hard stop — surface it, do not keep advancing.
@@ -170,11 +170,11 @@ final class AppModel: ObservableObject {
         let metrics = reports.last?.metrics
         var snapshotBuildSeconds: Double? = nil
         if let metrics {
-            let s0 = frameStages != nil ? CFAbsoluteTimeGetCurrent() : 0
+            let s0 = frameStages != nil ? AppMonotonicClock.nowSeconds() : 0
             lastSnapshot = try? RenderSnapshot.build(epoch: runner.epoch,
                                                      programCount: config.programCount,
                                                      soup: runner.soup, metrics: metrics)
-            if frameStages != nil { snapshotBuildSeconds = CFAbsoluteTimeGetCurrent() - s0 }
+            if frameStages != nil { snapshotBuildSeconds = AppMonotonicClock.nowSeconds() - s0 }
         }
         // Stash this frame's app-stage spans for the renderer to fold (only when timing).
         if frameStages != nil {
@@ -187,13 +187,14 @@ final class AppModel: ObservableObject {
     /// Fold one frame's app-stage spans into the accumulator, pairing the renderer's
     /// frame wall + Metal-only spans with the epoch-batch and snapshot-build spans
     /// `stepFrame` measured. No-op unless `--frame-stage-timing` is on.
-    func recordFrameStages(frameSeconds: Double, metricTextureSeconds: Double?,
-                           renderSubmitSeconds: Double?) {
+    func recordFrameStages(frameSeconds: Double, soupBufferSeconds: Double?,
+                           metricTextureSeconds: Double?, renderSubmitSeconds: Double?) {
         guard frameStages != nil else { return }
         frameStages?.record(AppFrameStageSample(
             frameSeconds: frameSeconds,
             epochBatchSeconds: lastEpochBatchSeconds,
             snapshotBuildSeconds: lastSnapshotBuildSeconds,
+            soupBufferSeconds: soupBufferSeconds,
             metricTextureSeconds: metricTextureSeconds,
             renderSubmitSeconds: renderSubmitSeconds))
     }
@@ -273,7 +274,7 @@ final class AppModel: ObservableObject {
         guard let seconds = options.validationSeconds, validationRun == nil else { return }
         let policy = ValidationPolicy(requestedSeconds: seconds, metalAvailable: context != nil)
         validationRun = ValidationRun(policy: policy)
-        validationStart = CFAbsoluteTimeGetCurrent()
+        validationStart = AppMonotonicClock.nowSeconds()
         let deadline = policy.metalAvailable ? policy.graceDeadline : 0
         let timer = Timer(timeInterval: max(0, deadline), repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.evaluateValidation() }
@@ -301,7 +302,7 @@ final class AppModel: ObservableObject {
     private func evaluateValidation() {
         guard let start = validationStart, validationRun != nil, !validationFinished else { return }
         let inputs = ValidationInputs(
-            elapsedSeconds: CFAbsoluteTimeGetCurrent() - start,
+            elapsedSeconds: AppMonotonicClock.nowSeconds() - start,
             completedDraws: completedDraws,
             hasError: hud.errorState != nil,
             shadowMismatch: hud.shadowMismatch)
