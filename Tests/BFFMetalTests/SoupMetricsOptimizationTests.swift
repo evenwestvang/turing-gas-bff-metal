@@ -168,13 +168,68 @@ final class SoupMetricsOptimizationTests: XCTestCase {
                            halt: UInt32(HaltReason.budget.rawValue))
         }
         let publicResult = SoupMetrics.programMetrics(soup: soup, plan: plan,
-                                                      outcomes: outcomes,
-                                                      programCount: programs)
+                                                       outcomes: outcomes,
+                                                       programCount: programs)
         let serial = SoupMetrics.programMetrics(soup: soup, plan: plan, outcomes: outcomes,
-                                                programCount: programs, parallel: false)
+                                                 programCount: programs, parallel: false)
         XCTAssertEqual(publicResult, serial,
                        "at-threshold parallel must match forced serial")
     }
+
+    /// The serial path at `parallelThreshold - 2`, the threshold boundary, and the
+    /// parallel path at `parallelThreshold + 2` all produce bit-identical per-program
+    /// metrics for the same deterministic input. The threshold only selects serial vs
+    /// parallel; the math is identical, so the forced-serial and forced-parallel paths
+    /// agree element-for-element (including the `entropyBitsPerByte` IEEE-754 bit
+    /// pattern) at every size, and the public auto-select path matches the right forced
+    /// path for its size.
+    func testSerialThresholdBoundaryAndParallelAreBitIdentical() throws {
+        let sizes = [
+            (programCount: SoupMetrics.parallelThreshold - 2, isParallel: false), // 4094
+            (programCount: SoupMetrics.parallelThreshold,     isParallel: true),  // 4096
+            (programCount: SoupMetrics.parallelThreshold + 2, isParallel: true),  // 4098
+        ]
+        for (programs, isParallel) in sizes {
+            let cfg = try SoupConfig(seed: 42, programCount: programs, stepBudget: 256,
+                                     mutationP32: 0, shadowSampleCount: 0)
+            let soup = BFFRandom.initialSoup(programs: programs, seed: 42)
+            let (_, plan) = SoupPlanner.plan(soup: soup, config: cfg, epoch: 0)
+            let outcomes = plan.inputTapes.enumerated().map { (p, tape) -> GPUPairOutcome in
+                GPUPairOutcome(finalTape: tape, steps: UInt32(10 + (p % 100)),
+                               noopSteps: UInt32(p % 5), copyWrites: 0, loopOps: 0,
+                               halt: UInt32(HaltReason.budget.rawValue))
+            }
+
+            let serial = SoupMetrics.programMetrics(soup: soup, plan: plan, outcomes: outcomes,
+                                                    programCount: programs, parallel: false)
+            let par = SoupMetrics.programMetrics(soup: soup, plan: plan, outcomes: outcomes,
+                                                programCount: programs, parallel: true)
+            let pub = SoupMetrics.programMetrics(soup: soup, plan: plan, outcomes: outcomes,
+                                                programCount: programs)
+
+            XCTAssertEqual(serial.count, programs)
+            XCTAssertEqual(par.count, programs)
+            XCTAssertEqual(pub.count, programs)
+
+            // Serial and parallel forced paths are element-for-element bit-identical,
+            // including the entropy Double's IEEE-754 bit pattern.
+            for id in 0..<programs {
+                XCTAssertEqual(serial[id], par[id],
+                               "programs=\(programs) id=\(id): serial != parallel")
+                XCTAssertEqual(serial[id].entropyBitsPerByte.bitPattern,
+                               par[id].entropyBitsPerByte.bitPattern,
+                               "programs=\(programs) id=\(id): entropy bitPattern differs")
+            }
+            // The public auto-select path matches the correct forced path for this size.
+            XCTAssertEqual(pub, serial,
+                           "programs=\(programs): public path must match forced serial")
+            XCTAssertEqual(pub, par,
+                           "programs=\(programs): public path must match forced parallel")
+            // Sanity: the auto-select picked the expected path for this size.
+            XCTAssertEqual(programs >= SoupMetrics.parallelThreshold, isParallel)
+        }
+    }
+
 
     // MARK: - 3. Soup / digest / counters / trajectory equivalence
 

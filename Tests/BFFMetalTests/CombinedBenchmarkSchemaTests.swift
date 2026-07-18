@@ -265,4 +265,91 @@ final class CombinedBenchmarkSchemaTests: XCTestCase {
         XCTAssertTrue(result.instrumentationEnabled)
         XCTAssertNotNil(result.hostStageAttribution)
     }
+
+    // MARK: - Schema-4 config.timedProgramMetrics encode/decode (predecessor defaults)
+
+    /// `config.timedProgramMetrics` is always present in schema-4 JSON: `true` only
+    /// under `--timed-program-metrics`, `false` otherwise. The nested config object
+    /// carries it as a plain bool.
+    func testTimedProgramMetricsEncodedInSchema4Config() throws {
+        var cfg = BenchmarkConfig(seed: 1, programCount: 2, warmupEpochs: 0,
+                                  measuredEpochs: 2, sampleInterval: 1)
+        XCTAssertFalse(cfg.timedProgramMetrics, "default is false")
+
+        let resultOff = combinedResult()  // uses a default config (timedProgramMetrics=false)
+        let objectOff = try encodedObject(resultOff)
+        let configOff = try XCTUnwrap(objectOff["config"] as? [String: Any])
+        XCTAssertEqual(configOff["timedProgramMetrics"] as? Bool, false,
+                       "default config encodes timedProgramMetrics: false")
+
+        // Opt-in config: the field encodes as true and survives a round-trip.
+        cfg.timedProgramMetrics = true
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let dataOn = try encoder.encode(cfg)
+        let jsonOn = String(decoding: dataOn, as: UTF8.self)
+        XCTAssertTrue(jsonOn.contains("\"timedProgramMetrics\":true"),
+                       "opt-in config encodes timedProgramMetrics: true")
+        let back = try JSONDecoder().decode(BenchmarkConfig.self, from: dataOn)
+        XCTAssertTrue(back.timedProgramMetrics, "round-trip preserves the opt-in")
+    }
+
+    /// Predecessor-schema JSON (schema 2 and either schema-3 branch) lacks the
+    /// `timedProgramMetrics` key entirely. Decoding must default it to `false` (the
+    /// in-epoch metrics scan stays off — the default) so a predecessor document
+    /// decodes losslessly without inventing the opt-in.
+    func testPredecessorSchemaConfigDecodesTimedProgramMetricsAsFalse() throws {
+        // Encode a config, then strip the new key to simulate a predecessor-schema doc.
+        let cfg = BenchmarkConfig(seed: 1, programCount: 2, warmupEpochs: 0,
+                                  measuredEpochs: 2, sampleInterval: 1,
+                                  timedProgramMetrics: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try encoder.encode(cfg)) as? [String: Any])
+        XCTAssertNotNil(object["timedProgramMetrics"], "sanity: key present before strip")
+        object.removeValue(forKey: "timedProgramMetrics")
+
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(BenchmarkConfig.self, from: data)
+        XCTAssertFalse(decoded.timedProgramMetrics,
+                       "predecessor-schema config defaults timedProgramMetrics to false")
+        // The other fields decode faithfully.
+        XCTAssertEqual(decoded.seed, cfg.seed)
+        XCTAssertEqual(decoded.programCount, cfg.programCount)
+        XCTAssertEqual(decoded.sampleInterval, cfg.sampleInterval)
+    }
+
+    /// `timedProgramMetrics` is independent of the schema-3 host-attribution and paper
+    /// sides: a host-attribution-only schema-3 shape (missing the Brotli keys AND the
+    /// new config key) decodes with all three sides at their honest defaults.
+    func testTimedProgramMetricsDefaultsIndependentlyOfSchema3Sides() throws {
+        let result = combinedResult()
+        var object = try encodedObject(result)
+        // Strip every schema-3 paper key + the new config key.
+        for key in ["initialBrotliBitsPerByte", "initialHighOrderComplexity",
+                    "finalBrotliBitsPerByte", "finalHighOrderComplexity",
+                    "highOrderComplexityCrossings"] {
+            object.removeValue(forKey: key)
+        }
+        var config = try XCTUnwrap(object["config"] as? [String: Any])
+        config.removeValue(forKey: "highOrderComplexityThresholds")
+        config.removeValue(forKey: "timedProgramMetrics")
+        object["config"] = config
+        var samples = try XCTUnwrap(object["samples"] as? [[String: Any]])
+        for i in samples.indices {
+            samples[i].removeValue(forKey: "brotliBitsPerByte")
+            samples[i].removeValue(forKey: "highOrderComplexity")
+        }
+        object["samples"] = samples
+
+        let decoded = try decodeObject(object)
+        XCTAssertTrue(decoded.instrumentationEnabled, "host-attribution side preserved")
+        XCTAssertNotNil(decoded.hostStageAttribution)
+        XCTAssertNil(decoded.initialBrotliBitsPerByte, "paper side defaulted to nil")
+        XCTAssertTrue(decoded.highOrderComplexityCrossings.isEmpty)
+        XCTAssertTrue(decoded.config.highOrderComplexityThresholds.isEmpty)
+        XCTAssertFalse(decoded.config.timedProgramMetrics,
+                       "new config key defaulted to false independently")
+    }
 }

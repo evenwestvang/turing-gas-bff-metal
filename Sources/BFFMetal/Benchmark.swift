@@ -110,6 +110,21 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
     /// Emit a per-epoch kinetics sample (and the expensive compression proxy) every
     /// `sampleInterval` epochs. `>= 1`; large values bound output at large soups.
     public var sampleInterval: Int
+    /// Opt-in: run the timed epoch's per-program `ProgramMetric` construction
+    /// (`MetricsPolicy.enabled`) so `hostStageAttribution.programMetricsMsPerEpoch`
+    /// measures the real per-program metric scan. Default `false` — the benchmark
+    /// passes `MetricsPolicy.disabled` so the epoch wall carries no per-program
+    /// entropy/activity scan (it never consumes `EpochReport.metrics`; in kinetics
+    /// mode per-program entropy is measured externally via `SoupSignals.measure`,
+    /// outside the epoch wall). DISTINCT from `--no-samples` (which gates the
+    /// external `SoupSignals.measure` analysis) and from `--signal-interval` (which
+    /// gates the signal-measurement cadence): this knob gates ONLY the in-epoch
+    /// `ProgramMetric` construction. Enabling changes nothing else — the soup, RNG,
+    /// digest, counters, shadow, and trajectory are byte-for-byte identical (pinned
+    /// by test). Most useful with `--host-stage-timing` so the scan is attributed to
+    /// `programMetricsMsPerEpoch`; without it the scan runs but is folded into the
+    /// unclassified epoch-wall remainder. New in schema 4.
+    public var timedProgramMetrics: Bool
 
     public init(seed: UInt32, programCount: Int,
                 stepBudget: Int = BFF.stepBudget,
@@ -121,7 +136,8 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
                 measuredEpochs: Int = 8,
                 deltaHThresholds: [Double] = [],
                 highOrderComplexityThresholds: [Double] = [],
-                sampleInterval: Int = 1) {
+                sampleInterval: Int = 1,
+                timedProgramMetrics: Bool = false) {
         self.seed = seed
         self.programCount = programCount
         self.stepBudget = stepBudget
@@ -134,6 +150,7 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
         self.deltaHThresholds = deltaHThresholds
         self.highOrderComplexityThresholds = highOrderComplexityThresholds
         self.sampleInterval = max(1, sampleInterval)
+        self.timedProgramMetrics = timedProgramMetrics
     }
 
     /// Total epochs the run executes (warmup + measured).
@@ -151,11 +168,13 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
     /// without changing any existing field's meaning. `deltaHThresholds` is treated
     /// the same way for robustness (it is a schema-2 key but may be absent in
     /// trimmed snapshots). Existing scalar keys are decoded strictly — no silent
-    /// remapping of old field meanings.
+    /// remapping of old field meanings. Schema 4 adds `timedProgramMetrics`
+    /// (default `false` when absent), so schema-2/3 and either schema-3 branch
+    /// decode losslessly with the in-epoch metrics scan staying off (the default).
     enum CodingKeys: String, CodingKey {
         case seed, programCount, stepBudget, mutationP32, variant, initMode,
              shadowSampleCount, warmupEpochs, measuredEpochs, deltaHThresholds,
-             highOrderComplexityThresholds, sampleInterval
+             highOrderComplexityThresholds, sampleInterval, timedProgramMetrics
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -172,6 +191,7 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
         highOrderComplexityThresholds =
             try c.decodeIfPresent([Double].self, forKey: .highOrderComplexityThresholds) ?? []
         sampleInterval = try c.decodeIfPresent(Int.self, forKey: .sampleInterval) ?? 1
+        timedProgramMetrics = try c.decodeIfPresent(Bool.self, forKey: .timedProgramMetrics) ?? false
     }
 }
 

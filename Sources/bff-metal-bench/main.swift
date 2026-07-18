@@ -74,6 +74,16 @@ var includeBrotli = false
 // Opt-in host-stage timing attribution. Off by default; when on, each epoch's runEpoch
 // is timed at stage boundaries and the result carries `hostStageAttribution`.
 var instrumentStages = false
+// `--timed-program-metrics` opts in to running the timed epoch's per-program
+// `ProgramMetric` construction (`MetricsPolicy.enabled`) so
+// `hostStageAttribution.programMetricsMsPerEpoch` measures the real per-program metric
+// scan instead of the ~0 it sees under the default `.disabled`. DISTINCT from
+// `--no-samples` (external `SoupSignals.measure`) and `--signal-interval` (the
+// signal-measurement cadence): it gates ONLY the in-epoch `ProgramMetric` construction,
+// which is a pure side computation — soup/digest/counters/trajectory are unchanged.
+// Most useful with `--host-stage-timing`; without it the scan runs but is not
+// attributed to a named stage.
+var timedProgramMetrics = false
 
 let usageExit = BenchmarkExitCode.usage
 
@@ -139,6 +149,7 @@ while cursor < arguments.count {
     case "--compression": includeCompression = true
     case "--brotli": includeBrotli = true
     case "--host-stage-timing": instrumentStages = true
+    case "--timed-program-metrics": timedProgramMetrics = true
     case "--variant":
         let raw = nextValue(argument)
         guard let v = BFFVariant(rawValue: raw) else {
@@ -211,6 +222,26 @@ while cursor < arguments.count {
                                   populated only on a Metal host; null otherwise. Mixed
                                   measured span availability is surfaced as incomplete
                                   attribution, never compacted silently.
+          --timed-program-metrics opt in to running the timed epoch's per-program
+                                  ProgramMetric construction (MetricsPolicy.enabled) so
+                                  hostStageAttribution.programMetricsMsPerEpoch measures
+                                  the real per-program metric scan instead of the ~0 it
+                                  sees under the default (MetricsPolicy.disabled). The
+                                  benchmark never consumes EpochReport.metrics; in
+                                  kinetics mode per-program entropy is measured
+                                  externally (SoupSignals.measure) outside the epoch
+                                  wall. DISTINCT from --no-samples (which gates the
+                                  external signal analysis) and from --signal-interval
+                                  (the signal-measurement cadence): this gates ONLY the
+                                  in-epoch ProgramMetric construction, which is a pure
+                                  side computation — soup/digest/counters/trajectory are
+                                  byte-for-byte identical whether it runs or not. Default
+                                  off; most useful with --host-stage-timing so the scan
+                                  is attributed to programMetricsMsPerEpoch (without it
+                                  the scan runs but folds into the unclassified
+                                  epoch-wall remainder). New in schema 4
+                                  (config.timedProgramMetrics; defaults to false when
+                                  absent, so predecessor-schema JSON decodes losslessly).
           --allow-missing-gpu-timing  exit 0 even if GPU timestamps are unavailable
         Seeds are strict unsigned decimals in 0...\(UInt32.max); malformed/overflowing
         tokens are a usage error (exit \(BenchmarkExitCode.usage)), never truncated.
@@ -248,6 +279,12 @@ if includeCompression && !analyzeSignals {
 }
 if includeBrotli && !analyzeSignals {
     warn("--brotli is ignored under --no-samples (no signal analysis runs)")
+}
+if timedProgramMetrics && !instrumentStages {
+    warn("--timed-program-metrics runs the in-epoch per-program metric scan but "
+         + "--host-stage-timing is off, so it will not be attributed to "
+         + "programMetricsMsPerEpoch (it folds into the unclassified epoch-wall "
+         + "remainder). Add --host-stage-timing to measure the scan.")
 }
 if signalInterval > 1 && !analyzeSignals {
     warn("--signal-interval is ignored under --no-samples (no signal analysis runs)")
@@ -294,7 +331,8 @@ for programs in programsList {
             // them out of the config (and thus out of the crossing tracker) otherwise,
             // so `highOrderComplexityCrossings` stays empty without --brotli.
             highOrderComplexityThresholds: includeBrotli ? highOrderThresholds : [],
-            sampleInterval: sampleInterval)
+            sampleInterval: sampleInterval,
+            timedProgramMetrics: timedProgramMetrics)
         do {
             _ = try cfg.soupConfig()   // validate bounds now
         } catch let e as SoupConfig.ConfigError {
@@ -355,13 +393,17 @@ func emit(_ results: [BenchmarkResult]) {
         //     config key highOrderComplexityThresholds — from the paper schema-3 shape.
         //     Per sample: brotliBitsPerByte / highOrderComplexity. All null/empty
         //     unless --brotli is on and the linked Brotli is exactly 1.1.0.
+        //   - config.timedProgramMetrics (always present; bool) — the per-cell
+        //     representation of --timed-program-metrics (gates ONLY the in-epoch
+        //     ProgramMetric construction; default false). New in schema 4.
         // All null/empty unless the respective flag is on. Schema 2's key set is
         // otherwise unchanged and every optional stays an explicit null
         // (see Docs/Benchmarking.md). Custom init(from:) accepts schema-2-shaped JSON
         // missing every new key, defaulting optionals to nil and arrays to []; it also
         // accepts either predecessor schema-3 shape (host-attribution JSON missing the
         // Brotli keys, or paper JSON missing instrumentationEnabled/hostStageAttribution)
-        // by defaulting the absent side's keys the same way.
+        // by defaulting the absent side's keys the same way; timedProgramMetrics
+        // defaults to false when absent (predecessor schemas never carried it).
         let data = try encoder.encode(Envelope(schemaVersion: 4, results: results))
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))
@@ -467,6 +509,7 @@ for config in configs {
          + "analyzeSignals=\(analyzeSignals) compression=\(includeCompression) "
          + "brotli=\(includeBrotli) brotliVersion=\(BrotliCompressor.encoderVersionString) "
          + "hostStageTiming=\(instrumentStages) "
+         + "timedProgramMetrics=\(timedProgramMetrics) "
          + "sampleInterval=\(config.sampleInterval) signalInterval=\(signalInterval) "
          + "rng=\(BFFRandom.contractID)")
 }

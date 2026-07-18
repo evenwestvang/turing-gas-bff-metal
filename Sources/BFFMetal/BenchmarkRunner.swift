@@ -172,20 +172,32 @@ public enum BenchmarkRunner {
                 || completed == config.totalEpochs
 
             // --- Epoch execution wall: runEpoch only ---
-            // Per-program metrics are always disabled here: the benchmark never
+            // Per-program metrics default to disabled here: the benchmark never
             // consumes `EpochReport.metrics`, and in kinetics mode per-program entropy
-            // is measured externally (below) *outside* this wall. So the timed epoch
-            // carries mutation → pairing → packing → GPU dispatch/wait/readback →
+            // is measured externally (below) *outside* this wall. So by default the timed
+            // epoch carries mutation → pairing → packing → GPU dispatch/wait/readback →
             // scatter → counters → digest → configured shadow, and NOT the per-program
             // entropy/activity scan. (The FNV-1a digest is the one unavoidable O(N)
             // timed pass; the counters are O(pairs).)
+            //
+            // `config.timedProgramMetrics` is the explicit opt-in that flips the in-epoch
+            // metrics policy to `.enabled` so the per-program `ProgramMetric` scan runs
+            // *inside* this wall — making `hostStageAttribution.programMetricsMsPerEpoch`
+            // (under `--host-stage-timing`) measure the real per-program metric scan
+            // instead of the ~0 it sees under the default `.disabled`. It is DISTINCT
+            // from `--no-samples` (external `SoupSignals.measure`) and from
+            // `--signal-interval` (the signal-measurement cadence): it gates ONLY the
+            // in-epoch `ProgramMetric` construction, which is a pure side computation —
+            // the soup, RNG, counters, shadow, digest, and trajectory are byte-for-byte
+            // identical whether it runs or not (pinned by test).
             // Pass the SAME monotonic clock as the stage clock when instrumentation is
             // on, so the stage-boundary reads and the enclosing wall come from one clock
             // and reconcile exactly. When off, no stage clock is passed and `runEpoch`
             // is byte-for-byte the uninstrumented call — proven equivalent by test.
             let stageClock: (() -> Double)? = options.instrumentStages ? now : nil
+            let metricsPolicy: MetricsPolicy = config.timedProgramMetrics ? .enabled : .disabled
             let t0 = now()
-            let report = try runner.runEpoch(using: evaluator, metrics: .disabled,
+            let report = try runner.runEpoch(using: evaluator, metrics: metricsPolicy,
                                              stageClock: stageClock)
             let wall = now() - t0
             let gpu = gpuSecondsAfterEpoch()

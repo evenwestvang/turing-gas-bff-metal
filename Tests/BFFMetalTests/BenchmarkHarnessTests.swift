@@ -923,6 +923,134 @@ final class BenchmarkHarnessTests: XCTestCase {
         XCTAssertEqual(runner.programMetricBuildCount, 1)
     }
 
+    // MARK: - Timed program metrics opt-in (--timed-program-metrics)
+
+    /// The default benchmark config (`timedProgramMetrics == false`) runs the timed
+    /// epoch with `MetricsPolicy.disabled`, so `EpochReport.metrics` is empty for every
+    /// epoch (warmup + measured). This is the default-behavior preservation contract:
+    /// the new opt-in changes nothing unless explicitly requested.
+    func testDefaultBenchmarkTimedEpochsDisableProgramMetrics() throws {
+        let cfg = BenchmarkConfig(seed: 3, programCount: 16, mutationP32: 1 << 22,
+                                   initMode: .opcode, warmupEpochs: 1, measuredEpochs: 3,
+                                   sampleInterval: 1)
+        XCTAssertFalse(cfg.timedProgramMetrics,
+                       "default config must keep timed program metrics off")
+        let soupConfig = try cfg.soupConfig()
+
+        var epochs = 0
+        var metricsBuilt = 0
+        var clock = 0.0
+        let result = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil, options: .throughputOnly, readMaxRSSBytes: { nil },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                    includeCompression: includeComp)
+            },
+            onEpoch: { report in
+                epochs += 1
+                XCTAssertTrue(report.metrics.isEmpty,
+                              "default: timed epoch must not build per-program metrics")
+                if !report.metrics.isEmpty { metricsBuilt += 1 }
+            })
+        XCTAssertEqual(epochs, cfg.totalEpochs, "every epoch runs")
+        XCTAssertEqual(metricsBuilt, 0,
+                       "default: no per-program metric construction in the timed epoch")
+        XCTAssertFalse(result.signalsAnalyzed)
+    }
+
+    /// `--timed-program-metrics` (`config.timedProgramMetrics == true`) flips the timed
+    /// epoch's `MetricsPolicy` to `.enabled`, so every epoch (warmup + measured) builds
+    /// exactly one `ProgramMetric` array of size `programCount`. The scan runs inside the
+    /// epoch wall but changes nothing else.
+    func testTimedProgramMetricsOptInBuildsOnePerEpoch() throws {
+        let cfg = BenchmarkConfig(seed: 3, programCount: 16, mutationP32: 1 << 22,
+                                   initMode: .opcode, warmupEpochs: 1, measuredEpochs: 3,
+                                   sampleInterval: 1, timedProgramMetrics: true)
+        XCTAssertTrue(cfg.timedProgramMetrics)
+        let soupConfig = try cfg.soupConfig()
+
+        var epochs = 0
+        var metricsBuilt = 0
+        var clock = 0.0
+        let result = try BenchmarkRunner.run(
+            config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+            deviceName: nil, options: .throughputOnly, readMaxRSSBytes: { nil },
+            now: { clock += 0.001; return clock },
+            gpuSecondsAfterEpoch: { nil },
+            measureSignals: { soup, includeComp in
+                SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                    includeCompression: includeComp)
+            },
+            onEpoch: { report in
+                epochs += 1
+                XCTAssertEqual(report.metrics.count, cfg.programCount,
+                               "opt-in: each epoch builds one full metrics array")
+                if report.metrics.count == cfg.programCount { metricsBuilt += 1 }
+            })
+        XCTAssertEqual(epochs, cfg.totalEpochs, "every epoch runs")
+        XCTAssertEqual(metricsBuilt, cfg.totalEpochs,
+                       "exactly one metric build per warmup + measured epoch")
+        XCTAssertFalse(result.signalsAnalyzed,
+                       "timedProgramMetrics is orthogonal to signal analysis")
+    }
+
+    /// Enabling `--timed-program-metrics` changes ONLY the in-epoch metrics policy. The
+    /// soup trajectory, digest, counters, shadow, samples, and threshold crossings are
+    /// byte-for-byte identical to a default (metrics-disabled) run. This pins the "pure
+    /// side computation" invariant at the `BenchmarkRunner` level, complementing the
+    /// `SoupRunner`-level enabled-vs-disabled equivalence test.
+    func testTimedProgramMetricsEnabledVsDisabledPreservesTrajectory() throws {
+        var cfg = BenchmarkConfig(seed: 21, programCount: 32, mutationP32: 1 << 22,
+                                  initMode: .opcode, warmupEpochs: 1, measuredEpochs: 6,
+                                  deltaHThresholds: [0.1], sampleInterval: 1)
+        let soupConfig = try cfg.soupConfig()
+        XCTAssertFalse(cfg.timedProgramMetrics, "default baseline: metrics disabled")
+
+        func run(timed: Bool) throws -> BenchmarkResult {
+            cfg.timedProgramMetrics = timed
+            var clock = 0.0
+            return try BenchmarkRunner.run(
+                config: cfg, soupConfig: soupConfig, evaluator: CPUPairEvaluator(),
+                deviceName: nil,
+                options: .init(analyzeSignals: true, includeCompression: false),
+                readMaxRSSBytes: { nil },
+                now: { clock += 0.001; return clock },
+                gpuSecondsAfterEpoch: { nil },
+                measureSignals: { soup, includeComp in
+                    SoupSignals.measure(soup: soup, programCount: cfg.programCount,
+                                        includeCompression: includeComp)
+                })
+        }
+
+        let disabled = try run(timed: false)
+        let enabled = try run(timed: true)
+
+        // The soup/digest/counters/trajectory are identical.
+        XCTAssertEqual(enabled.finalDigest, disabled.finalDigest, "digest must match")
+        XCTAssertEqual(enabled.totalPairs, disabled.totalPairs)
+        XCTAssertEqual(enabled.totalRawSteps, disabled.totalRawSteps)
+        XCTAssertEqual(enabled.totalCommandSteps, disabled.totalCommandSteps)
+        XCTAssertEqual(enabled.totalCopyWrites, disabled.totalCopyWrites)
+        XCTAssertEqual(enabled.haltBudget, disabled.haltBudget)
+        XCTAssertEqual(enabled.haltPCOut, disabled.haltPCOut)
+        XCTAssertEqual(enabled.haltUnmatched, disabled.haltUnmatched)
+        XCTAssertEqual(enabled.haltUnknown, disabled.haltUnknown)
+        XCTAssertEqual(enabled.measuredEpochs, disabled.measuredEpochs)
+        XCTAssertEqual(enabled.samples.map(\.epoch), disabled.samples.map(\.epoch))
+        XCTAssertEqual(enabled.samples.map(\.entropyBitsPerByte),
+                       disabled.samples.map(\.entropyBitsPerByte))
+        XCTAssertEqual(enabled.samples.map(\.deltaHFromInitial),
+                       disabled.samples.map(\.deltaHFromInitial))
+        XCTAssertEqual(enabled.thresholdCrossings, disabled.thresholdCrossings)
+        XCTAssertEqual(enabled.finalDigest, disabled.finalDigest)
+        // Config differs only in the opt-in flag.
+        XCTAssertFalse(disabled.config.timedProgramMetrics)
+        XCTAssertTrue(enabled.config.timedProgramMetrics)
+    }
+
     // MARK: - Stable schema-2 JSON: explicit nulls, no vanishing keys (blocker 4)
 
     /// A `--no-samples` (throughput-only) run must still emit EVERY documented optional

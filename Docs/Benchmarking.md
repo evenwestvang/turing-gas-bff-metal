@@ -86,6 +86,14 @@ are `null`; `thresholdCrossings` and `samples` are explicit empty arrays `[]`. A
 follow the same rule: an un-crossed `thresholdCrossings[]` entry still carries
 `"epoch": null`, `"wallMsToCross": null`, `"gpuMsToCross": null`.
 
+**Schema 4 also adds `config.timedProgramMetrics`** (always-present bool, new in this
+revision): `true` only under `--timed-program-metrics`. Predecessor-schema JSON (schema 2
+and either schema-3 branch) lacks the key and decodes losslessly with it defaulted to
+`false` (the in-epoch metrics scan stays off — the default). It is the per-cell
+representation of the `--timed-program-metrics` CLI flag (see "In-epoch program metrics"
+above); it gates ONLY the in-epoch `ProgramMetric` construction and never the external
+signal analysis, so it is orthogonal to `--no-samples`/`--signal-interval`/`--compression`.
+
 Exit codes: `0` ok · `1` shadow mismatch or generic GPU/runtime error · `2` Metal
 unavailable — **no Metal on the platform *or* no system default device** (nothing ran) ·
 `3` ran but GPU timestamps were unavailable · `64` bad arguments (includes any malformed
@@ -152,12 +160,29 @@ Read all three as relative, same-alphabet, same-length signals.
 - **In-epoch program metrics.** `SoupRunner.runEpoch(using:metrics:)` gates the derived
   per-program `ProgramMetric` (order-0 entropy + activity) behind an explicit policy that
   **defaults to enabled**, so the interactive app, the oracle, and `bff-metal-soup` are
-  unchanged. The benchmark always passes `.disabled` because it never consumes
+  unchanged. The benchmark passes `.disabled` by default because it never consumes
   `EpochReport.metrics`; `metrics` is therefore empty **only** under that explicit
-  opt-out. Disabling changes nothing else — the mutation → pair → evaluate → scatter
-  sequence, the counters, the CPU shadow, the committed soup, and the digest are
-  byte-for-byte identical (pinned by a metrics-enabled-vs-disabled equivalence test, with
-  an invocation counter proving the scan is genuinely skipped).
+  opt-out (or under `--timed-program-metrics`, see below, where metrics ARE built but
+  still not consumed by the aggregator). Disabling changes nothing else — the mutation →
+  pair → evaluate → scatter sequence, the counters, the CPU shadow, the committed soup,
+  and the digest are byte-for-byte identical (pinned by a metrics-enabled-vs-disabled
+  equivalence test, with an invocation counter proving the scan is genuinely skipped).
+- **`--timed-program-metrics`** (opt-in; new in schema 4) flips the timed epoch's
+  `MetricsPolicy` to `.enabled` so the per-program `ProgramMetric` scan runs *inside* the
+  measured epoch wall. Its sole purpose is to make
+  `hostStageAttribution.programMetricsMsPerEpoch` (under `--host-stage-timing`) measure
+  the real per-program metric scan instead of the ~0 it reports under the default
+  `.disabled`. It is **distinct from `--no-samples`** (which gates the external
+  `SoupSignals.measure` entropy/transition/LZ analysis outside the epoch wall) and from
+  `--signal-interval` (the signal-measurement cadence): `--timed-program-metrics` gates
+  ONLY the in-epoch `ProgramMetric` construction. Enabling it changes nothing else — the
+  soup, RNG, pairing, mutation, scatter, counters, CPU shadow, digest, and trajectory are
+  byte-for-byte identical to a default run (pinned by test). Default off; most useful
+  with `--host-stage-timing` so the scan is attributed to `programMetricsMsPerEpoch`
+  (without it the scan runs but folds into the unclassified epoch-wall remainder, and a
+  stderr note is emitted). Encoded as `config.timedProgramMetrics` (a bool, always
+  present in schema-4 JSON); predecessor-schema JSON decodes losslessly with the field
+  defaulting to `false` when absent.
 - **`--compression`** opts the LZ proxy in; bounded to the sample cadence so it stays
   affordable even at 131072 programs. Ignored (with a stderr note) under `--no-samples`.
   Under a sparse `--signal-interval` it stays independent and never broadens: the LZ
@@ -180,15 +205,16 @@ it does for the app/oracle (no stage clock is passed).
    boundaries taken *between* stages, so they are mutually exclusive: `mutationPairing`
    (mutation planning + Fisher–Yates pairing), `packing` (pair packing / nested-array
    construction), `evaluate` (the whole evaluator call), `scatter`, `counterReduction`,
-   `programMetrics` (≈ 0 in the benchmark — it runs `MetricsPolicy.disabled`), `shadow`,
-   and `digest` (the full-soup FNV-1a). The gap between the enclosing epoch wall and the
-   stage sum is the explicit signed **`unclassifiedMsPerEpoch`** remainder. The eight
-   stage means **plus** the signed remainder equal `wallMsPerEpoch` exactly. If the stage
-   sum exceeds the wall, the remainder is negative, `classifiedWallFraction` can exceed
-   1, and `reconciliationValid` is `false` with `reconciliationError` populated.
-   Instrumented aggregation requires spans for every measured epoch; mixed availability
-   is reported via `attributionComplete:false` and null measurements, never by
-   reconciling a compacted subset.
+   `programMetrics` (≈ 0 under the default `MetricsPolicy.disabled`; run
+   `--timed-program-metrics` to make this stage measure the real per-program metric
+   scan), `shadow`, and `digest` (the full-soup FNV-1a). The gap between the enclosing
+   epoch wall and the stage sum is the explicit signed **`unclassifiedMsPerEpoch`**
+   remainder. The eight stage means **plus** the signed remainder equal `wallMsPerEpoch`
+   exactly. If the stage sum exceeds the wall, the remainder is negative,
+   `classifiedWallFraction` can exceed 1, and `reconciliationValid` is `false` with
+   `reconciliationError` populated. Instrumented aggregation requires spans for every
+   measured epoch; mixed availability is reported via `attributionComplete:false` and
+   null measurements, never by reconciling a compacted subset.
 
 2. **Evaluator substages** — a *sub*-decomposition of the single `evaluate` span,
    reported only by an evaluator that profiles (the Metal host):
@@ -578,6 +604,23 @@ explain ≥ 95% of the wall **or** the remainder is explicitly reported (it alwa
 instrumentation overhead < 5% at 131072, uninstrumented wall ≤ 5% regression across the
 1K/4K/16K/65K/131K release matrix, valid JSON, empty stderr, positive GPU time, zero
 `haltUnknown`, and no thermal pressure.
+
+By default `programMetricsMsPerEpoch` is ≈ 0 because the benchmark runs the timed epoch
+with `MetricsPolicy.disabled`. Add `--timed-program-metrics` (with `--host-stage-timing`)
+to flip the in-epoch metrics policy to `.enabled` so `programMetricsMsPerEpoch` measures
+the real per-program metric scan. The scan is a pure side computation — the soup, RNG,
+counters, shadow, digest, and trajectory are byte-for-byte identical to a default run:
+
+```sh
+# measure the real per-program metric scan inside the epoch wall
+swift run -c release bff-metal-bench --programs 131072 --seed 1 \
+  --warmup 2 --epochs 20 --shadow-sample 0 --no-samples \
+  --host-stage-timing --timed-program-metrics > stage-metrics-on.json
+# compare against the default (metrics-disabled) attribution to isolate the scan cost
+jq -s '{default:.[0].results[0].hostStageAttribution.programMetricsMsPerEpoch,
+        timed:.[1].results[0].hostStageAttribution.programMetricsMsPerEpoch}' \
+  stage-on.json stage-metrics-on.json
+```
 
 ### Shadow-on correctness spot checks
 

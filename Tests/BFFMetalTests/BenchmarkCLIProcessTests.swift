@@ -267,6 +267,64 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         XCTAssertEqual(analyzing.status, 64,
                        "sparse signals + thresholds while analyzing remains a usage error")
     }
+
+    // MARK: - --timed-program-metrics propagation and stage-timing note
+
+    /// `--timed-program-metrics` is accepted and propagated to the resolved config; it
+    /// does not change the exit-code mapping (still 2 on a non-Metal host). Without
+    /// `--host-stage-timing` it emits the documented stderr note (the scan runs but is
+    /// not attributed to `programMetricsMsPerEpoch`).
+    func testTimedProgramMetricsPropagationAndStageTimingNote() throws {
+        let r = try runBench(["--programs", "2", "--seed", "1",
+                              "--warmup", "0", "--epochs", "1",
+                              "--timed-program-metrics"])
+        #if canImport(Metal)
+        let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 4)
+        XCTAssertNotEqual(r.status, 64, "opt-in is not a usage error")
+        #else
+        XCTAssertEqual(r.status, 2, "timed-program-metrics does not change the no-Metal exit code")
+        XCTAssertTrue(r.stderr.contains("timedProgramMetrics=true"),
+                      "--timed-program-metrics propagated to the resolved config")
+        #endif
+        // Without --host-stage-timing the documented note is emitted.
+        XCTAssertTrue(r.stderr.contains("--host-stage-timing is off"),
+                      "stderr notes that the scan will not be attributed without --host-stage-timing")
+    }
+
+    /// By default (no `--timed-program-metrics`) the resolved config reports
+    /// `timedProgramMetrics=false`, and no stage-timing note is emitted.
+    func testDefaultConfigHasTimedProgramMetricsFalseAndNoNote() throws {
+        let r = try runBench(["--programs", "2", "--seed", "1",
+                              "--warmup", "0", "--epochs", "1", "--no-samples"])
+        #if !canImport(Metal)
+        XCTAssertEqual(r.status, 2)
+        XCTAssertTrue(r.stderr.contains("timedProgramMetrics=false"),
+                      "default config propagates timedProgramMetrics=false")
+        XCTAssertFalse(r.stderr.contains("--host-stage-timing is off"),
+                       "no stage-timing note when the opt-in is off")
+        #endif
+    }
+
+    /// `--timed-program-metrics` combined with `--host-stage-timing` is accepted and
+    /// propagates both flags; no stage-timing note is emitted (the scan WILL be
+    /// attributed to `programMetricsMsPerEpoch`).
+    func testTimedProgramMetricsWithHostStageTimingIsAccepted() throws {
+        let r = try runBench(["--programs", "2", "--seed", "1",
+                              "--warmup", "0", "--epochs", "1",
+                              "--timed-program-metrics", "--host-stage-timing"])
+        #if canImport(Metal)
+        let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 4)
+        XCTAssertNotEqual(r.status, 64)
+        #else
+        XCTAssertEqual(r.status, 2)
+        XCTAssertTrue(r.stderr.contains("timedProgramMetrics=true"))
+        XCTAssertTrue(r.stderr.contains("hostStageTiming=true"))
+        XCTAssertFalse(r.stderr.contains("--host-stage-timing is off"),
+                       "no note when --host-stage-timing is also on")
+        #endif
+    }
 }
 
 /// Local mirror of the documented exit codes, so the Metal-host branch above can name
