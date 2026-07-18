@@ -276,11 +276,14 @@ if includeBrotli && analyzeSignals && !BrotliCompressor.isPaperPinned {
 var configs: [BenchmarkConfig] = []
 for programs in programsList {
     for seed in seeds {
+        // `all` resolves per cell against this cell's program count (pure, importable,
+        // order-independent — see `resolveShadowSampleCount`). A non-`all`, non-integer
+        // argument stays a usage error, exactly as a non-integer `intArg` would.
         let shadow: Int
-        if let raw = shadowSampleArg {
-            shadow = (raw == "all") ? programs / 2 : intArg("--shadow-sample", raw)
-        } else {
-            shadow = 0
+        switch resolveShadowSampleCount(shadowSampleArg, programCount: programs) {
+        case .count(let n): shadow = n
+        case .notAnIntegerOrAll(let v):
+            fail("--shadow-sample requires an integer or 'all', got '\(v)'", exitCode: usageExit)
         }
         let cfg = BenchmarkConfig(
             seed: seed, programCount: programs, stepBudget: budget,

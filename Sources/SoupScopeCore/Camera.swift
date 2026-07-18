@@ -88,7 +88,8 @@ public struct Camera: Equatable, Sendable {
 
     /// Clamp `bytePx` into `[minBytePx, maxBytePx]` and re-establish the camera
     /// invariant on each axis (content covers the viewport, or is centered when it is
-    /// smaller than the viewport). Idempotent.
+    /// smaller than the viewport). Idempotent, and restores the invariant even from
+    /// poisoned public state (NaN/Inf `originByte*` or `bytePx`).
     public mutating func clamp(_ g: CameraGeometry) {
         guard g.isUsable else { return }
         let lo = minBytePx(g)
@@ -101,11 +102,16 @@ public struct Camera: Equatable, Sendable {
     }
 
     /// Zoom by `factor` (≈ `exp(k·Δ)`) anchored at a screen pixel: the soup byte
-    /// under the anchor stays under the anchor (03 §8). Non-finite/≤0 factors are
-    /// ignored.
+    /// under the anchor stays under the anchor (03 §8). Non-finite/≤0 factors and
+    /// non-finite anchors are ignored. Unusable geometry returns safely; a poisoned
+    /// camera is normalized via `clamp` *before* the gesture-specific early return, so
+    /// a poisoned camera + an invalid gesture still lands on a valid invariant (the
+    /// `clamp` is idempotent on an already-valid camera, so this is a no-op there).
     public mutating func zoom(factor: Double, anchorPxX: Double, anchorPxY: Double,
                               geometry g: CameraGeometry) {
-        guard g.isUsable, factor.isFinite, factor > 0,
+        guard g.isUsable else { return }
+        clamp(g)
+        guard factor.isFinite, factor > 0,
               anchorPxX.isFinite, anchorPxY.isFinite else { return }
         let before = screenToByte(pxX: anchorPxX, pxY: anchorPxY)
 
@@ -122,9 +128,14 @@ public struct Camera: Equatable, Sendable {
     }
 
     /// Pan by a screen-pixel delta (dragging the content). Non-finite deltas are
-    /// ignored.
+    /// ignored. Unusable geometry returns safely; a poisoned camera is normalized via
+    /// `clamp` *before* the gesture-specific early return, so a poisoned camera + an
+    /// invalid gesture still lands on a valid invariant. After `clamp`, `bytePx` is
+    /// finite/>0 so the divisions below cannot re-poison the origin.
     public mutating func pan(dxPx: Double, dyPx: Double, geometry g: CameraGeometry) {
-        guard g.isUsable, dxPx.isFinite, dyPx.isFinite, bytePx > 0 else { return }
+        guard g.isUsable else { return }
+        clamp(g)
+        guard dxPx.isFinite, dyPx.isFinite else { return }
         originByteX -= dxPx / bytePx
         originByteY -= dyPx / bytePx
         clamp(g)
@@ -147,13 +158,23 @@ public struct Camera: Equatable, Sendable {
     /// no background gap at either edge); content smaller than or equal to the
     /// viewport is pinned to the centered origin, which also disables panning on that
     /// axis (any pan is immediately clamped back to center).
+    ///
+    /// Restores the invariant even from poisoned public state: a NaN/Inf origin on an
+    /// undersized axis is centered (not zeroed), and a non-finite origin on a larger
+    /// axis is replaced with a finite value before clamping. (`bytePx` is guaranteed
+    /// finite/>0 by `clamp` before this runs; the guard is defensive.)
     private func clampOrigin(_ v: inout Double, viewPx: Double, soupBytes: Double) {
-        guard v.isFinite, bytePx > 0 else { v = 0; return }
+        guard bytePx.isFinite, bytePx > 0 else { v = 0; return }
         let visible = viewPx / bytePx                 // soup bytes across the viewport
         if soupBytes <= visible {
-            v = (soupBytes - visible) / 2             // center; nothing to reveal by panning
+            // Always center undersized axes, regardless of the incoming origin (even
+            // NaN/Inf): there is nothing to reveal by panning, so pin to center.
+            v = (soupBytes - visible) / 2
         } else {
-            v = Swift.min(Swift.max(v, 0), soupBytes - visible)
+            // Larger than the viewport: replace a non-finite origin with a finite value
+            // (0) before clamping so the invariant always restores.
+            let finiteV = v.isFinite ? v : 0
+            v = Swift.min(Swift.max(finiteV, 0), soupBytes - visible)
         }
     }
 }

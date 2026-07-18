@@ -177,3 +177,39 @@ public func parseSingleSeed(_ raw: String) throws -> UInt32 {
     }
     return seeds[0]
 }
+
+// MARK: - --shadow-sample resolution
+
+/// The resolution of a `--shadow-sample` argument for one matrix cell.
+public enum ShadowSampleResolution: Equatable {
+    /// The shadow-sample count to use for this cell (`0` = throughput mode).
+    case count(Int)
+    /// The argument is neither `all` nor a decimal integer — a usage error.
+    case notAnIntegerOrAll(value: String)
+}
+
+/// Resolve a `--shadow-sample` argument against a single matrix cell's program count.
+///
+/// The benchmark expands `--programs` into one cell per program count, and
+/// `--shadow-sample all` must resolve **per cell** against that cell's program count —
+/// so `--programs 4,8 --shadow-sample all` shadows 2 pairs in the 4-program cell and 4
+/// in the 8-program cell. Because `all` carries no count of its own (it is just the
+/// literal string `"all"`), the resolution is independent of whether `--programs`
+/// precedes or follows `--shadow-sample` on the command line: the argument is captured
+/// as a raw string during parsing and resolved later against each cell's final program
+/// count. (The app-launch parser defers `all` the same way; see `AppLaunchOptions`.)
+///
+/// - Parameters:
+///   - arg: The raw `--shadow-sample` argument string, or `nil` if the flag was
+///     omitted (throughput mode: 0 shadowed pairs).
+///   - programCount: The cell's program count — the per-cell resolution input.
+/// - Returns: `.count(n)` where `n` is `0` (`nil`), `max(0, programCount / 2)` (`all`),
+///   or the parsed integer; `.notAnIntegerOrAll` for a non-decimal, non-`all` value
+///   (the caller exits with the usage code, exactly as a non-integer `intArg` would).
+public func resolveShadowSampleCount(_ arg: String?,
+                                     programCount: Int) -> ShadowSampleResolution {
+    guard let raw = arg else { return .count(0) }
+    if raw == "all" { return .count(max(0, programCount / 2)) }
+    if let n = Int(raw) { return .count(n) }
+    return .notAnIntegerOrAll(value: raw)
+}

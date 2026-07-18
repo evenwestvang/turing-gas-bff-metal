@@ -219,4 +219,156 @@ final class CameraInvariantTests: XCTestCase {
             XCTAssertEqual(cam, snapshot, "an unusable geometry must never mutate the camera")
         }
     }
+
+    // MARK: - Poisoned public state restoration
+    //
+    // The public `originByte*` / `bytePx` fields are mutable, so a buggy caller (or a
+    // corrupt restore-from-disk) can poison them with NaN/Inf/≤0. `clamp`, `zoom`, and
+    // `pan` must restore the invariant even from that state — centering undersized axes
+    // (never zeroing them), replacing a non-finite origin with a finite value before
+    // clamping larger axes, and normalizing *before* any gesture-specific early return
+    // so a poisoned camera + an invalid gesture still lands on a valid invariant.
+
+    /// Cameras with one poisoned public field each — origins NaN/Inf, bytePx
+    /// NaN/Inf/≤0 — against a `bytePx` that keeps both axes oversized on `tallContent`.
+    private func poisonedCameras() -> [Camera] {
+        [Camera(originByteX: .nan,        originByteY: 50,         bytePx: 10),
+         Camera(originByteX: 50,          originByteY: .infinity,  bytePx: 10),
+         Camera(originByteX: -.infinity,  originByteY: .nan,       bytePx: 10),
+         Camera(originByteX: 100,         originByteY: 100,         bytePx: .nan),
+         Camera(originByteX: 100,         originByteY: 100,         bytePx: .infinity),
+         Camera(originByteX: 100,         originByteY: 100,         bytePx: -3),
+         Camera(originByteX: 100,         originByteY: 100,         bytePx: 0)]
+    }
+
+    /// `clamp` restores the invariant from any poisoned origin on undersized axes
+    /// (content smaller than the viewport → centered, never zeroed), even with NaN/Inf
+    /// origins. `bytePx` stays in the undersized range so both axes are undersized.
+    func testClampRestoresInvariantFromPoisonedOriginUndersizedAxes() {
+        let g = wideView()
+        let bytePx = 4.5  // minBytePx(wideView); keeps both axes undersized at the fit zoom
+        for origin in [Double.nan, .infinity, -.infinity] {
+            var cam = Camera(originByteX: origin, originByteY: origin, bytePx: bytePx)
+            cam.clamp(g)
+            assertInvariant(cam, g, "poisoned origin=\(origin)")
+            // Undersized axes are exactly centered, not zero, not NaN.
+            let visX = g.viewPxWidth / cam.bytePx
+            let visY = g.viewPxHeight / cam.bytePx
+            XCTAssertEqual(cam.originByteX, (g.soupByteWidth - visX) / 2, accuracy: 1e-6,
+                           "x centered from origin=\(origin)")
+            XCTAssertEqual(cam.originByteY, (g.soupByteHeight - visY) / 2, accuracy: 1e-6,
+                           "y centered from origin=\(origin)")
+        }
+    }
+
+    /// `clamp` restores the invariant from any poisoned origin on oversized axes
+    /// (content larger than the viewport → origin in `[0, soupBytes − visible]`),
+    /// replacing NaN/Inf with a finite value before clamping.
+    func testClampRestoresInvariantFromPoisonedOriginOversizedAxes() {
+        let g = tallContent()
+        let bytePx = 10.0  // makes both axes oversized on tallContent (visible ≪ content)
+        for origin in [Double.nan, .infinity, -.infinity] {
+            var cam = Camera(originByteX: origin, originByteY: origin, bytePx: bytePx)
+            cam.clamp(g)
+            assertInvariant(cam, g, "poisoned origin=\(origin)")
+            let visible = g.viewPxWidth / cam.bytePx
+            XCTAssertGreaterThanOrEqual(cam.originByteX, -1e-6,
+                "x origin finite and >= 0 from origin=\(origin)")
+            XCTAssertLessThanOrEqual(cam.originByteX, g.soupByteWidth - visible + 1e-6,
+                "x origin <= soupBytes − visible from origin=\(origin)")
+        }
+    }
+
+    /// `clamp` restores the invariant from a poisoned `bytePx` (NaN, ±Inf, ≤0) on both
+    /// undersized and oversized geometries — `bytePx` is reset into `[minBytePx, max]`
+    /// and the origins re-centered/clamped against the restored zoom.
+    func testClampRestoresInvariantFromPoisonedBytePx() {
+        for g in [wideView(), tallContent()] {
+            for bad in [Double.nan, .infinity, -.infinity, -1.0, 0.0] {
+                var cam = Camera(originByteX: 100, originByteY: 100, bytePx: bad)
+                cam.clamp(g)
+                assertInvariant(cam, g, "poisoned bytePx=\(bad)")
+            }
+        }
+    }
+
+    /// `zoom` with an invalid gesture on a poisoned camera normalizes the state
+    /// *before* the gesture early return — the camera lands on a valid invariant, not
+    /// the poisoned input. Covers both undersized and oversized geometries.
+    func testZoomNormalizesPoisonedStateBeforeGestureEarlyReturn() {
+        for g in [wideView(), tallContent()] {
+            for poisoned in poisonedCameras() {
+                var cam = poisoned
+                cam.zoom(factor: .nan, anchorPxX: 640, anchorPxY: 400, geometry: g)
+                assertInvariant(cam, g, "zoom(NaN factor) from \(poisoned)")
+
+                cam = poisoned
+                cam.zoom(factor: 2, anchorPxX: .nan, anchorPxY: .infinity, geometry: g)
+                assertInvariant(cam, g, "zoom(valid factor, NaN anchor) from \(poisoned)")
+            }
+        }
+    }
+
+    /// `pan` with an invalid gesture on a poisoned camera normalizes the state *before*
+    /// the gesture early return. Covers both undersized and oversized geometries.
+    func testPanNormalizesPoisonedStateBeforeGestureEarlyReturn() {
+        for g in [wideView(), tallContent()] {
+            for poisoned in poisonedCameras() {
+                var cam = poisoned
+                cam.pan(dxPx: .nan, dyPx: .infinity, geometry: g)
+                assertInvariant(cam, g, "pan(NaN, Inf) from \(poisoned)")
+            }
+        }
+    }
+
+    /// A valid `zoom` from poisoned state restores the invariant and keeps the cursor
+    /// anchor: `clamp` runs before `before` is sampled, so the byte under the anchor
+    /// after the zoom equals the byte under the anchor in the *normalized* pre-state.
+    func testZoomFromPoisonedStateRestoresInvariantAndKeepsAnchor() {
+        let g = tallContent()
+        let ax = 640.0, ay = 400.0
+        for poisoned in poisonedCameras() {
+            var cam = poisoned
+            cam.zoom(factor: 1.5, anchorPxX: ax, anchorPxY: ay, geometry: g)
+            assertInvariant(cam, g, "valid zoom from \(poisoned)")
+
+            var normalized = poisoned
+            normalized.clamp(g)
+            let expected = normalized.screenToByte(pxX: ax, pxY: ay)
+            let after = cam.screenToByte(pxX: ax, pxY: ay)
+            XCTAssertEqual(after.x, expected.x, accuracy: 1e-3,
+                           "anchor x preserved from \(poisoned)")
+            XCTAssertEqual(after.y, expected.y, accuracy: 1e-3,
+                           "anchor y preserved from \(poisoned)")
+        }
+    }
+
+    /// A valid `pan` from poisoned state restores the invariant. Covers both undersized
+    /// axes (pan locked to center) and oversized axes (pan clamped to the covering range).
+    func testPanFromPoisonedStateRestoresInvariant() {
+        for g in [wideView(), tallContent()] {
+            for poisoned in poisonedCameras() {
+                var cam = poisoned
+                cam.pan(dxPx: -500, dyPx: 300, geometry: g)
+                assertInvariant(cam, g, "valid pan from \(poisoned)")
+            }
+        }
+    }
+
+    /// A resize (re-`clamp` under changing geometry) from a poisoned start restores and
+    /// preserves the invariant across every intermediate size, on both geometries.
+    func testResizeFromPoisonedStateRestoresInvariant() {
+        for base in [wideView(), tallContent()] {
+            var g = base
+            for poisoned in poisonedCameras() {
+                var cam = poisoned
+                for (w, h) in [(400.0, 300.0), (2400.0, 1400.0), (60.0, 4000.0)] {
+                    g.viewPxWidth = w
+                    g.viewPxHeight = h
+                    cam.clamp(g)
+                    assertInvariant(cam, g, "resize to \(w)x\(h) from \(poisoned)")
+                }
+            }
+        }
+    }
 }
