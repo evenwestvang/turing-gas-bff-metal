@@ -158,4 +158,31 @@ final class ResidentAppRunPlanTests: XCTestCase {
         XCTAssertFalse(emitter.emit(diagnostic) { lines.append($0) })
         XCTAssertEqual(lines.count, 1)
     }
+
+    func testResidentTerminationExitCodePolicy() {
+        XCTAssertEqual(ResidentTerminationPolicy.exitCode(reason: .epochLimit,
+                                                          metalAvailable: true,
+                                                          hasError: false),
+                       0)
+        XCTAssertEqual(ResidentTerminationPolicy.exitCode(reason: .secondsLimit,
+                                                          metalAvailable: true,
+                                                          hasError: false),
+                       0)
+        XCTAssertEqual(ResidentTerminationPolicy.exitCode(reason: .requested,
+                                                          metalAvailable: true,
+                                                          hasError: false),
+                       0)
+        XCTAssertEqual(ResidentTerminationPolicy.exitCode(reason: .failure,
+                                                          metalAvailable: true,
+                                                          hasError: false),
+                       1)
+        XCTAssertEqual(ResidentTerminationPolicy.exitCode(reason: .epochLimit,
+                                                          metalAvailable: true,
+                                                          hasError: true),
+                       1)
+        XCTAssertEqual(ResidentTerminationPolicy.exitCode(reason: .failure,
+                                                          metalAvailable: false,
+                                                          hasError: true),
+                       2)
+    }
 }

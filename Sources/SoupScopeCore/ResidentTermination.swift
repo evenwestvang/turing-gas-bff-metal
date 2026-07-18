@@ -8,6 +8,22 @@ public enum ResidentDriverStopReason: String, Codable, Equatable, Sendable {
     case failure
 }
 
+public enum ResidentTerminationPolicy {
+    /// Resident process exit status: 0 for normal bounded stops, 2 when Metal
+    /// never came up, and 1 for every other resident failure or surfaced app error.
+    public static func exitCode(reason: ResidentDriverStopReason,
+                                metalAvailable: Bool,
+                                hasError: Bool) -> Int32 {
+        guard metalAvailable else { return 2 }
+        switch reason {
+        case .failure:
+            return 1
+        case .requested, .epochLimit, .secondsLimit:
+            return hasError ? 1 : 0
+        }
+    }
+}
+
 public struct ResidentProgressSnapshot: Equatable, Sendable {
     public var simulationEpoch: Int
     public var textureSourceEpoch: Int

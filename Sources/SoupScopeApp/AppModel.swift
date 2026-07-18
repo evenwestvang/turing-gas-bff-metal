@@ -415,8 +415,18 @@ final class AppModel: ObservableObject, @unchecked Sendable {
             failures: snapshot.failures,
             unknownHalts: snapshot.unknownHalts,
             stopReason: reason)
-        residentFinalDiagnosticEmitter.emit(diagnostic) { print($0) }
-        NSApplication.shared.terminate(nil)
+        guard residentFinalDiagnosticEmitter.emit(diagnostic, write: { print($0) }) else {
+            return
+        }
+        let exitCode = ResidentTerminationPolicy.exitCode(
+            reason: reason,
+            metalAvailable: context != nil,
+            hasError: hud.errorState != nil)
+        if exitCode == 0 {
+            NSApplication.shared.terminate(nil)
+        } else {
+            exit(exitCode)
+        }
     }
 
     func stopResidentSimulation() {
