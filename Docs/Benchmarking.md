@@ -27,13 +27,29 @@ diagnostics and warnings go to stderr. One `results[]` entry per matrix cell. Pi
 "Paper-aligned observability" below). Per sample: `brotliBitsPerByte`,
 `highOrderComplexity`. Per result: `initialBrotliBitsPerByte`,
 `initialHighOrderComplexity`, `finalBrotliBitsPerByte`, `finalHighOrderComplexity`,
-and `highOrderComplexityCrossings` (an array of `{complexity, crossed, epoch,
-wallMsToCross, gpuMsToCross}` first-crossing records). Per config:
-`highOrderComplexityThresholds`. **All are `null`/`[]` unless `--brotli` is on and
-the linked Brotli is exactly 1.1.0** — the same explicit-null discipline as schema 2
-(keys always present; `null` = "not computed", never a fabricated 0). Schema 2's key
-set is otherwise unchanged; `H0` itself is the already-present whole-soup entropy
-(`initial/finalEntropyBitsPerByte`, per-sample `entropyBitsPerByte`).
+and `highOrderComplexityCrossings` — an array of first-crossing records shaped
+`{complexity, crossed, observedEpoch, previousMeasuredEpoch, crossingEpochCensoring,
+wallMsToCross, gpuMsToCross}`. The observation interval is encoded explicitly so
+machine-readable output cannot imply the true crossing epoch is exact: the true
+crossing lies in the half-open interval `(previousMeasuredEpoch, observedEpoch]`,
+and `crossingEpochCensoring` is `"exact"` (every epoch in the interval was
+measured — always the case at measurement cadence 1, or when the crossing is
+first observed at epoch 0), `"interval"` (Brotli was measured sparsely; the true
+crossing is somewhere in the interval but not pinpointed), or `"notCrossed"`
+(threshold not reached by the last measurement; `observedEpoch` is `null` and
+`previousMeasuredEpoch` holds the last measured epoch). When `--brotli` is on but
+no `highOrderComplexity` observation exists (e.g. the linked Brotli is not 1.1.0
+so the injected closure returns `nil`), `highOrderComplexityCrossings` is `[]` —
+never a list of false "not crossed" records. Per config:
+`highOrderComplexityThresholds`. **All are `null`/`[]` unless `--brotli` is on
+and the linked Brotli is exactly 1.1.0** — the same explicit-null discipline as
+schema 2 (keys always present; `null` = "not computed", never a fabricated 0).
+Schema 2's key set is otherwise unchanged; `H0` itself is the already-present
+whole-soup entropy (`initial/finalEntropyBitsPerByte`, per-sample
+`entropyBitsPerByte`). Custom `init(from:)` on `BenchmarkConfig` and
+`BenchmarkResult` accepts schema-2-shaped JSON missing every new Brotli/config/
+crossing key: optional scalar metrics default to `nil`, arrays/thresholds to `[]`,
+and no existing field's meaning is changed.
 
 **Schema 2** (from 1): entropy-kinetics fields (`initialEntropyBitsPerByte`,
 `finalEntropyBitsPerByte`, `finalDeltaH`, `finalMeanProgramEntropyBitsPerByte`,
@@ -205,9 +221,25 @@ H0 is the already-reported whole-soup entropy (`initial/finalEntropyBitsPerByte`
 | Parameters | quality **2**, lgwin **24** (`BROTLI_MAX_WINDOW_BITS`), mode **generic**, whole soup in one shot, output sized by `BrotliEncoderMaxCompressedSize(n)` |
 | Provenance gate | `BrotliEncoderVersion() == 0x1001000`; the metric is emitted **only** against 1.1.0 — any other encoder yields `null` (honest "not computed"), never a wrong number |
 
-These match cubff's `common_language.h` exactly (verified in `Docs/CubffGrounding.md`).
-This is a **version-checked** dependency, not an unversioned system Brotli: the runtime
-gate refuses to stand in a non-1.1.0 encoder for the paper number.
+These match cubff's measurement exactly. The upstream source references
+(paradigms-of-intelligence/cubff, pinned commit
+`f212e849027c98fcf4b242eccfb5fed435223e23`; see `Docs/CubffGrounding.md`):
+
+| Metric | cubff name | Upstream source |
+|---|---|---|
+| **H0** (whole-soup order-0 Shannon entropy, bits/byte) | `h0` | `common_language.h` — computed over the whole soup each measured epoch |
+| **Brotli bpb** (`brotli_size * 8 / soupBytes`) | `brotli_bpb` | `common_language.h` — `BrotliEncoderCompress(2, 24, BROTLI_MODE_GENERIC, …)` over the whole soup; `brotli_size` = the returned `*encoded_size` |
+| **High-order complexity** (`H0 − brotli_bpb`) | `higher_entropy` | `common_language.h` — arithmetic `h0 - brotli_bpb`, logged per measured epoch |
+
+**Runtime version gating is not cryptographic tag authentication.** The
+`BrotliEncoderVersion() == 0x1001000` check detects a library that *reports* 1.1.0
+but does not verify the library binary against the pinned tag's hash — a
+maliciously patched Brotli that lies about its version would pass the gate. The
+fixture generator (`Tools/brotli-fixtures/generate.sh`) remains **tag-pinned**: it
+clones `v1.1.0` from `https://github.com/google/brotli`, hard-checks the commit
+SHA `ed738e842d2fbdf2d6459e39267a633c4a9b2f5d`, and refuses to emit fixtures from
+any other checkout, so the authoritative compressed-byte-count fixtures are
+reproducible from source regardless of what the system library reports.
 
 **Fixtures.** `Tests/BrotliMetricsTests/Fixtures/brotli-1.1.0-q2.json` records eight
 small literal inputs (empty, constant runs, an opcode cycle, an iota block, SplitMix64
@@ -230,11 +262,17 @@ every epoch and never inside `runEpoch`, so simulation throughput is unaffected.
 ignored (stderr note) under `--no-samples`.
 
 `--high-order-thresholds L` records the first-crossing epoch/time for each level
-(default `1`). Because Brotli is sparse by construction, the crossing epoch is resolved
-**to the Brotli measurement cadence**, not necessarily the exact epoch — stated in the
-field docs rather than implied to be per-epoch exact. (Contrast `--delta-h-thresholds`,
-which needs the per-epoch entropy trajectory and so is rejected under a sparse
-`--signal-interval`.)
+(default `1`). Because Brotli is sparse by construction, the crossing epoch is
+resolved **to the Brotli measurement cadence**, not necessarily the exact epoch.
+Each crossing record encodes the observation interval explicitly:
+`previousMeasuredEpoch` (the preceding Brotli-measured epoch, or `nil` at the
+initial epoch-0 reading), `observedEpoch` (the first measured epoch reaching the
+threshold), and `crossingEpochCensoring` (`"exact"` when every epoch in the
+interval was measured — always at cadence 1; `"interval"` when Brotli was
+measured sparsely; `"notCrossed"` when the threshold was never reached). This
+ensures machine-readable output cannot imply the true crossing epoch is exact
+when it is not. (Contrast `--delta-h-thresholds`, which needs the per-epoch
+entropy trajectory and so is rejected under a sparse `--signal-interval`.)
 
 ### Determinism and isolation
 
@@ -264,7 +302,9 @@ fields reported as `null`.
   crossing 1, replicator onset) should agree in distribution — not exact numeric parity
   at a given epoch. The compression *definition* is exact (same encoder, same
   parameters); only the soup that is fed to it comes from a different RNG.
-- **Crossing epoch is cadence-resolved** (above).
+- **Crossing epoch is cadence-resolved** and the observation interval is encoded
+  explicitly in each crossing record (`previousMeasuredEpoch`, `observedEpoch`,
+  `crossingEpochCensoring`) — see above.
 - **1.0.9 ≠ 1.1.0 at scale**: the metric is pinned to 1.1.0 for this reason.
 
 ## Self-replicator counting (`CheckSelfRep`): feasibility report
@@ -402,7 +442,7 @@ so Brotli is measured a bounded number of times over the run:
 
 ```sh
 swift run -c release bff-metal-bench \
-  --programs 131072 --seed 1,2,3 --warmup 2 --epochs 16384 \
+  --programs 131072 --seeds 1,2,3 --warmup 2 --epochs 16384 \
   --init uniform --brotli --signal-interval 64 --sample-interval 64 \
   --high-order-thresholds 0.5,1,2 \
   > paper-study-16384.json

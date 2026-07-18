@@ -173,7 +173,11 @@ while cursor < arguments.count {
           --high-order-thresholds L  comma bits/byte high-order-complexity levels whose
                                   first-crossing epoch/time to record (default 1, the
                                   paper threshold). Only with --brotli; the crossing
-                                  epoch is resolved to the Brotli measurement cadence.
+                                  epoch is resolved to the Brotli measurement cadence
+                                  and the observation interval is encoded explicitly
+                                  (observedEpoch, previousMeasuredEpoch,
+                                  crossingEpochCensoring) so the true crossing is
+                                  never implied to be exact when it is not.
           --sample-interval N     JSON emission cadence: emit a kinetics sample every N
                                   epochs (+ the final epoch) (default 1). It is also the
                                   LZ-proxy MEASUREMENT cadence when --compression is on
@@ -319,10 +323,14 @@ func emit(_ results: [BenchmarkResult]) {
     do {
         // schemaVersion 3: paper-aligned high-order complexity added — per-sample
         // brotliBitsPerByte/highOrderComplexity, result initial/final Brotli bpb +
-        // high-order complexity, and highOrderComplexityCrossings, plus the config
-        // key highOrderComplexityThresholds. All null/empty unless --brotli measured
-        // against Brotli 1.1.0. Schema 2's key set is otherwise unchanged and every
-        // optional stays an explicit null (see Docs/Benchmarking.md).
+        // high-order complexity, and highOrderComplexityCrossings (each record
+        // carries observedEpoch, previousMeasuredEpoch, and crossingEpochCensoring
+        // so the true crossing epoch cannot be mistaken for exact under sparse
+        // measurement), plus the config key highOrderComplexityThresholds. All
+        // null/empty unless --brotli measured against Brotli 1.1.0. Schema 2's key
+        // set is otherwise unchanged and every optional stays an explicit null
+        // (see Docs/Benchmarking.md). Custom init(from:) accepts schema-2-shaped
+        // JSON missing every new key, defaulting optionals to nil and arrays to [].
         let data = try encoder.encode(Envelope(schemaVersion: 3, results: results))
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))

@@ -145,6 +145,34 @@ public struct BenchmarkConfig: Equatable, Sendable, Codable {
                        mutationP32: mutationP32, variant: variant,
                        shadowSampleCount: shadowSampleCount, initMode: initMode)
     }
+
+    /// Backward-compatible decode: schema-2 JSON lacks `highOrderComplexityThresholds`
+    /// (added in schema 3). Default it to `[]` so a schema-2-shaped config decodes
+    /// without changing any existing field's meaning. `deltaHThresholds` is treated
+    /// the same way for robustness (it is a schema-2 key but may be absent in
+    /// trimmed snapshots). Existing scalar keys are decoded strictly — no silent
+    /// remapping of old field meanings.
+    enum CodingKeys: String, CodingKey {
+        case seed, programCount, stepBudget, mutationP32, variant, initMode,
+             shadowSampleCount, warmupEpochs, measuredEpochs, deltaHThresholds,
+             highOrderComplexityThresholds, sampleInterval
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        seed = try c.decode(UInt32.self, forKey: .seed)
+        programCount = try c.decode(Int.self, forKey: .programCount)
+        stepBudget = try c.decode(Int.self, forKey: .stepBudget)
+        mutationP32 = try c.decode(UInt32.self, forKey: .mutationP32)
+        variant = try c.decode(BFFVariant.self, forKey: .variant)
+        initMode = try c.decode(SoupConfig.InitMode.self, forKey: .initMode)
+        shadowSampleCount = try c.decode(Int.self, forKey: .shadowSampleCount)
+        warmupEpochs = try c.decode(Int.self, forKey: .warmupEpochs)
+        measuredEpochs = try c.decode(Int.self, forKey: .measuredEpochs)
+        deltaHThresholds = try c.decodeIfPresent([Double].self, forKey: .deltaHThresholds) ?? []
+        highOrderComplexityThresholds =
+            try c.decodeIfPresent([Double].self, forKey: .highOrderComplexityThresholds) ?? []
+        sampleInterval = try c.decodeIfPresent(Int.self, forKey: .sampleInterval) ?? 1
+    }
 }
 
 // MARK: - Per-epoch observation
@@ -244,51 +272,130 @@ public struct ThresholdTracker {
 /// First-crossing record for one paper high-order-complexity (`H0 − brotli_bpb`)
 /// threshold. Parallel to `ThresholdCrossing` but tracks the *absolute* complexity,
 /// not a delta, and its epoch is resolved only to the Brotli measurement cadence.
+///
+/// Because Brotli is measured sparsely (on the sample∩signal cadence, plus epoch 0
+/// and the final epoch), the true crossing epoch cannot be implied to be exact.
+/// Instead the observation interval is encoded explicitly: the true crossing lies
+/// in the half-open interval `(previousMeasuredEpoch, observedEpoch]`. At
+/// measurement cadence 1 (every epoch measured) this interval is a single epoch
+/// and `crossingEpochCensoring` is `"exact"`; at a sparse cadence the interval may
+/// span several epochs and `crossingEpochCensoring` is `"interval"`.
 public struct HighOrderComplexityCrossing: Equatable, Sendable, Codable {
     /// The threshold in bits/byte of high-order complexity. The paper's regime is `1`.
     public var complexity: Double
     public var crossed: Bool
-    /// The first Brotli-measured epoch whose complexity reached the threshold.
-    /// Because Brotli runs only on the sample cadence, this is the crossing epoch
-    /// **to Brotli-measurement resolution**, not necessarily the exact epoch —
-    /// stated honestly rather than implied to be per-epoch exact.
-    public var epoch: Int?
-    /// Cumulative wall ms from run start to that epoch (includes warmup timing).
+    /// The first Brotli-measured epoch at which complexity reached the threshold.
+    /// `nil` when `crossed` is false. The true crossing epoch lies in the
+    /// half-open interval `(previousMeasuredEpoch, observedEpoch]`.
+    public var observedEpoch: Int?
+    /// The Brotli-measured epoch immediately preceding `observedEpoch`, or `nil`
+    /// when the crossing was first observed at the initial (epoch-0) measurement
+    /// (the true crossing is then at or before epoch 0). When `crossed` is false
+    /// this holds the last Brotli-measured epoch of the run — the right endpoint
+    /// of the observation window over which the threshold was not reached. `nil`
+    /// when no Brotli measurement was taken at all.
+    public var previousMeasuredEpoch: Int?
+    /// How the true crossing epoch is bounded — a clear, machine-readable censoring
+    /// representation:
+    /// - `"exact"`: every epoch in `(previousMeasuredEpoch, observedEpoch]` was
+    ///   measured, so `observedEpoch` is the exact crossing epoch. Always the case
+    ///   at measurement cadence 1, and when the crossing is first observed at
+    ///   epoch 0 (the initial reading).
+    /// - `"interval"`: Brotli was measured sparsely; the true crossing is
+    ///   somewhere in `(previousMeasuredEpoch, observedEpoch]` but not pinpointed
+    ///   to a single epoch.
+    /// - `"notCrossed"`: the threshold was not reached by the last Brotli
+    ///   measurement (`previousMeasuredEpoch`); `observedEpoch` is `nil`.
+    public var crossingEpochCensoring: String
+    /// Cumulative wall ms from run start to `observedEpoch` (includes warmup).
     public var wallMsToCross: Double?
-    /// Cumulative GPU command-buffer ms to that epoch, or `nil` if any epoch up to
-    /// the crossing lacked a usable GPU timestamp.
+    /// Cumulative GPU command-buffer ms to `observedEpoch`, or `nil` if any epoch
+    /// up to the crossing lacked a usable GPU timestamp.
     public var gpuMsToCross: Double?
+
+    public init(complexity: Double, crossed: Bool, observedEpoch: Int?,
+                previousMeasuredEpoch: Int?, crossingEpochCensoring: String,
+                wallMsToCross: Double?, gpuMsToCross: Double?) {
+        self.complexity = complexity
+        self.crossed = crossed
+        self.observedEpoch = observedEpoch
+        self.previousMeasuredEpoch = previousMeasuredEpoch
+        self.crossingEpochCensoring = crossingEpochCensoring
+        self.wallMsToCross = wallMsToCross
+        self.gpuMsToCross = gpuMsToCross
+    }
 }
 
 /// Records the first Brotli-measured epoch at which high-order complexity reaches
 /// each threshold. Pure and order-following: feed it one `observe(...)` per
 /// Brotli-measured epoch, in epoch order (epoch 0's reference first, if measured).
+///
+/// **Nil-compression contract (fix: wrong encoder / nil compression).** When
+/// `--brotli` is requested but no actual `highOrderComplexity` observation exists
+/// (e.g. the injected closure returns `nil` because the linked Brotli is not
+/// 1.1.0), `observe(...)` is never called. In that case `crossings` returns an
+/// empty array — never a list of false "not crossed" records — so the
+/// machine-readable output cannot imply a measurement was taken when it was not.
 public struct HighOrderComplexityTracker {
     private let thresholds: [Double]
     private var recorded: [HighOrderComplexityCrossing]
+    /// The epoch passed to the previous `observe(...)` call, or `nil` before the
+    /// first call. Used to compute `previousMeasuredEpoch` and the censoring kind.
+    private var previousEpoch: Int? = nil
+    /// Number of `observe(...)` calls. When zero, `crossings` is empty (fix #1).
+    private var observationsFed: Int = 0
 
     public init(thresholds: [Double]) {
         self.thresholds = thresholds
         self.recorded = thresholds.map {
-            HighOrderComplexityCrossing(complexity: $0, crossed: false, epoch: nil,
+            HighOrderComplexityCrossing(complexity: $0, crossed: false,
+                                        observedEpoch: nil, previousMeasuredEpoch: nil,
+                                        crossingEpochCensoring: "notCrossed",
                                         wallMsToCross: nil, gpuMsToCross: nil)
         }
     }
 
     /// Observe one Brotli-measured epoch. A threshold is crossed the first epoch
-    /// `complexity >= threshold`.
+    /// `complexity >= threshold`. The interval `(previousMeasuredEpoch, observedEpoch]`
+    /// is encoded explicitly so the true crossing epoch cannot be mistaken for
+    /// exact under a sparse measurement cadence.
     public mutating func observe(epoch: Int, complexity: Double,
                                  cumulativeWallMs: Double, cumulativeGpuMs: Double?) {
-        for i in recorded.indices where !recorded[i].crossed
-            && complexity >= recorded[i].complexity {
-            recorded[i].crossed = true
-            recorded[i].epoch = epoch
-            recorded[i].wallMsToCross = cumulativeWallMs
-            recorded[i].gpuMsToCross = cumulativeGpuMs
+        observationsFed += 1
+        for i in recorded.indices {
+            if !recorded[i].crossed && complexity >= recorded[i].complexity {
+                recorded[i].crossed = true
+                recorded[i].observedEpoch = epoch
+                recorded[i].previousMeasuredEpoch = previousEpoch
+                recorded[i].crossingEpochCensoring =
+                    Self.censoringKind(observed: epoch, previous: previousEpoch)
+                recorded[i].wallMsToCross = cumulativeWallMs
+                recorded[i].gpuMsToCross = cumulativeGpuMs
+            } else if !recorded[i].crossed {
+                // Still not crossed: advance the right endpoint of the observation
+                // window so the consumer knows up to which epoch it was not reached.
+                recorded[i].previousMeasuredEpoch = epoch
+            }
         }
+        previousEpoch = epoch
     }
 
-    public var crossings: [HighOrderComplexityCrossing] { recorded }
+    /// The censoring kind for a crossing at `observed` whose preceding measurement
+    /// was at `previous`. `nil` previous means epoch-0 (the initial reading) —
+    /// exact. A gap of 1 means every epoch in the interval was measured — exact.
+    /// A gap > 1 means the true crossing is somewhere in the interval.
+    fileprivate static func censoringKind(observed: Int, previous: Int?) -> String {
+        guard let previous else { return "exact" }
+        return observed - previous == 1 ? "exact" : "interval"
+    }
+
+    public var crossings: [HighOrderComplexityCrossing] {
+        // Fix #1: when no observation was ever fed (e.g. --brotli on but the
+        // closure returned nil for every epoch), return empty — never a list of
+        // false "not crossed" records that would imply a measurement was taken.
+        guard observationsFed > 0 else { return [] }
+        return recorded
+    }
 }
 
 // MARK: - Result
@@ -441,15 +548,39 @@ extension ThresholdCrossing {
 
 extension HighOrderComplexityCrossing {
     enum CodingKeys: String, CodingKey {
-        case complexity, crossed, epoch, wallMsToCross, gpuMsToCross
+        case complexity, crossed, observedEpoch, previousMeasuredEpoch,
+             crossingEpochCensoring, wallMsToCross, gpuMsToCross
     }
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(complexity, forKey: .complexity)
         try c.encode(crossed, forKey: .crossed)
-        try c.encodeOrNull(epoch, forKey: .epoch)
+        try c.encodeOrNull(observedEpoch, forKey: .observedEpoch)
+        try c.encodeOrNull(previousMeasuredEpoch, forKey: .previousMeasuredEpoch)
+        try c.encode(crossingEpochCensoring, forKey: .crossingEpochCensoring)
         try c.encodeOrNull(wallMsToCross, forKey: .wallMsToCross)
         try c.encodeOrNull(gpuMsToCross, forKey: .gpuMsToCross)
+    }
+    /// Backward-compatible decode: `observedEpoch`, `previousMeasuredEpoch`, and
+    /// `crossingEpochCensoring` default gracefully when absent (e.g. partial JSON).
+    /// A missing `crossingEpochCensoring` is derived conservatively from `crossed`.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        complexity = try c.decode(Double.self, forKey: .complexity)
+        crossed = try c.decode(Bool.self, forKey: .crossed)
+        observedEpoch = try c.decodeIfPresent(Int.self, forKey: .observedEpoch)
+        previousMeasuredEpoch = try c.decodeIfPresent(Int.self, forKey: .previousMeasuredEpoch)
+        if let kind = try c.decodeIfPresent(String.self, forKey: .crossingEpochCensoring) {
+            crossingEpochCensoring = kind
+        } else if crossed, let observed = observedEpoch {
+            // Derive from the gap when the field is absent.
+            crossingEpochCensoring = HighOrderComplexityTracker.censoringKind(
+                observed: observed, previous: previousMeasuredEpoch)
+        } else {
+            crossingEpochCensoring = "notCrossed"
+        }
+        wallMsToCross = try c.decodeIfPresent(Double.self, forKey: .wallMsToCross)
+        gpuMsToCross = try c.decodeIfPresent(Double.self, forKey: .gpuMsToCross)
     }
 }
 
@@ -539,6 +670,59 @@ extension BenchmarkResult {
         try c.encodeOrNull(maxRSSBytes, forKey: .maxRSSBytes)
         try c.encode(samples, forKey: .samples)
         try c.encode(finalDigest, forKey: .finalDigest)
+    }
+
+    /// Backward-compatible decode: schema-2 JSON lacks every Brotli/high-order key
+    /// added in schema 3 (`initialBrotliBitsPerByte`, `initialHighOrderComplexity`,
+    /// `finalBrotliBitsPerByte`, `finalHighOrderComplexity`, and
+    /// `highOrderComplexityCrossings`). Optional scalar metrics default to `nil`
+    /// and the crossings array defaults to `[]`, so a schema-2-shaped result decodes
+    /// without altering any existing field's meaning. Existing schema-2 keys are
+    /// decoded strictly; `thresholdCrossings`/`samples` tolerate absence (default
+    /// `[]`) for trimmed snapshots but their element semantics are unchanged.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        config = try c.decode(BenchmarkConfig.self, forKey: .config)
+        deviceName = try c.decodeIfPresent(String.self, forKey: .deviceName)
+        rngContractID = try c.decode(String.self, forKey: .rngContractID)
+        warmupEpochs = try c.decode(Int.self, forKey: .warmupEpochs)
+        measuredEpochs = try c.decode(Int.self, forKey: .measuredEpochs)
+        gpuTimingAvailable = try c.decode(Bool.self, forKey: .gpuTimingAvailable)
+        wallMsPerEpoch = try c.decode(Double.self, forKey: .wallMsPerEpoch)
+        gpuMsPerEpoch = try c.decodeIfPresent(Double.self, forKey: .gpuMsPerEpoch)
+        hostResidualMsPerEpoch = try c.decodeIfPresent(Double.self, forKey: .hostResidualMsPerEpoch)
+        gpuBusyFraction = try c.decodeIfPresent(Double.self, forKey: .gpuBusyFraction)
+        signalAnalysisMsTotal = try c.decodeIfPresent(Double.self, forKey: .signalAnalysisMsTotal)
+        epochsPerSecond = try c.decode(Double.self, forKey: .epochsPerSecond)
+        pairsPerSecond = try c.decode(Double.self, forKey: .pairsPerSecond)
+        rawStepsPerSecond = try c.decode(Double.self, forKey: .rawStepsPerSecond)
+        commandStepsPerSecond = try c.decode(Double.self, forKey: .commandStepsPerSecond)
+        totalPairs = try c.decode(Int.self, forKey: .totalPairs)
+        totalRawSteps = try c.decode(Int.self, forKey: .totalRawSteps)
+        totalCommandSteps = try c.decode(Int.self, forKey: .totalCommandSteps)
+        totalCopyWrites = try c.decode(Int.self, forKey: .totalCopyWrites)
+        haltBudget = try c.decode(Int.self, forKey: .haltBudget)
+        haltPCOut = try c.decode(Int.self, forKey: .haltPCOut)
+        haltUnmatched = try c.decode(Int.self, forKey: .haltUnmatched)
+        haltUnknown = try c.decode(Int.self, forKey: .haltUnknown)
+        signalsAnalyzed = try c.decode(Bool.self, forKey: .signalsAnalyzed)
+        initialEntropyBitsPerByte = try c.decodeIfPresent(Double.self, forKey: .initialEntropyBitsPerByte)
+        finalEntropyBitsPerByte = try c.decodeIfPresent(Double.self, forKey: .finalEntropyBitsPerByte)
+        finalDeltaH = try c.decodeIfPresent(Double.self, forKey: .finalDeltaH)
+        finalMeanProgramEntropyBitsPerByte = try c.decodeIfPresent(Double.self, forKey: .finalMeanProgramEntropyBitsPerByte)
+        finalTransitionRate = try c.decodeIfPresent(Double.self, forKey: .finalTransitionRate)
+        finalCompressionProxyRatio = try c.decodeIfPresent(Double.self, forKey: .finalCompressionProxyRatio)
+        thresholdCrossings = try c.decodeIfPresent([ThresholdCrossing].self, forKey: .thresholdCrossings) ?? []
+        initialBrotliBitsPerByte = try c.decodeIfPresent(Double.self, forKey: .initialBrotliBitsPerByte)
+        initialHighOrderComplexity = try c.decodeIfPresent(Double.self, forKey: .initialHighOrderComplexity)
+        finalBrotliBitsPerByte = try c.decodeIfPresent(Double.self, forKey: .finalBrotliBitsPerByte)
+        finalHighOrderComplexity = try c.decodeIfPresent(Double.self, forKey: .finalHighOrderComplexity)
+        highOrderComplexityCrossings = try c.decodeIfPresent([HighOrderComplexityCrossing].self, forKey: .highOrderComplexityCrossings) ?? []
+        shadowCheckedTotal = try c.decode(Int.self, forKey: .shadowCheckedTotal)
+        shadowMismatchTotal = try c.decode(Int.self, forKey: .shadowMismatchTotal)
+        maxRSSBytes = try c.decodeIfPresent(Int.self, forKey: .maxRSSBytes)
+        samples = try c.decodeIfPresent([EpochSample].self, forKey: .samples) ?? []
+        finalDigest = try c.decode(String.self, forKey: .finalDigest)
     }
 }
 

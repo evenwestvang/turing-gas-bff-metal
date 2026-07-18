@@ -18,6 +18,33 @@ This document records the one-time source grounding of the Swift CPU oracle
 The checkout is external and never vendored; `Tools/cubff-grounding/generate.sh` re-clones and
 hard-checks the SHA before generating anything.
 
+## Paper observability metrics — exact source references
+
+The paper's high-order-complexity metrics are logged by cubff's simulation loop
+in `common_language.h` (pinned commit above). Stable URLs:
+`https://github.com/paradigms-of-intelligence/cubff/blob/f212e849027c98fcf4b242eccfb5fed435223e23/common_language.h`.
+
+| Metric (our name) | cubff name | Definition | Source |
+|---|---|---|---|
+| **H0** | `h0` | Whole-soup order-0 Shannon entropy, bits/byte | `common_language.h` — computed over the entire soup each measured epoch |
+| **Brotli bpb** | `brotli_bpb` | `brotli_size * 8 / (num_programs * kSingleTapeSize)` — compressed size as bits per input byte | `common_language.h` — `BrotliEncoderCompress(2, 24, BROTLI_MODE_GENERIC, n, soup, &size, buf)` over the whole soup; `brotli_size` = the returned `*encoded_size` |
+| **High-order complexity** | `higher_entropy` | `h0 - brotli_bpb` | `common_language.h` — arithmetic logged per measured epoch |
+
+The exact Brotli call cubff makes: `BrotliEncoderCompress(2, 24,
+BROTLI_MODE_GENERIC, …)` — quality 2, lgwin 24 (`BROTLI_MAX_WINDOW_BITS`), generic
+mode, the whole soup in one shot. Our `BrotliCompressor.quality2CompressedByteCount`
+uses the identical call; `PaperComplexity.brotliBitsPerByte` /
+`PaperComplexity.highOrderComplexity` implement the identical arithmetic.
+
+**Runtime version gating is not tag authentication.** Our
+`BrotliCompressor.isPaperPinned` checks `BrotliEncoderVersion() == 0x1001000`,
+which detects a library *reporting* 1.1.0 but does not cryptographically
+authenticate the library binary against the pinned tag. The fixture generator
+(`Tools/brotli-fixtures/generate.sh`) remains **tag-pinned** — it clones
+`v1.1.0` from `https://github.com/google/brotli`, hard-checks the commit SHA, and
+refuses to emit from any other checkout — so the authoritative fixtures are
+reproducible from source regardless of what the system library reports.
+
 **CPU build validated against upstream's own goldens.** `test.sh bff_noheads` and `test.sh bff`
 (full 131,072-program, 256-epoch simulations, seed 10248) reproduce upstream's checked-in
 `testdata/bff_noheads.txt` and `testdata/bff.txt` **bit-exactly** when linked against brotli
