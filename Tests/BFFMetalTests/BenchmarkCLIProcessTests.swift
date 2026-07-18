@@ -76,8 +76,8 @@ final class BenchmarkCLIProcessTests: XCTestCase {
     // MARK: - --no-samples propagation and schema behavior
 
     /// `--no-samples` is accepted and propagated; on a non-Metal host the run emits a
-    /// schemaVersion-2 envelope with an empty `results` array and exits 2. On a Metal
-    /// host the same invocation actually runs, so we only require schemaVersion 2 and a
+    /// schemaVersion-3 envelope with an empty `results` array and exits 2. On a Metal
+    /// host the same invocation actually runs, so we only require schemaVersion 3 and a
     /// documented exit code.
     func testNoSamplesFlagPropagatesAndSchemaIsStable() throws {
         let r = try runBench(["--programs", "2", "--seed", "1",
@@ -86,7 +86,7 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         #if canImport(Metal)
         // Metal host: it ran. Require the schema marker and one of the valid codes.
         let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
-        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3)
         XCTAssertTrue([BenchmarkExitCodeValue.success,
                        BenchmarkExitCodeValue.runtimeFailure,
                        BenchmarkExitCodeValue.gpuTimingUnavailable].contains(r.status),
@@ -95,7 +95,7 @@ final class BenchmarkCLIProcessTests: XCTestCase {
         // No Metal: nothing ran — exit 2 with an explicit empty results array.
         XCTAssertEqual(r.status, 2, "non-Metal valid config exits 2 (nothing ran)")
         let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
-        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2, "schemaVersion 2 emitted")
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3, "schemaVersion 3 emitted")
         XCTAssertEqual((obj?["results"] as? [Any])?.count, 0, "empty results array")
         XCTAssertTrue(r.stderr.contains("analyzeSignals=false"),
                       "--no-samples propagated to the resolved config")
@@ -113,7 +113,7 @@ final class BenchmarkCLIProcessTests: XCTestCase {
                               "--compression", "--sample-interval", "2"])
         #if canImport(Metal)
         let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
-        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3)
         #else
         XCTAssertEqual(r.status, 2, "compression does not change the no-Metal exit code")
         XCTAssertTrue(r.stderr.contains("compression=true"),
@@ -168,7 +168,7 @@ final class BenchmarkCLIProcessTests: XCTestCase {
                               "--signal-interval", "3"])
         #if canImport(Metal)
         let obj = try JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any]
-        XCTAssertEqual(obj?["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(obj?["schemaVersion"] as? Int, 3)
         XCTAssertNotEqual(r.status, 64, "cadence-only analysis is not a usage error")
         #else
         XCTAssertEqual(r.status, 2, "cadence-only signal analysis does not change the exit code")

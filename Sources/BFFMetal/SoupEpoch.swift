@@ -56,6 +56,22 @@ public enum SoupPlanner {
     /// hash iteration order.
     public static func plan(soup: [UInt8], config: SoupConfig, epoch: Int)
         -> (mutatedSoup: [UInt8], plan: EpochPlan) {
+        // Composition of the two byte-identical sub-steps below. Kept as one call so
+        // every existing caller (app, oracle, CLI, shadow) is unchanged; the split only
+        // exists so the benchmark can time mutation+pairing separately from packing.
+        let (mutated, perm, mutationCount) = mutateAndPair(soup: soup, config: config,
+                                                           epoch: epoch)
+        let plan = pack(mutated: mutated, permutation: perm, mutationCount: mutationCount,
+                        config: config, epoch: epoch)
+        return (mutated, plan)
+    }
+
+    /// Stage 1: mutate a copy of the soup (RNG stream `epoch*4+0`) and draw the
+    /// Fisher–Yates pairing permutation (stream `epoch*4+1`). No pair tapes are packed
+    /// yet — this is exactly the mutation-planning + pairing work the benchmark times as
+    /// one host stage. Byte-for-byte the first half of `plan`.
+    public static func mutateAndPair(soup: [UInt8], config: SoupConfig, epoch: Int)
+        -> (mutated: [UInt8], permutation: [UInt32], mutationCount: Int) {
         precondition(soup.count == config.soupByteCount,
                      "soup is \(soup.count) bytes, expected \(config.soupByteCount)")
         precondition(epoch >= 0 && epoch <= Int(UInt32.max), "epoch out of range")
@@ -67,7 +83,16 @@ public enum SoupPlanner {
 
         let perm = BFFRandom.pairingPermutation(count: config.programCount,
                                                 seed: config.seed, epoch: e)
+        return (mutated, perm, mutationCount)
+    }
 
+    /// Stage 2: pack each permutation-selected partner pair into its 128-byte
+    /// interaction tape (the nested-array construction / allocation the GPU consumes).
+    /// Pure function of the mutated soup + permutation; byte-for-byte the second half of
+    /// `plan`.
+    public static func pack(mutated: [UInt8], permutation perm: [UInt32],
+                            mutationCount: Int, config: SoupConfig, epoch: Int)
+        -> EpochPlan {
         var pairs: [PairIdentity] = []
         var tapes: [[UInt8]] = []
         pairs.reserveCapacity(config.pairCount)
@@ -86,9 +111,8 @@ public enum SoupPlanner {
             tapes.append(tape)
         }
 
-        let plan = EpochPlan(epoch: epoch, permutation: perm, pairs: pairs,
-                             inputTapes: tapes, mutationCount: mutationCount)
-        return (mutated, plan)
+        return EpochPlan(epoch: epoch, permutation: perm, pairs: pairs,
+                         inputTapes: tapes, mutationCount: mutationCount)
     }
 
     /// Scatter both 64-byte halves of each final pair tape back to the stable

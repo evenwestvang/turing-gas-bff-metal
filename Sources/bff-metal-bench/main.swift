@@ -63,6 +63,9 @@ var allowMissingGPUTiming = false
 // opts the O(n·window) LZ proxy in; it is ignored when analysis is off.
 var analyzeSignals = true
 var includeCompression = false
+// Opt-in host-stage timing attribution. Off by default; when on, each epoch's runEpoch
+// is timed at stage boundaries and the result carries `hostStageAttribution`.
+var instrumentStages = false
 
 let usageExit = BenchmarkExitCode.usage
 
@@ -125,6 +128,7 @@ while cursor < arguments.count {
     case "--allow-missing-gpu-timing": allowMissingGPUTiming = true
     case "--no-samples": analyzeSignals = false
     case "--compression": includeCompression = true
+    case "--host-stage-timing": instrumentStages = true
     case "--variant":
         let raw = nextValue(argument)
         guard let v = BFFVariant(rawValue: raw) else {
@@ -169,6 +173,15 @@ while cursor < arguments.count {
           --compression           opt in to the O(n·window) LZ proxy (sampled epochs
                                   only, and only where signals are measured; off by
                                   default; ignored under --no-samples)
+          --host-stage-timing     opt in to bounded host-stage timing attribution: time
+                                  each epoch's runEpoch at stage boundaries (mutation+
+                                  pairing, packing, evaluate, scatter, counters, program
+                                  metrics, shadow, digest) plus a named unclassified
+                                  remainder, emitted as `hostStageAttribution`. Off by
+                                  default; never changes the soup/RNG/counters/digest or
+                                  the reported throughput. Metal evaluator substages
+                                  (buffer alloc/upload/encode/submit+wait/readback) are
+                                  populated only on a Metal host; null otherwise.
           --allow-missing-gpu-timing  exit 0 even if GPU timestamps are unavailable
         Seeds are strict unsigned decimals in 0...\(UInt32.max); malformed/overflowing
         tokens are a usage error (exit \(BenchmarkExitCode.usage)), never truncated.
@@ -273,9 +286,10 @@ func emit(_ results: [BenchmarkResult]) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     do {
-        // schemaVersion 2: kinetics fields are now optional (nil under --no-samples),
-        // signalsAnalyzed + signalAnalysisMsTotal added (see Docs/Benchmarking.md).
-        let data = try encoder.encode(Envelope(schemaVersion: 2, results: results))
+        // schemaVersion 3: adds `instrumentationEnabled` (always present) and the
+        // opt-in `hostStageAttribution` object (null unless --host-stage-timing). All
+        // schema-2 keys are preserved unchanged (see Docs/Benchmarking.md).
+        let data = try encoder.encode(Envelope(schemaVersion: 3, results: results))
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))
     } catch {
@@ -303,7 +317,8 @@ do {
 
 let runOptions = BenchmarkRunner.Options(analyzeSignals: analyzeSignals,
                                          includeCompression: includeCompression,
-                                         signalInterval: signalInterval)
+                                         signalInterval: signalInterval,
+                                         instrumentStages: instrumentStages)
 
 var results: [BenchmarkResult] = []
 var anyShadowMismatch = false
@@ -368,6 +383,7 @@ for config in configs {
          + "budget=\(config.stepBudget) init=\(config.initMode.rawValue) "
          + "variant=\(config.variant.rawValue) shadowSample=\(config.shadowSampleCount) "
          + "analyzeSignals=\(analyzeSignals) compression=\(includeCompression) "
+         + "hostStageTiming=\(instrumentStages) "
          + "sampleInterval=\(config.sampleInterval) signalInterval=\(signalInterval) "
          + "rng=\(BFFRandom.contractID)")
 }

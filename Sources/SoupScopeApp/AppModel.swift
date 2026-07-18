@@ -42,6 +42,17 @@ final class AppModel: ObservableObject {
     private var runner: SoupRunner
     private(set) var lastSnapshot: RenderSnapshot?
 
+    // Opt-in per-frame host-stage timing (`--frame-stage-timing`). `nil` (off) unless the
+    // launch option requested it, so the default frame path is byte-for-byte unchanged.
+    // `stepFrame` stashes the epoch-batch and snapshot-build spans it measures; the
+    // renderer folds them together with the frame wall and the Metal-only texture/submit
+    // spans into one `AppFrameStageSample`.
+    private var frameStages: AppFrameStageAccumulator?
+    private var lastEpochBatchSeconds: Double?
+    private var lastSnapshotBuildSeconds: Double?
+    /// Whether per-frame host-stage timing is active (renderer gate).
+    var frameStageTimingEnabled: Bool { frameStages != nil }
+
     // Drawable geometry (pixels), set by the renderer on resize.
     private var drawablePxW: Double = 0
     private var drawablePxH: Double = 0
@@ -102,6 +113,8 @@ final class AppModel: ObservableObject {
         self.hud = initialHUD
         self.lodReadout = LODReadout(camera: camera, lod: lod)
 
+        self.frameStages = parsed.frameStageTiming ? AppFrameStageAccumulator() : nil
+
         self.lastSnapshot = try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
                                                         soup: runner.soup)
 
@@ -117,6 +130,13 @@ final class AppModel: ObservableObject {
     /// error visible (never spins/retries). Returns the latest snapshot regardless
     /// so the last good frame stays on screen.
     func stepFrame() -> RenderSnapshot? {
+        // Clear this frame's stashed stage spans up front (only when timing), so a frame
+        // that does not advance (finished / paused / error) honestly folds `nil` for the
+        // epoch-batch and snapshot stages rather than a previous frame's values.
+        if frameStages != nil {
+            lastEpochBatchSeconds = nil
+            lastSnapshotBuildSeconds = nil
+        }
         guard validationFinished == false else { return lastSnapshot }
         guard hud.errorState == nil, isRunning, let evaluator = context?.evaluator else {
             return lastSnapshot
@@ -148,12 +168,34 @@ final class AppModel: ObservableObject {
         hud.record(batch: reports, epoch: runner.epoch, batchMs: batchMs)
 
         let metrics = reports.last?.metrics
+        var snapshotBuildSeconds: Double? = nil
         if let metrics {
+            let s0 = frameStages != nil ? CFAbsoluteTimeGetCurrent() : 0
             lastSnapshot = try? RenderSnapshot.build(epoch: runner.epoch,
                                                      programCount: config.programCount,
                                                      soup: runner.soup, metrics: metrics)
+            if frameStages != nil { snapshotBuildSeconds = CFAbsoluteTimeGetCurrent() - s0 }
+        }
+        // Stash this frame's app-stage spans for the renderer to fold (only when timing).
+        if frameStages != nil {
+            lastEpochBatchSeconds = batchMs / 1000
+            lastSnapshotBuildSeconds = snapshotBuildSeconds
         }
         return lastSnapshot
+    }
+
+    /// Fold one frame's app-stage spans into the accumulator, pairing the renderer's
+    /// frame wall + Metal-only spans with the epoch-batch and snapshot-build spans
+    /// `stepFrame` measured. No-op unless `--frame-stage-timing` is on.
+    func recordFrameStages(frameSeconds: Double, metricTextureSeconds: Double?,
+                           renderSubmitSeconds: Double?) {
+        guard frameStages != nil else { return }
+        frameStages?.record(AppFrameStageSample(
+            frameSeconds: frameSeconds,
+            epochBatchSeconds: lastEpochBatchSeconds,
+            snapshotBuildSeconds: lastSnapshotBuildSeconds,
+            metricTextureSeconds: metricTextureSeconds,
+            renderSubmitSeconds: renderSubmitSeconds))
     }
 
     // MARK: - Geometry / camera
@@ -295,7 +337,10 @@ final class AppModel: ObservableObject {
             + "shadowChecked=\(h.shadowChecked) shadowMismatch=\(h.shadowMismatch) "
             + "programs=\(h.programCount) device=\"\(h.deviceName)\" "
             + "error=\(h.errorState ?? "none")"
-        print(line)
+        // Append the opt-in per-frame host-stage attribution when enabled and any frame
+        // was folded; absent otherwise so the default diagnostic line is unchanged.
+        let stageLine = frameStages?.summary().map { " frameStages[\($0.summaryLine)]" }
+        print(line + (stageLine ?? ""))
         // C `exit` flushes stdio: 0 success, 1 error/mismatch/no-progress, 2 no Metal.
         exit(outcome.exitCode)
     }

@@ -93,6 +93,11 @@ public struct EpochReport: Sendable {
     public var shadowMismatches: [ShadowMismatch]
     /// FNV-1a digest of the soup after this epoch's scatter.
     public var digest: UInt64
+    /// Opt-in host-stage timing for this epoch, present ONLY when `runEpoch` was called
+    /// with a `stageClock`. `nil` (the default) for every normal call — the app, oracle,
+    /// and CLI never request it, so it adds no cost and no behavior change. The spans are
+    /// a pure side observation and never influence the soup, counters, or digest.
+    public var stageBreakdown: HostStageSpans? = nil
 
     public var activitySummary: MetricSummary {
         MetricSummary(values: metrics.map { Double($0.activity) })
@@ -168,13 +173,43 @@ public struct SoupRunner: Sendable {
     @discardableResult
     public mutating func runEpoch<E: PairEvaluator>(
         using evaluator: E,
-        metrics policy: MetricsPolicy = .enabled
+        metrics policy: MetricsPolicy = .enabled,
+        stageClock: (() -> Double)? = nil
     ) throws -> EpochReport {
-        let (mutated, plan) = SoupPlanner.plan(soup: soup, config: config, epoch: epoch)
+        // `mark()` reads the injected monotonic clock ONLY when instrumentation is on,
+        // so an uninstrumented call (the default everywhere) reads no clock and the
+        // pipeline below is byte-for-byte and timing-for-timing what it was before. The
+        // stage boundaries are the only difference the clock introduces; the soup,
+        // counters, shadow, and digest are computed identically regardless.
+        func mark() -> Double? { stageClock?() }
 
-        let outcomes = try evaluator.evaluate(pairTapes: plan.inputTapes,
+        let m0 = mark()
+        let (mutated, perm, mutationCount) = SoupPlanner.mutateAndPair(
+            soup: soup, config: config, epoch: epoch)
+        let m1 = mark()
+        let plan = SoupPlanner.pack(mutated: mutated, permutation: perm,
+                                    mutationCount: mutationCount, config: config,
+                                    epoch: epoch)
+        let m2 = mark()
+
+        let outcomes: [GPUPairOutcome]
+        let evaluatorProfile: EvaluatorStageProfile?
+        if let stageClock, let profiling = evaluator as? StageProfilingEvaluator {
+            // The evaluator decomposes its own evaluate span (Metal substages). Its
+            // outcomes are identical to `evaluate`; the profile is a side observation.
+            let r = try profiling.evaluateProfiled(pairTapes: plan.inputTapes,
+                                                   variant: config.variant,
+                                                   stepBudget: config.stepBudget,
+                                                   clock: stageClock)
+            outcomes = r.outcomes
+            evaluatorProfile = r.profile
+        } else {
+            outcomes = try evaluator.evaluate(pairTapes: plan.inputTapes,
                                               variant: config.variant,
                                               stepBudget: config.stepBudget)
+            evaluatorProfile = nil
+        }
+        let m3 = mark()
         guard outcomes.count == plan.pairs.count else {
             throw RunError.evaluatorReturnedWrongCount(expected: plan.pairs.count,
                                                        got: outcomes.count)
@@ -183,10 +218,12 @@ public struct SoupRunner: Sendable {
         var newSoup = mutated
         SoupPlanner.scatter(into: &newSoup, plan: plan,
                             finalTapes: outcomes.map(\.finalTape))
+        let m4 = mark()
 
         let counters = EpochCounters.reduce(epoch: epoch,
                                             mutationCount: plan.mutationCount,
                                             outcomes: outcomes)
+        let m5 = mark()
         // Per-program metrics are the only work gated by policy. Under `.disabled` the
         // scan (and its O(programCount) entropy computation) is not performed at all;
         // the report simply carries no per-program metrics. Nothing below depends on it.
@@ -199,6 +236,7 @@ public struct SoupRunner: Sendable {
         } else {
             metrics = []
         }
+        let m6 = mark()
 
         // CPU shadow: read-only, never perturbs the soup or its RNG.
         let sample = ShadowSampler.sampleIndices(pairCount: config.pairCount,
@@ -216,14 +254,40 @@ public struct SoupRunner: Sendable {
                 mismatches.append(mm)
             }
         }
+        let m7 = mark()
 
-        // Commit only now.
+        // Commit only now. (Between the shadow boundary and the digest boundary; the
+        // commit itself is intentionally left in the unclassified remainder.)
         soup = newSoup
         epoch += 1
 
+        let m8 = mark()
+        let digestValue = SoupDigest.digest(newSoup)
+        let m9 = mark()
+
+        // Build the stage breakdown only when instrumented. Each span is a difference of
+        // two adjacent marks, so the spans are mutually exclusive and their sum is ≤ the
+        // wall the caller measures around this whole call.
+        let breakdown: HostStageSpans?
+        if stageClock != nil,
+           let m0, let m1, let m2, let m3, let m4, let m5, let m6, let m7, let m8, let m9 {
+            breakdown = HostStageSpans(
+                mutationPairingSeconds: m1 - m0,
+                packingSeconds: m2 - m1,
+                evaluateSeconds: m3 - m2,
+                scatterSeconds: m4 - m3,
+                counterReductionSeconds: m5 - m4,
+                programMetricsSeconds: m6 - m5,
+                shadowSeconds: m7 - m6,
+                digestSeconds: m9 - m8,
+                evaluatorProfile: evaluatorProfile)
+        } else {
+            breakdown = nil
+        }
+
         return EpochReport(counters: counters, metrics: metrics,
                            shadowChecked: sample.count, shadowMismatches: mismatches,
-                           digest: SoupDigest.digest(newSoup))
+                           digest: digestValue, stageBreakdown: breakdown)
     }
 
     /// Run `count` epochs, returning each epoch's report in order.
