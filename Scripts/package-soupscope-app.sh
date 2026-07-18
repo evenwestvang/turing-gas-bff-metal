@@ -5,25 +5,26 @@
 #     Contents/
 #       Info.plist
 #       MacOS/SoupScope           ← the SwiftPM-built executable
-#       Resources/BFFEvaluate.metal, SoupRender.metal  ← shaders, laid out FLAT
+#       Resources/BFFEvaluate.metal, BFFResidentEpoch.metal, SoupRender.metal
+#                                                    ← shaders, laid out FLAT
 #
 # The shaders are placed directly in Contents/Resources (conventional layout); the
 # app ships NO SwiftPM per-target resource bundle. At runtime the app finds them via
 # Bundle.main (see Sources/BFFMetal/ShaderResourceLocator.swift), while `swift run`
 # and `swift test` keep finding them via Bundle.module. Renderer, evaluator, RNG,
-# metrics, LOD, HUD, and scheduling are all unchanged — this only relocates two
+# metrics, LOD, HUD, and scheduling are all unchanged — this only relocates three
 # verbatim .metal resources into the conventional place and seals them.
 #
 # Determinism and provenance are enforced, not assumed. Each invocation builds into
 # a fresh, dedicated SwiftPM scratch path (never the repository .build or any prior
 # artifact), so the packaged shaders can only have come from *this* build. Exactly
-# the two shaders below are packaged, each resolved from an explicit, pinned SwiftPM
+# the three shaders below are packaged, each resolved from an explicit, pinned SwiftPM
 # per-target resource bundle path under that fresh scratch build, and each required
 # to be byte-identical to its explicit repository source before it is copied.
 # Packaging aborts on a missing, duplicated, basename-colliding, stale, or extra
 # .metal file — on the build side (unexpected set under the bin dir), on provenance
 # (a built resource whose bytes drift from its repository source), and on the bundle
-# side (Contents/Resources must end up as exactly those two files and no SwiftPM
+# side (Contents/Resources must end up as exactly those three files and no SwiftPM
 # resource bundle). Same inputs -> same layout. The scratch path is removed on both
 # success and failure via a scoped trap.
 #
@@ -62,6 +63,7 @@ PACKAGE_NAME="BFFOracle"
 # (three colon-separated fields; the repo path itself contains no colon).
 REQUIRED_SHADERS=(
     "BFFEvaluate.metal:BFFMetal:Sources/BFFMetal/Shaders/BFFEvaluate.metal"
+    "BFFResidentEpoch.metal:BFFMetal:Sources/BFFMetal/Shaders/BFFResidentEpoch.metal"
     "SoupRender.metal:SoupScopeApp:Sources/SoupScopeApp/Shaders/SoupRender.metal"
 )
 
@@ -274,7 +276,7 @@ main() {
         echo "    resource: $base  <-  $repo_rel"
     done
 
-    # 6. Assert the sealed result: exactly the two shaders, no SwiftPM bundle.
+    # 6. Assert the sealed result: exactly the three shaders, no SwiftPM bundle.
     verify_packaged_resources "$app/Contents/Resources"
 
     # 7. Info.plist for a regular windowed app.

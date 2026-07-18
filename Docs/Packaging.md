@@ -17,16 +17,17 @@ than the repository `.build` or any prior artifact, so the packaged shaders can 
 have come from *this* build; the scratch path is removed on both success and failure
 via a scoped trap, and the caller's default `.build` is left untouched.
 
-The script packages **exactly** the two shaders below, each resolved from its
+The script packages **exactly** the three shaders below, each resolved from its
 explicit, pinned SwiftPM per-target resource bundle in that fresh build
 (`BFFOracle_BFFMetal.bundle`, `BFFOracle_SoupScopeApp.bundle`), requiring exactly one
 unambiguous source per basename, and each required to be **byte-identical to its
 explicit repository source** (`Sources/BFFMetal/Shaders/BFFEvaluate.metal`,
+`Sources/BFFMetal/Shaders/BFFResidentEpoch.metal`,
 `Sources/SoupScopeApp/Shaders/SoupRender.metal`) before it is copied. It aborts if
-the build's `.metal` set is anything other than those two (missing, extra,
+the build's `.metal` set is anything other than those three (missing, extra,
 duplicate, or stale copies), if a built resource's bytes drift from its repository
 source, and — after copying — re-checks that `Contents/Resources` holds precisely
-those two files and no SwiftPM resource bundle. The pure resolution/verification
+those three files and no SwiftPM resource bundle. The pure resolution/verification
 helpers (including the byte-identity gate that rejects stale content under a
 correctly named path) are covered on any host by
 `Scripts/tests/package-soupscope-app-tests.sh` (portable; no Metal toolchain
@@ -45,11 +46,12 @@ build/SoupScope.app/
       SoupScope                 # the SwiftPM-built executable
     Resources/
       BFFEvaluate.metal         # BFFMetal evaluator shader source
+      BFFResidentEpoch.metal    # BFFMetal resident epoch shader source
       SoupRender.metal          # SoupScopeApp render shader source
 ```
 
 There is **no** SwiftPM per-target resource bundle inside the `.app` (no
-`BFFOracle_BFFMetal.bundle`, no `BFFOracle_SoupScopeApp.bundle`) — the two `.metal`
+`BFFOracle_BFFMetal.bundle`, no `BFFOracle_SoupScopeApp.bundle`) — the three `.metal`
 sources are the exact verbatim `.copy` resources the build produced, relocated into
 the conventional `Contents/Resources`.
 
@@ -71,7 +73,7 @@ resource-bundle-less `.app` would make the SwiftPM-generated `Bundle.module`
 accessor trap; the precedence + laziness are pinned by `ShaderResourceLocatorTests`.
 
 No renderer, evaluator, RNG, metric, LOD, HUD, or scheduling behavior changes — only
-where the two shader sources are located on disk.
+where the three shader sources are located on disk.
 
 ## Signing
 

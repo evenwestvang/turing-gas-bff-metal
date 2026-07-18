@@ -49,7 +49,7 @@ expect_stdout() {
     fi
 }
 
-# Build a canonical, valid bin dir: exactly the two required shaders, one each,
+# Build a canonical, valid bin dir: exactly the three required shaders, one each,
 # in the pinned per-target bundle path. Echoes the bin dir.
 make_good_bindir() {
     local root
@@ -57,28 +57,33 @@ make_good_bindir() {
     mkdir -p "$root/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources"
     mkdir -p "$root/${PACKAGE_NAME}_SoupScopeApp.bundle/Contents/Resources"
     printf 'evaluate\n' > "$root/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources/BFFEvaluate.metal"
+    printf 'epoch\n'    > "$root/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources/BFFResidentEpoch.metal"
     printf 'render\n'   > "$root/${PACKAGE_NAME}_SoupScopeApp.bundle/Contents/Resources/SoupRender.metal"
     printf '%s' "$root"
 }
 
-# Build a valid, sealed Contents/Resources (exactly the two shaders). Echoes it.
+# Build a valid, sealed Contents/Resources (exactly the three shaders). Echoes it.
 make_good_resources() {
     local root
     root=$(mktemp -d)
     printf 'evaluate\n' > "$root/BFFEvaluate.metal"
+    printf 'epoch\n'    > "$root/BFFResidentEpoch.metal"
     printf 'render\n'   > "$root/SoupRender.metal"
     printf '%s' "$root"
 }
 
 echo "manifest"
-expect_stdout "required_basenames is exactly the two shaders, sorted" \
-    $'BFFEvaluate.metal\nSoupRender.metal' required_basenames
+expect_stdout "required_basenames is exactly the three shaders, sorted" \
+    $'BFFEvaluate.metal\nBFFResidentEpoch.metal\nSoupRender.metal' required_basenames
 
 echo "resolve_shader_source"
 bindir=$(make_good_bindir)
 expect_stdout "resolves BFFEvaluate from BFFMetal bundle" \
     "$bindir/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources/BFFEvaluate.metal" \
     resolve_shader_source "BFFEvaluate.metal" "BFFMetal" "$bindir"
+expect_stdout "resolves BFFResidentEpoch from BFFMetal bundle" \
+    "$bindir/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources/BFFResidentEpoch.metal" \
+    resolve_shader_source "BFFResidentEpoch.metal" "BFFMetal" "$bindir"
 expect_stdout "resolves SoupRender from SoupScopeApp bundle" \
     "$bindir/${PACKAGE_NAME}_SoupScopeApp.bundle/Contents/Resources/SoupRender.metal" \
     resolve_shader_source "SoupRender.metal" "SoupScopeApp" "$bindir"
@@ -125,7 +130,7 @@ expect_fail "rejects a duplicate/stale .metal elsewhere under bin" \
 
 echo "verify_packaged_resources"
 res=$(make_good_resources)
-expect_ok "accepts exactly the two sealed shaders" verify_packaged_resources "$res"
+expect_ok "accepts exactly the three sealed shaders" verify_packaged_resources "$res"
 
 # Extra file.
 resx=$(make_good_resources)
