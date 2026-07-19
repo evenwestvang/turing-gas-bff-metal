@@ -20,7 +20,12 @@ struct SoupScopeApp: App {
     }
 
     var body: some Scene {
-        WindowGroup(ScaffoldInfo.appName) {
+        let scene = SoupScopeAppLifecycle.sceneComposition(for: appModel.residentPlan)
+        // Exactly one automatically presented shared WindowGroup: SwiftUI
+        // presents the one main window at launch with no explicit
+        // openWindow/AppKit NSWindow wiring. The scene id comes from the
+        // production lifecycle decision tested in SoupScopeCore.
+        WindowGroup(ScaffoldInfo.appName, id: scene.windowSceneID) {
             ContentView(appModel: appModel)
         }
     }

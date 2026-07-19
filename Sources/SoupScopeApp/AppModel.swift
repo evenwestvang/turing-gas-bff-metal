@@ -18,6 +18,7 @@ import CSoupRender
 final class AppModel: ObservableObject, @unchecked Sendable {
     let options: AppLaunchOptions
     let residentPlan: ResidentAppRunPlan
+    private let constructsLegacyCPURunner: Bool
     let config: SoupConfig
     private let residentConfig: ResidentEpochConfig?
     let grid: ProgramGrid
@@ -42,7 +43,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     @Published private(set) var lodReadout: LODReadout
 
     let context: SharedMetalContext?
-    private var runner: SoupRunner
+    private var runner: SoupRunner?
     private var residentDriver: ResidentSimulationDriver?
     private var residentDisplayedEpoch = 0
     private var residentRenderedFrames = 0
@@ -92,6 +93,9 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         self.options = parsed
         let resolvedResidentPlan = parsed.residentRunPlan()
         self.residentPlan = resolvedResidentPlan
+        let resolvedConstructsLegacyCPURunner =
+            SoupScopeAppLifecycle.constructsLegacyCPURunner(for: resolvedResidentPlan)
+        self.constructsLegacyCPURunner = resolvedConstructsLegacyCPURunner
 
         let resolvedConfig: SoupConfig
         do {
@@ -119,7 +123,12 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         }
         self.grid = ProgramGrid(programCount: resolvedConfig.programCount)
         self.normalization = MetricNormalization(stepBudget: resolvedConfig.stepBudget)
-        self.runner = SoupRunner(config: resolvedConfig)
+        // Resident mode does not construct the legacy CPU `SoupRunner`. The
+        // non-resident path keeps its existing CPU runner for the per-frame
+        // snapshot pipeline.
+        self.runner = resolvedConstructsLegacyCPURunner
+            ? SoupRunner(config: resolvedConfig)
+            : nil
         self.batcher = AdaptiveBatcher()
 
         var builtContext: SharedMetalContext?
@@ -138,10 +147,19 @@ final class AppModel: ObservableObject, @unchecked Sendable {
 
         self.frameStages = parsed.frameStageTiming ? AppFrameStageAccumulator() : nil
 
-        self.lastSnapshot = resolvedResidentPlan.enabled
-            ? nil
-            : (try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
-                                           soup: runner.soup))
+        // Initial snapshot routing via the pure production decision: non-resident
+        // mode constructed the legacy CPU runner above, so it seeds an epoch-0
+        // `RenderSnapshot.initial` from that runner's seeded soup — giving the
+        // renderer something deterministic to draw before the first epoch batch.
+        // Resident mode routes to `.none` (its soup lives on the GPU), so it must
+        // not try to build from an empty CPU soup; `lastSnapshot` stays `nil`
+        // until the resident driver produces a frame.
+        let resolvedInitialSnapshotSource =
+            SoupScopeAppLifecycle.initialSnapshotSource(for: resolvedResidentPlan)
+        self.lastSnapshot = resolvedInitialSnapshotSource == .legacyCPURunner
+            ? (try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
+                                           soup: runner?.soup ?? []))
+            : nil
 
         // Arm the display-independent validation watchdog (no-op for interactive
         // launch, which omits --validation-seconds).
@@ -164,7 +182,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     /// error visible (never spins/retries). Returns the latest snapshot regardless
     /// so the last good frame stays on screen.
     func stepFrame() -> RenderSnapshot? {
-        guard !residentPlan.enabled else { return lastSnapshot }
+        guard constructsLegacyCPURunner else { return lastSnapshot }
         // Clear this frame's stashed stage spans up front (only when timing), so a frame
         // that does not advance (finished / paused / error) honestly folds `nil` for the
         // epoch-batch and snapshot stages rather than a previous frame's values.
@@ -177,46 +195,62 @@ final class AppModel: ObservableObject, @unchecked Sendable {
             return lastSnapshot
         }
 
-        let epochsToRun = batcher.nextBatchEpochs()
-        let t0 = AppMonotonicClock.nowSeconds()
-        var reports: [EpochReport] = []
-        reports.reserveCapacity(epochsToRun)
         do {
-            for _ in 0 ..< epochsToRun {
-                reports.append(try runner.runEpoch(using: evaluator))
+            guard let frameSnapshot = try withStoredCPURunner({ runner -> RenderSnapshot? in
+                let epochsToRun = batcher.nextBatchEpochs()
+                let t0 = AppMonotonicClock.nowSeconds()
+                var reports: [EpochReport] = []
+                reports.reserveCapacity(epochsToRun)
+                for _ in 0 ..< epochsToRun {
+                    reports.append(try runner.runEpoch(using: evaluator))
+                }
+                let batchMs = (AppMonotonicClock.nowSeconds() - t0) * 1000
+                batcher.record(batchMs: batchMs, epochs: reports.count)
+
+                // A shadow mismatch is a hard stop — surface it, do not keep advancing.
+                if let bad = reports.first(where: { !$0.shadowMismatches.isEmpty }) {
+                    hud.record(batch: reports, epoch: runner.epoch, batchMs: batchMs)
+                    hud.setError("CPU-shadow mismatch: "
+                                 + (bad.shadowMismatches.first?.summary ?? "divergence"))
+                    return lastSnapshot
+                }
+
+                hud.record(batch: reports, epoch: runner.epoch, batchMs: batchMs)
+
+                let metrics = reports.last?.metrics
+                var snapshotBuildSeconds: Double? = nil
+                if let metrics {
+                    let s0 = frameStages != nil ? AppMonotonicClock.nowSeconds() : 0
+                    lastSnapshot = try? RenderSnapshot.build(epoch: runner.epoch,
+                                                             programCount: config.programCount,
+                                                             soup: runner.soup,
+                                                             metrics: metrics)
+                    if frameStages != nil {
+                        snapshotBuildSeconds = AppMonotonicClock.nowSeconds() - s0
+                    }
+                }
+                // Stash this frame's app-stage spans for the renderer to fold (only when timing).
+                if frameStages != nil {
+                    lastEpochBatchSeconds = batchMs / 1000
+                    lastSnapshotBuildSeconds = snapshotBuildSeconds
+                }
+                return lastSnapshot
+            }) else {
+                return lastSnapshot
             }
+            return frameSnapshot
         } catch {
             hud.setError("epoch execution failed: \(error)")
             return lastSnapshot
         }
-        let batchMs = (AppMonotonicClock.nowSeconds() - t0) * 1000
-        batcher.record(batchMs: batchMs, epochs: reports.count)
+    }
 
-        // A shadow mismatch is a hard stop — surface it, do not keep advancing.
-        if let bad = reports.first(where: { !$0.shadowMismatches.isEmpty }) {
-            hud.record(batch: reports, epoch: runner.epoch, batchMs: batchMs)
-            hud.setError("CPU-shadow mismatch: "
-                         + (bad.shadowMismatches.first?.summary ?? "divergence"))
-            return lastSnapshot
-        }
-
-        hud.record(batch: reports, epoch: runner.epoch, batchMs: batchMs)
-
-        let metrics = reports.last?.metrics
-        var snapshotBuildSeconds: Double? = nil
-        if let metrics {
-            let s0 = frameStages != nil ? AppMonotonicClock.nowSeconds() : 0
-            lastSnapshot = try? RenderSnapshot.build(epoch: runner.epoch,
-                                                     programCount: config.programCount,
-                                                     soup: runner.soup, metrics: metrics)
-            if frameStages != nil { snapshotBuildSeconds = AppMonotonicClock.nowSeconds() - s0 }
-        }
-        // Stash this frame's app-stage spans for the renderer to fold (only when timing).
-        if frameStages != nil {
-            lastEpochBatchSeconds = batchMs / 1000
-            lastSnapshotBuildSeconds = snapshotBuildSeconds
-        }
-        return lastSnapshot
+    private func withStoredCPURunner<Result>(
+        _ body: (inout SoupRunner) throws -> Result
+    ) rethrows -> Result? {
+        guard var storedRunner = runner else { return nil }
+        defer { runner = storedRunner }
+        return try body(&storedRunner)
     }
 
     /// Fold one frame's app-stage spans into the accumulator, pairing the renderer's
