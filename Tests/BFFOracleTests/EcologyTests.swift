@@ -217,7 +217,7 @@ final class EcologyRandomTests: XCTestCase {
             0xA4D1_DB89)
         XCTAssertEqual(
             try EcologyRandom.draw(seed: 7, purpose: .initBytes, epoch: 0,
-                                  element: EcologyTopology.soupByteCount - 1),
+                                  element: UInt32(exactly: EcologyTopology.soupByteCount - 1)!),
             0x344E_B244)
     }
 
