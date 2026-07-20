@@ -87,7 +87,7 @@ final class EcologyCLIProcessTests: XCTestCase {
                     let start = range.upperBound
                     let hex = String(line[start...].prefix(16))
                     if hex.count == 16,
-                       hex.allSatisfy({ $0.isHexDigit }) {
+                       hex.allSatisfy({ $0.isASCIIHexDigit }) {
                         return "0x" + hex
                     }
                 }
@@ -471,5 +471,18 @@ final class EcologyCLIProcessTests: XCTestCase {
         XCTAssertEqual(b.status, 0)
         XCTAssertEqual(a.stdout, b.stdout,
                        "two identical runs must produce byte-identical stdout")
+    }
+}
+
+/// File-local ASCII hex predicate. Narrow by name (avoids shadowing any
+/// stdlib `Character.isHexDigit`) and narrow by scope (ASCII 0-9, a-f, A-F
+/// only — not the full Unicode hex category), matching the digest format
+/// emitted by `bff-ecology-epoch`.
+private extension Character {
+    var isASCIIHexDigit: Bool {
+        switch self {
+        case "0"..."9", "a"..."f", "A"..."F": return true
+        default: return false
+        }
     }
 }
