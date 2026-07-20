@@ -418,7 +418,7 @@ final class EcologyCheckpointFileTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         let checkpoint = try EcologyCheckpointFile.load(from: url)
         XCTAssertEqual(checkpoint.soupBase64,
-                       EcologyCheckpoint.decode(from: data).soupBase64)
+                       try EcologyCheckpoint.decode(from: data).soupBase64)
     }
 
     // MARK: - Malformed input rejection (no trap)
