@@ -14,6 +14,11 @@ let package = Package(
         .executable(name: "bff-metal-soup", targets: ["bff-metal-soup"]),
         .executable(name: "bff-metal-bench", targets: ["bff-metal-bench"]),
         .executable(name: "bff-resident-epoch", targets: ["bff-resident-epoch"]),
+        // Headless CPU ecology checkpoint/replay CLI (BFF-Ecology v1). Pure
+        // Swift, no Metal dependency; emits `engine=ecology-v1` and the
+        // "Experimental Spatial Ecology" label. Existing products keep their
+        // defaults and output contracts.
+        .executable(name: "bff-ecology-epoch", targets: ["bff-ecology-epoch"]),
         .executable(name: "SoupScope", targets: ["SoupScopeApp"]),
     ],
     targets: [
@@ -66,6 +71,12 @@ let package = Package(
         // unchanged.
         .executableTarget(name: "bff-resident-epoch",
                           dependencies: ["BFFMetal", "BFFOracle"]),
+        // Headless CPU ecology checkpoint/replay CLI. Pure Swift, no Metal
+        // dependency. Reuses the BFFECO1 checkpoint implementation in
+        // `Sources/BFFOracle/Ecology.swift`; no second on-disk format. Existing
+        // products keep their defaults and output contracts.
+        .executableTarget(name: "bff-ecology-epoch",
+                          dependencies: ["BFFOracle"]),
         // Platform-independent app core: grid/camera/LOD/normalization/opcode/
         // batcher/HUD/snapshot pure models + launch-option parsing. Depends on
         // BFFMetal for the soup runner and epoch types; builds and is tested on
