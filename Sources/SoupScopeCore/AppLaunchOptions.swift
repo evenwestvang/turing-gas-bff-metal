@@ -29,8 +29,9 @@ public struct AppLaunchOptions: Equatable, Sendable {
     /// and is only wired into the Metal shell (a non-Metal host produces no frames to
     /// time).
     public var frameStageTiming: Bool
-    /// Experimental GPU-resident app integration. Omitted by default so the existing
-    /// CPU-snapshot app path remains the product default.
+    /// Experimental GPU-resident app integration. An empty GUI launch selects
+    /// resident mode by default, while any nonempty explicit CLI invocation keeps
+    /// the existing CPU-snapshot path unless a `--resident`-family flag flips it.
     public var simulationMode: AppSimulationMode
     public var residentPlanner: ResidentPairingPlanner
     public var residentEpochLimit: Int?
