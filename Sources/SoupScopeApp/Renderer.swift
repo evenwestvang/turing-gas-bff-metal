@@ -2,15 +2,16 @@
 import Foundation
 import Metal
 import MetalKit
+import BFFMetal
 import SoupScopeCore
 import CSoupRender
 
 /// MTKView delegate: drives one bounded epoch batch per frame (via `AppModel`),
-/// then renders the resulting immutable snapshot. Every GPU resource it touches is
-/// allocated fresh per frame from the snapshot, so there is no CPU/GPU race on the
-/// evolving soup — the render command buffer retains its buffers until completion,
-/// and the next frame builds new ones. Render command buffers are submitted on the
-/// context's shared queue, serial with the evaluator's compute work.
+/// then renders the resulting immutable snapshot. The CPU path allocates fresh
+/// per-frame buffers from `RenderSnapshot`; the resident path acquires a generation
+/// lease on a persistent GPU snapshot slot and releases it from the render command
+/// buffer completion handler. Render command buffers are submitted on the context's
+/// shared queue, serial with the evaluator's compute work.
 ///
 /// The delegate methods are left non-isolated (so the conformance holds regardless
 /// of how the SDK annotates `MTKViewDelegate`'s isolation) and hop to the main
@@ -73,11 +74,47 @@ final class Renderer: NSObject, MTKViewDelegate {
             let sourceEpoch = appModel.latestResidentSourceEpoch
             if let texture = appModel.residentVisualizationTexture {
                 var uniforms = appModel.makeUniforms()
-                encoder.setRenderPipelineState(context.residentRenderPipeline)
-                encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VizUniforms>.stride, index: 0)
-                encoder.setFragmentTexture(texture, index: 0)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-                appModel.noteResidentFrameSubmitted(sourceEpoch: sourceEpoch)
+                let expectedByteCount = try? ResidentSnapshotLayout.checkedSoupByteCount(
+                    programCount: Int(uniforms.programCount))
+                if ResidentRenderDecision.requiresSnapshotLease(microBlend: uniforms.microBlend) {
+                    let snapshotLease = appModel.acquireResidentSnapshot()
+                    let decision = ResidentRenderDecision.decide(
+                        expectedByteCount: expectedByteCount,
+                        leaseByteCount: snapshotLease?.byteCount,
+                        expectedOverviewWidth: texture.width,
+                        expectedOverviewHeight: texture.height,
+                        leaseOverviewWidth: snapshotLease?.overviewTexture.width,
+                        leaseOverviewHeight: snapshotLease?.overviewTexture.height,
+                        microBlend: uniforms.microBlend)
+                    if decision.usesLeasedSnapshot, let snapshotLease {
+                        encoder.setRenderPipelineState(context.residentRenderPipeline)
+                        encoder.setFragmentBytes(&uniforms,
+                                                 length: MemoryLayout<VizUniforms>.stride,
+                                                 index: 0)
+                        encoder.setFragmentBuffer(snapshotLease.buffer, offset: 0, index: 1)
+                        encoder.setFragmentTexture(snapshotLease.overviewTexture, index: 0)
+                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                        snapshotLease.releaseOnCommandBufferCompletion(commandBuffer)
+                        appModel.noteResidentFrameSubmitted(sourceEpoch: snapshotLease.sourceEpoch)
+                    } else {
+                        snapshotLease?.release()
+                        encoder.setRenderPipelineState(context.residentOverviewRenderPipeline)
+                        encoder.setFragmentBytes(&uniforms,
+                                                 length: MemoryLayout<VizUniforms>.stride,
+                                                 index: 0)
+                        encoder.setFragmentTexture(texture, index: 0)
+                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                        appModel.noteResidentFrameSubmitted(sourceEpoch: sourceEpoch)
+                    }
+                } else {
+                    encoder.setRenderPipelineState(context.residentOverviewRenderPipeline)
+                    encoder.setFragmentBytes(&uniforms,
+                                             length: MemoryLayout<VizUniforms>.stride,
+                                             index: 0)
+                    encoder.setFragmentTexture(texture, index: 0)
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                    appModel.noteResidentFrameSubmitted(sourceEpoch: sourceEpoch)
+                }
             }
         } else if let snapshot {
             let soupStart = timing ? AppMonotonicClock.nowSeconds() : 0

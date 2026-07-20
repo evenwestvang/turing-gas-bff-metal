@@ -149,6 +149,377 @@ public struct ResidentBufferSizes: Equatable, Sendable, Codable {
     }
 }
 
+public enum ResidentSnapshotLayout {
+    public enum LayoutError: Error, Equatable, CustomStringConvertible {
+        case programCountNotPositive(Int)
+        case programCountOverflow(Int)
+        case programIDOutOfRange(Int, programCount: Int)
+        case byteIndexOutOfRange(Int)
+
+        public var description: String {
+            switch self {
+            case .programCountNotPositive(let n):
+                return "program count \(n) must be positive"
+            case .programCountOverflow(let n):
+                return "program count \(n) overflows resident snapshot byte count"
+            case .programIDOutOfRange(let id, let programCount):
+                return "program id \(id) out of range 0..<\(programCount)"
+            case .byteIndexOutOfRange(let byte):
+                return "byte index \(byte) out of range 0..<\(BFF.tapeSize)"
+            }
+        }
+    }
+
+    public static let programByteCount = BFF.tapeSize
+
+    public static func checkedSoupByteCount(programCount: Int) throws -> Int {
+        guard programCount > 0 else {
+            throw LayoutError.programCountNotPositive(programCount)
+        }
+        guard programCount <= Int.max / programByteCount else {
+            throw LayoutError.programCountOverflow(programCount)
+        }
+        return programCount * programByteCount
+    }
+
+    public static func byteOffset(programID: Int, byteIndex: Int,
+                                  programCount: Int) throws -> Int {
+        _ = try checkedSoupByteCount(programCount: programCount)
+        guard programID >= 0 && programID < programCount else {
+            throw LayoutError.programIDOutOfRange(programID, programCount: programCount)
+        }
+        guard byteIndex >= 0 && byteIndex < programByteCount else {
+            throw LayoutError.byteIndexOutOfRange(byteIndex)
+        }
+        return programID * programByteCount + byteIndex
+    }
+}
+
+public struct ResidentSnapshotReservation: Equatable, Sendable, Codable {
+    public var slot: Int
+    public var generation: UInt64
+
+    public init(slot: Int, generation: UInt64) {
+        self.slot = slot
+        self.generation = generation
+    }
+}
+
+public struct ResidentSnapshotToken: Equatable, Sendable, Codable {
+    public var slot: Int
+    public var generation: UInt64
+    public var sourceEpoch: Int
+    public var byteCount: Int
+
+    public init(slot: Int, generation: UInt64, sourceEpoch: Int, byteCount: Int) {
+        self.slot = slot
+        self.generation = generation
+        self.sourceEpoch = sourceEpoch
+        self.byteCount = byteCount
+    }
+}
+
+public struct ResidentSnapshotSlotDiagnostics: Equatable, Sendable, Codable {
+    public var slot: Int
+    public var generation: UInt64?
+    public var sourceEpoch: Int?
+    public var byteCount: Int?
+    public var isWriting: Bool
+    public var isPublished: Bool
+    public var activeLeases: Int
+}
+
+public struct ResidentSnapshotRingDiagnostics: Equatable, Sendable, Codable {
+    public var slotCount: Int
+    public var expectedByteCount: Int
+    public var nextGeneration: UInt64
+    public var publishedSlot: Int?
+    public var publishedGeneration: UInt64?
+    public var publishedSourceEpoch: Int?
+    public var activeLeaseCount: Int
+    public var writingSlotCount: Int
+    public var reservationCount: Int
+    public var publishCount: Int
+    public var skippedReservationCount: Int
+    public var cancelledReservationCount: Int
+    public var stalePublicationCount: Int
+    public var failedAcquireCount: Int
+    public var staleReleaseCount: Int
+    public var generationExhaustedReservationCount: Int
+    public var lastBlitHostSeconds: Double?
+    public var lastBlitGPUSeconds: Double?
+    public var slots: [ResidentSnapshotSlotDiagnostics]
+}
+
+public struct ResidentSnapshotRingState: Sendable {
+    private struct Slot: Sendable {
+        var generation: UInt64?
+        var sourceEpoch: Int?
+        var byteCount: Int?
+        var isWriting = false
+        var activeLeases = 0
+    }
+
+    public enum StateError: Error, Equatable, CustomStringConvertible {
+        case invalidSlotCount(Int)
+        case invalidExpectedByteCount(Int)
+
+        public var description: String {
+            switch self {
+            case .invalidSlotCount(let n):
+                return "snapshot ring slot count \(n) must be positive"
+            case .invalidExpectedByteCount(let n):
+                return "snapshot ring byte count \(n) must be positive"
+            }
+        }
+    }
+
+    private var slots: [Slot]
+    private var publishedSlot: Int?
+    public let expectedByteCount: Int
+    public private(set) var nextGeneration: UInt64 = 1
+    private var reservationCount = 0
+    private var publishCount = 0
+    private var skippedReservationCount = 0
+    private var cancelledReservationCount = 0
+    private var stalePublicationCount = 0
+    private var failedAcquireCount = 0
+    private var staleReleaseCount = 0
+    private var generationExhaustedReservationCount = 0
+    private var lastBlitHostSeconds: Double?
+    private var lastBlitGPUSeconds: Double?
+
+    public init(slotCount: Int, expectedByteCount: Int) throws {
+        try self.init(slotCount: slotCount,
+                      expectedByteCount: expectedByteCount,
+                      initialNextGeneration: 1)
+    }
+
+    init(slotCount: Int, expectedByteCount: Int,
+         initialNextGeneration: UInt64) throws {
+        guard slotCount > 0 else { throw StateError.invalidSlotCount(slotCount) }
+        guard expectedByteCount > 0 else {
+            throw StateError.invalidExpectedByteCount(expectedByteCount)
+        }
+        self.slots = [Slot](repeating: Slot(), count: slotCount)
+        self.expectedByteCount = expectedByteCount
+        self.nextGeneration = initialNextGeneration
+    }
+
+    public mutating func reserveForWrite() -> ResidentSnapshotReservation? {
+        guard nextGeneration < UInt64.max else {
+            skippedReservationCount += 1
+            generationExhaustedReservationCount += 1
+            return nil
+        }
+        guard let slot = slots.indices.first(where: { index in
+            index != publishedSlot && !slots[index].isWriting && slots[index].activeLeases == 0
+        }) else {
+            skippedReservationCount += 1
+            return nil
+        }
+        let generation = nextGeneration
+        nextGeneration += 1
+        slots[slot].generation = generation
+        slots[slot].sourceEpoch = nil
+        slots[slot].byteCount = nil
+        slots[slot].isWriting = true
+        reservationCount += 1
+        return ResidentSnapshotReservation(slot: slot, generation: generation)
+    }
+
+    @discardableResult
+    public mutating func publish(_ reservation: ResidentSnapshotReservation,
+                                 sourceEpoch: Int,
+                                 byteCount: Int,
+                                 blitHostSeconds: Double?,
+                                 blitGPUSeconds: Double?) -> ResidentSnapshotToken? {
+        guard slots.indices.contains(reservation.slot),
+              slots[reservation.slot].isWriting,
+              slots[reservation.slot].generation == reservation.generation,
+              byteCount == expectedByteCount else {
+            cancel(reservation)
+            return nil
+        }
+        if let publishedSlot,
+           let publishedGeneration = slots[publishedSlot].generation,
+           publishedGeneration > reservation.generation {
+            slots[reservation.slot].isWriting = false
+            slots[reservation.slot].sourceEpoch = nil
+            slots[reservation.slot].byteCount = nil
+            stalePublicationCount += 1
+            return nil
+        }
+        slots[reservation.slot].isWriting = false
+        slots[reservation.slot].sourceEpoch = sourceEpoch
+        slots[reservation.slot].byteCount = byteCount
+        publishedSlot = reservation.slot
+        publishCount += 1
+        lastBlitHostSeconds = blitHostSeconds
+        lastBlitGPUSeconds = blitGPUSeconds
+        return ResidentSnapshotToken(slot: reservation.slot,
+                                     generation: reservation.generation,
+                                     sourceEpoch: sourceEpoch,
+                                     byteCount: byteCount)
+    }
+
+    public mutating func cancel(_ reservation: ResidentSnapshotReservation) {
+        guard slots.indices.contains(reservation.slot),
+              slots[reservation.slot].isWriting,
+              slots[reservation.slot].generation == reservation.generation else {
+            return
+        }
+        slots[reservation.slot].isWriting = false
+        slots[reservation.slot].sourceEpoch = nil
+        slots[reservation.slot].byteCount = nil
+        cancelledReservationCount += 1
+    }
+
+    public mutating func acquire(expectedByteCount: Int) -> ResidentSnapshotToken? {
+        guard expectedByteCount == self.expectedByteCount,
+              let slot = publishedSlot,
+              slots.indices.contains(slot),
+              !slots[slot].isWriting,
+              slots[slot].byteCount == expectedByteCount,
+              let generation = slots[slot].generation,
+              let sourceEpoch = slots[slot].sourceEpoch else {
+            failedAcquireCount += 1
+            return nil
+        }
+        slots[slot].activeLeases += 1
+        return ResidentSnapshotToken(slot: slot,
+                                     generation: generation,
+                                     sourceEpoch: sourceEpoch,
+                                     byteCount: expectedByteCount)
+    }
+
+    public mutating func release(_ token: ResidentSnapshotToken) {
+        guard slots.indices.contains(token.slot),
+              slots[token.slot].generation == token.generation,
+              slots[token.slot].activeLeases > 0 else {
+            staleReleaseCount += 1
+            return
+        }
+        slots[token.slot].activeLeases -= 1
+    }
+
+    public var diagnostics: ResidentSnapshotRingDiagnostics {
+        let activeLeaseCount = slots.reduce(0) { $0 + $1.activeLeases }
+        let writingSlotCount = slots.filter(\.isWriting).count
+        let publishedGeneration = publishedSlot.flatMap { slots[$0].generation }
+        let publishedSourceEpoch = publishedSlot.flatMap { slots[$0].sourceEpoch }
+        return ResidentSnapshotRingDiagnostics(
+            slotCount: slots.count,
+            expectedByteCount: expectedByteCount,
+            nextGeneration: nextGeneration,
+            publishedSlot: publishedSlot,
+            publishedGeneration: publishedGeneration,
+            publishedSourceEpoch: publishedSourceEpoch,
+            activeLeaseCount: activeLeaseCount,
+            writingSlotCount: writingSlotCount,
+            reservationCount: reservationCount,
+            publishCount: publishCount,
+            skippedReservationCount: skippedReservationCount,
+            cancelledReservationCount: cancelledReservationCount,
+            stalePublicationCount: stalePublicationCount,
+            failedAcquireCount: failedAcquireCount,
+            staleReleaseCount: staleReleaseCount,
+            generationExhaustedReservationCount: generationExhaustedReservationCount,
+            lastBlitHostSeconds: lastBlitHostSeconds,
+            lastBlitGPUSeconds: lastBlitGPUSeconds,
+            slots: slots.enumerated().map { index, slot in
+                ResidentSnapshotSlotDiagnostics(
+                    slot: index,
+                    generation: slot.generation,
+                    sourceEpoch: slot.sourceEpoch,
+                    byteCount: slot.byteCount,
+                    isWriting: slot.isWriting,
+                    isPublished: index == publishedSlot,
+                    activeLeases: slot.activeLeases)
+            })
+    }
+}
+
+public enum ResidentRenderFallbackReason: Equatable, Sendable, Codable {
+    case unavailable
+    case invalidExpectedByteCount
+    case wrongByteCount(expected: Int, actual: Int)
+    case invalidExpectedOverviewSize(width: Int, height: Int)
+    case wrongOverviewSize(expectedWidth: Int, expectedHeight: Int,
+                           actualWidth: Int, actualHeight: Int)
+    case farLOD(microBlend: Float)
+}
+
+public struct ResidentRenderDecision: Equatable, Sendable, Codable {
+    public enum Source: Equatable, Sendable, Codable {
+        case leasedSnapshot
+        case liveOverview
+    }
+
+    public var source: Source
+    public var fallbackReason: ResidentRenderFallbackReason?
+
+    public var usesLeasedSnapshot: Bool { source == .leasedSnapshot }
+    public var usesCloseLOD: Bool { usesLeasedSnapshot }
+
+    public init(source: Source,
+                fallbackReason: ResidentRenderFallbackReason?) {
+        self.source = source
+        self.fallbackReason = fallbackReason
+    }
+
+    public static func requiresSnapshotLease(microBlend: Float) -> Bool {
+        microBlend > 0
+    }
+
+    public static func decide(expectedByteCount: Int?,
+                              leaseByteCount: Int?,
+                              expectedOverviewWidth: Int,
+                              expectedOverviewHeight: Int,
+                              leaseOverviewWidth: Int?,
+                              leaseOverviewHeight: Int?,
+                              microBlend: Float) -> ResidentRenderDecision {
+        guard requiresSnapshotLease(microBlend: microBlend) else {
+            return ResidentRenderDecision(source: .liveOverview,
+                                          fallbackReason: .farLOD(microBlend: microBlend))
+        }
+        guard let expectedByteCount, expectedByteCount > 0 else {
+            return ResidentRenderDecision(source: .liveOverview,
+                                          fallbackReason: .invalidExpectedByteCount)
+        }
+        guard expectedOverviewWidth > 0, expectedOverviewHeight > 0 else {
+            return ResidentRenderDecision(
+                source: .liveOverview,
+                fallbackReason: .invalidExpectedOverviewSize(width: expectedOverviewWidth,
+                                                             height: expectedOverviewHeight))
+        }
+        guard let leaseByteCount else {
+            return ResidentRenderDecision(source: .liveOverview,
+                                          fallbackReason: .unavailable)
+        }
+        guard leaseByteCount == expectedByteCount else {
+            return ResidentRenderDecision(
+                source: .liveOverview,
+                fallbackReason: .wrongByteCount(expected: expectedByteCount,
+                                                actual: leaseByteCount))
+        }
+        guard let leaseOverviewWidth, let leaseOverviewHeight else {
+            return ResidentRenderDecision(source: .liveOverview,
+                                          fallbackReason: .unavailable)
+        }
+        guard leaseOverviewWidth == expectedOverviewWidth,
+              leaseOverviewHeight == expectedOverviewHeight else {
+            return ResidentRenderDecision(
+                source: .liveOverview,
+                fallbackReason: .wrongOverviewSize(expectedWidth: expectedOverviewWidth,
+                                                   expectedHeight: expectedOverviewHeight,
+                                                   actualWidth: leaseOverviewWidth,
+                                                   actualHeight: leaseOverviewHeight))
+        }
+        return ResidentRenderDecision(source: .leasedSnapshot, fallbackReason: nil)
+    }
+}
+
 public struct ResidentKernelTiming: Equatable, Sendable, Codable {
     public var name: String
     public var hostSeconds: Double
@@ -437,6 +808,154 @@ private extension UInt64 {
 }
 
 #if canImport(Metal)
+public final class ResidentGPUSnapshotLease: @unchecked Sendable {
+    public let buffer: MTLBuffer
+    public let overviewTexture: MTLTexture
+    public let slot: Int
+    public let generation: UInt64
+    public let sourceEpoch: Int
+    public let byteCount: Int
+
+    private let lock = NSLock()
+    private var hasReleased = false
+    private let releaseBody: @Sendable (ResidentSnapshotToken) -> Void
+
+    fileprivate init(buffer: MTLBuffer,
+                     overviewTexture: MTLTexture,
+                     token: ResidentSnapshotToken,
+                     release: @escaping @Sendable (ResidentSnapshotToken) -> Void) {
+        self.buffer = buffer
+        self.overviewTexture = overviewTexture
+        self.slot = token.slot
+        self.generation = token.generation
+        self.sourceEpoch = token.sourceEpoch
+        self.byteCount = token.byteCount
+        self.releaseBody = release
+    }
+
+    public func release() {
+        let token: ResidentSnapshotToken?
+        lock.lock()
+        if hasReleased {
+            token = nil
+        } else {
+            hasReleased = true
+            token = ResidentSnapshotToken(slot: slot,
+                                          generation: generation,
+                                          sourceEpoch: sourceEpoch,
+                                          byteCount: byteCount)
+        }
+        lock.unlock()
+        if let token {
+            releaseBody(token)
+        }
+    }
+
+    public func releaseOnCommandBufferCompletion(_ commandBuffer: MTLCommandBuffer) {
+        commandBuffer.addCompletedHandler { [self] _ in
+            release()
+        }
+    }
+
+    deinit {
+        release()
+    }
+}
+
+private final class ResidentGPUSnapshotRing: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: ResidentSnapshotRingState
+    private let buffers: [MTLBuffer]
+    private let overviewTextures: [MTLTexture]
+
+    init(device: MTLDevice, slotCount: Int, byteCount: Int,
+         overviewWidth: Int, overviewHeight: Int) throws {
+        self.state = try ResidentSnapshotRingState(slotCount: slotCount,
+                                                   expectedByteCount: byteCount)
+        var builtBuffers: [MTLBuffer] = []
+        var builtTextures: [MTLTexture] = []
+        builtBuffers.reserveCapacity(slotCount)
+        builtTextures.reserveCapacity(slotCount)
+        let overviewDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: overviewWidth,
+            height: max(1, overviewHeight),
+            mipmapped: false)
+        overviewDesc.usage = .shaderRead
+        overviewDesc.storageMode = .private
+        for slot in 0..<slotCount {
+            guard let buffer = device.makeBuffer(length: byteCount,
+                                                 options: .storageModePrivate) else {
+                throw ResidentMetalEpochRunner.RunnerError
+                    .bufferAllocationFailed("resident.snapshot[\(slot)]")
+            }
+            buffer.label = "resident.snapshot[\(slot)]"
+            guard let texture = device.makeTexture(descriptor: overviewDesc) else {
+                throw ResidentMetalEpochRunner.RunnerError
+                    .bufferAllocationFailed("resident.snapshotOverview[\(slot)]")
+            }
+            texture.label = "resident.snapshotOverview[\(slot)]"
+            builtBuffers.append(buffer)
+            builtTextures.append(texture)
+        }
+        self.buffers = builtBuffers
+        self.overviewTextures = builtTextures
+    }
+
+    func reserveForWrite() -> (ResidentSnapshotReservation, MTLBuffer, MTLTexture)? {
+        lock.lock()
+        let reservation = state.reserveForWrite()
+        lock.unlock()
+        guard let reservation else { return nil }
+        return (reservation, buffers[reservation.slot], overviewTextures[reservation.slot])
+    }
+
+    func publish(_ reservation: ResidentSnapshotReservation,
+                 sourceEpoch: Int,
+                 byteCount: Int,
+                 blitHostSeconds: Double?,
+                 blitGPUSeconds: Double?) {
+        lock.lock()
+        _ = state.publish(reservation,
+                          sourceEpoch: sourceEpoch,
+                          byteCount: byteCount,
+                          blitHostSeconds: blitHostSeconds,
+                          blitGPUSeconds: blitGPUSeconds)
+        lock.unlock()
+    }
+
+    func cancel(_ reservation: ResidentSnapshotReservation) {
+        lock.lock()
+        state.cancel(reservation)
+        lock.unlock()
+    }
+
+    func acquire(expectedByteCount: Int) -> ResidentGPUSnapshotLease? {
+        lock.lock()
+        let token = state.acquire(expectedByteCount: expectedByteCount)
+        lock.unlock()
+        guard let token else { return nil }
+        return ResidentGPUSnapshotLease(buffer: buffers[token.slot],
+                                        overviewTexture: overviewTextures[token.slot],
+                                        token: token) { [weak self] token in
+            self?.release(token)
+        }
+    }
+
+    var diagnostics: ResidentSnapshotRingDiagnostics {
+        lock.lock()
+        let snapshot = state.diagnostics
+        lock.unlock()
+        return snapshot
+    }
+
+    private func release(_ token: ResidentSnapshotToken) {
+        lock.lock()
+        state.release(token)
+        lock.unlock()
+    }
+}
+
 public final class ResidentMetalEpochRunner {
     public enum RunnerError: Error, CustomStringConvertible {
         case noDevice
@@ -484,10 +1003,14 @@ public final class ResidentMetalEpochRunner {
     private let activityBuffer: MTLBuffer
     private let visualizationBuffer: MTLBuffer
     private let visualizationTexture: MTLTexture?
+    private let snapshotRing: ResidentGPUSnapshotRing
     private let bufferSizes: ResidentBufferSizes
 
     public var deviceName: String { device.name }
     public var residentVisualizationTexture: MTLTexture? { visualizationTexture }
+    public var residentSnapshotDiagnostics: ResidentSnapshotRingDiagnostics {
+        snapshotRing.diagnostics
+    }
 
     public convenience init(config: ResidentEpochConfig) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -556,14 +1079,19 @@ public final class ResidentMetalEpochRunner {
                                          label: "resident.activity")
         self.visualizationBuffer = try buffer(length: max(bufferSizes.visualizationBytes, 1),
                                               label: "resident.visualizationRGBA")
+        let visualizationHeight = (config.programCount + config.visualizationWidth - 1)
+            / config.visualizationWidth
+        self.snapshotRing = try ResidentGPUSnapshotRing(device: device,
+                                                        slotCount: 3,
+                                                        byteCount: bufferSizes.soupBytes,
+                                                        overviewWidth: config.visualizationWidth,
+                                                        overviewHeight: visualizationHeight)
 
         if config.visualizationEnabled {
-            let height = (config.programCount + config.visualizationWidth - 1)
-                / config.visualizationWidth
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .rgba8Unorm,
                 width: config.visualizationWidth,
-                height: max(1, height),
+                height: max(1, visualizationHeight),
                 mipmapped: false)
             desc.usage = [.shaderWrite, .shaderRead]
             guard let texture = device.makeTexture(descriptor: desc) else {
@@ -580,6 +1108,10 @@ public final class ResidentMetalEpochRunner {
             soupBuffer.contents().copyMemory(from: raw.baseAddress!,
                                              byteCount: initial.count)
         }
+    }
+
+    public func acquireResidentSnapshot(expectedByteCount: Int) -> ResidentGPUSnapshotLease? {
+        snapshotRing.acquire(expectedByteCount: expectedByteCount)
     }
 
     @discardableResult
@@ -610,6 +1142,7 @@ public final class ResidentMetalEpochRunner {
         if config.visualizationEnabled {
             try runVisualize(into: &timings, parameterBytes: &parameterBytes)
         }
+        scheduleSnapshotPublication(sourceEpoch: epoch + 1)
 
         let counterWords = readCounterWords()
         readbackBytes += bufferSizes.countersBytes
@@ -793,6 +1326,60 @@ public final class ResidentMetalEpochRunner {
             }
             dispatchThreads(count: config.programCount, pipeline: visualizePipeline, encoder: enc)
         }
+    }
+
+    private func scheduleSnapshotPublication(sourceEpoch: Int) {
+        guard let (reservation, snapshotBuffer, snapshotOverviewTexture) = snapshotRing.reserveForWrite() else {
+            return
+        }
+        guard let visualizationTexture else {
+            snapshotRing.cancel(reservation)
+            return
+        }
+        guard visualizationTexture.width == snapshotOverviewTexture.width,
+              visualizationTexture.height == snapshotOverviewTexture.height else {
+            snapshotRing.cancel(reservation)
+            return
+        }
+        guard let cb = commandQueue.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else {
+            snapshotRing.cancel(reservation)
+            return
+        }
+        cb.label = "resident.snapshot.blit"
+        let byteCount = bufferSizes.soupBytes
+        let start = ResidentClock.now()
+        blit.copy(from: soupBuffer, sourceOffset: 0,
+                  to: snapshotBuffer, destinationOffset: 0,
+                  size: byteCount)
+        let overviewSize = MTLSize(width: visualizationTexture.width,
+                                   height: visualizationTexture.height,
+                                   depth: 1)
+        blit.copy(from: visualizationTexture,
+                  sourceSlice: 0,
+                  sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: overviewSize,
+                  to: snapshotOverviewTexture,
+                  destinationSlice: 0,
+                  destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        cb.addCompletedHandler { [snapshotRing] completed in
+            let hostSeconds = ResidentClock.now() - start
+            guard completed.status == .completed, completed.error == nil else {
+                snapshotRing.cancel(reservation)
+                return
+            }
+            let gpuSpan = completed.gpuEndTime - completed.gpuStartTime
+            let gpuSeconds = (completed.gpuStartTime > 0 && gpuSpan > 0) ? gpuSpan : nil
+            snapshotRing.publish(reservation,
+                                 sourceEpoch: sourceEpoch,
+                                 byteCount: byteCount,
+                                 blitHostSeconds: hostSeconds,
+                                 blitGPUSeconds: gpuSeconds)
+        }
+        cb.commit()
     }
 
     private func encodeTimed(name: String,

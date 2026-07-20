@@ -3,6 +3,7 @@ import SwiftUI
 import Metal
 import MetalKit
 import AppKit
+import SoupScopeCore
 
 /// MTKView subclass that turns mouse/trackpad events into camera operations.
 /// Coordinates are converted into the renderer's convention — drawable pixels,
@@ -91,7 +92,8 @@ struct SoupMetalView: NSViewRepresentable {
         let view = SoupMTKView(frame: .zero, device: device)
         view.appModel = appModel
         view.colorPixelFormat = .bgra8Unorm
-        view.clearColor = MTLClearColor(red: 0.02, green: 0.02, blue: 0.03, alpha: 1)
+        let bg = SoupVisualizationTheme.background
+        view.clearColor = MTLClearColor(red: bg.r, green: bg.g, blue: bg.b, alpha: 1)
         view.framebufferOnly = true
         view.preferredFramesPerSecond = 60
         view.enableSetNeedsDisplay = false

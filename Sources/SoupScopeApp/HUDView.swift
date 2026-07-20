@@ -8,6 +8,8 @@ struct HUDView: View {
     let hud: HUDModel
     let lod: LODReadout
     let metricChannel: UInt32
+    /// Resident path channel label, or nil on the legacy CPU-snapshot path.
+    let residentChannel: ResidentVizChannel?
     let running: Bool
 
     private func f(_ x: Double, _ p: Int = 3) -> String {
@@ -19,10 +21,14 @@ struct HUDView: View {
     }
 
     private var channelName: String {
+        if let residentChannel {
+            return residentChannel.label
+        }
         switch metricChannel {
-        case 0: return "activity"
-        case 1: return "entropy"
-        default: return "life"
+        case 1: return "activity"
+        case 2: return "entropy"
+        case 3: return "legacy composite"
+        default: return "composite"
         }
     }
 

@@ -27,11 +27,24 @@ final class AppModel: ObservableObject, @unchecked Sendable {
 
     var camera = Camera()
     var batcher: AdaptiveBatcher
-    /// 0 activity, 1 entropy, 2 life composite (default).
-    var metricChannel: UInt32 = 2
+    /// Resident fast-view selector carried in the existing VizUniforms word:
+    /// 0 composite (default), 1 R, 2 G, 3 B.
+    var metricChannel: UInt32 = ResidentVizChannel.defaultChannel.rawValue
     var isRunning = true
 
     @Published private(set) var hud: HUDModel
+
+    /// Bounded entropy-over-time history for the resident visualization overlay.
+    /// This is visualization-grade state, intentionally separate from Brotli /
+    /// scientific entropy cadence. It remains empty until a future Metal /
+    /// close-LOD integration passes real mean-byte-entropy samples through
+    /// `receiveResidentVizEntropy(epoch:meanByteEntropy:)`.
+    @Published private(set) var vizEntropyHistory = VizEntropyHistory()
+
+    /// Explicit availability for resident visualization entropy. It starts false
+    /// because the current resident report type does not expose viz entropy; the
+    /// UI must report unavailable rather than inventing zeroes or empty data.
+    @Published private(set) var vizEntropyAvailable = false
 
     /// The LOD readout of the most recently submitted render frame — the exact
     /// `LODReadout` that fed the shader uniforms, surfaced for the HUD so the
@@ -312,8 +325,15 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         objectWillChange.send()          // reflect the paused flag immediately
     }
     func cycleMetricChannel() {
-        metricChannel = (metricChannel + 1) % 3
+        metricChannel = ResidentVizChannel.cyclingRawValue(after: metricChannel)
         objectWillChange.send()
+    }
+
+    /// The resident-path channel the current `metricChannel` selects. Used by
+    /// the HUD and entropy overlay to label the active resident signal with its
+    /// resident-specific names.
+    var residentVizChannel: ResidentVizChannel {
+        ResidentVizChannel(rawValue: metricChannel) ?? ResidentVizChannel.defaultChannel
     }
 
     /// The uniforms for the current frame. Evaluates the frame's `LODReadout` once
@@ -336,6 +356,15 @@ final class AppModel: ObservableObject, @unchecked Sendable {
 
     var residentVisualizationTexture: MTLTexture? {
         residentDriver?.texture
+    }
+
+    var residentSnapshotDiagnostics: ResidentSnapshotRingDiagnostics? {
+        residentDriver?.snapshotDiagnostics
+    }
+
+    func acquireResidentSnapshot() -> ResidentGPUSnapshotLease? {
+        guard let residentConfig else { return nil }
+        return residentDriver?.acquireSnapshot(expectedByteCount: residentConfig.soupByteCount)
     }
 
     var latestResidentSourceEpoch: Int {
@@ -425,6 +454,22 @@ final class AppModel: ObservableObject, @unchecked Sendable {
                          + (report.shadowMismatches.first?.summary ?? "divergence"))
         }
         objectWillChange.send()
+    }
+
+    /// Future Metal / close-LOD integration seam. `ResidentEpochReport` on this
+    /// bounded non-Metal slice intentionally lacks `vizMeanByteEntropy`, so resident
+    /// reports do not call this yet. When real samples are added, nil or non-finite
+    /// input means the signal is unavailable and records nothing.
+    func receiveResidentVizEntropy(epoch: Int, meanByteEntropy: Double?) {
+        guard let meanByteEntropy, meanByteEntropy.isFinite,
+              let sample = VizEntropySampleDecoder.sample(epoch: epoch,
+                                                          meanByteEntropy: meanByteEntropy)
+        else {
+            vizEntropyAvailable = false
+            return
+        }
+        vizEntropyAvailable = true
+        vizEntropyHistory.record(sample)
     }
 
     private func residentDidStop(reason: ResidentDriverStopReason,

@@ -229,26 +229,41 @@ final class VisualizationModelTests: XCTestCase {
 
     // MARK: - LOD-gated structural boundaries (program + byte)
 
-    func testProgramBoundaryIsAbsentAtMacroAndFadesInOnBlockSize() {
+    func testProgramBoundaryFadeMatchesMicroBlendOnBlockSize() {
         let lod = LODModel()
-        // Gated on the program-cell size on screen = 8·bytePx. Below the start it is
-        // absent, including the subpixel-macro regime (a program cell < 1 px).
-        XCTAssertEqual(lod.programBoundaryStartPx, 24, accuracy: 1e-12)  // 8·3
-        XCTAssertEqual(lod.programBoundaryEndPx, 48, accuracy: 1e-12)    // 8·6
-        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 0.1), 0, accuracy: 1e-12) // 0.8px block
-        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 1.0), 0, accuracy: 1e-12) // 8px block
-        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 3.0), 0, accuracy: 1e-12) // at start
-        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 6.0), 1, accuracy: 1e-12) // at end
-        // Strictly increasing in the fade band (smoothstep midpoint at 8·bytePx = 36).
-        let mid = lod.programBoundaryBlend(bytePx: 4.5)                  // 8·4.5 = 36
-        XCTAssertEqual(mid, 0.5, accuracy: 1e-12)
-        XCTAssertGreaterThan(lod.programBoundaryBlend(bytePx: 5.0),
-                             lod.programBoundaryBlend(bytePx: 4.0))
+        // Gated on the program-cell size on screen = 8·bytePx. The defaults
+        // (4…12 px) are 8·(0.5…1.5), so the program perimeter fade is pinned to
+        // the same bytePx band as the macro→micro crossfade — the program grid
+        // appears together with the byte colors and never at overview/mid LOD.
+        XCTAssertEqual(lod.programBoundaryStartPx, 4, accuracy: 1e-12)   // 8·0.5
+        XCTAssertEqual(lod.programBoundaryEndPx, 12, accuracy: 1e-12)    // 8·1.5
+        // The program perimeter blend equals microBlend across and beyond the
+        // transition: below the band (0), at the start (0), at the smoothstep
+        // midpoint (0.5), at the end (1), and well past it (1).
+        for px in [0.0, 0.1, 0.49, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 6.0,
+                   12.0, 18.0, 24.0, 32.0, 96.0] {
+            XCTAssertEqual(lod.programBoundaryBlend(bytePx: px),
+                           lod.microBlend(bytePx: px),
+                           accuracy: 1e-12,
+                           "program perimeter fade must equal microBlend at bytePx \(px)")
+        }
+        // Endpoint pins: 0 at/under the start, 1 at/over the end, 0.5 at the
+        // smoothstep midpoint (bytePx 1.0 → 8·1.0 = 8, halfway between 4 and 12).
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 0.1), 0, accuracy: 1e-12)
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 0.5), 0, accuracy: 1e-12)
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 1.0), 0.5, accuracy: 1e-12)
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 1.5), 1, accuracy: 1e-12)
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 6.0), 1, accuracy: 1e-12)
+        // Strictly increasing inside the fade band.
+        XCTAssertGreaterThan(lod.programBoundaryBlend(bytePx: 1.25),
+                             lod.programBoundaryBlend(bytePx: 0.75))
     }
 
     func testByteBoundaryIsCloseLODOnlyAndFadesIn() {
         let lod = LODModel()
-        // Gated directly on bytePx; only appears at the closest zoom.
+        // Gated directly on bytePx; only appears at the closest zoom. The byte
+        // grid band is intentionally left at 24…32 — it switches on well after the
+        // macro→micro crossfade and after the glyph ink.
         XCTAssertEqual(lod.byteBoundaryStart, 24, accuracy: 1e-12)
         XCTAssertEqual(lod.byteBoundaryEnd, 32, accuracy: 1e-12)
         XCTAssertEqual(lod.byteBoundaryBlend(bytePx: 1.0), 0, accuracy: 1e-12)
@@ -262,13 +277,57 @@ final class VisualizationModelTests: XCTestCase {
         XCTAssertGreaterThan(lod.byteBoundaryStart, lod.glyphStart)
     }
 
+    func testCloseGridThresholdsAreZeroThroughMidAndProgramLeadsByteGrid() {
+        let lod = LODModel()
+        // Below the macro→micro crossfade (bytePx < macroStart) both boundary
+        // blends are 0: the view is overview/mid LOD with no grid.
+        for px in [0.0, 0.1, 0.49] {
+            XCTAssertEqual(lod.programBoundaryBlend(bytePx: px), 0, accuracy: 1e-12)
+            XCTAssertEqual(lod.byteBoundaryBlend(bytePx: px), 0, accuracy: 1e-12)
+        }
+        // The byte-cell grid is 0 through the whole macro→micro band and beyond,
+        // right up to byteBoundaryStart.
+        for px in [0.5, 1.0, 1.5, 6.0, 12.0, 18.0, 19.999, 22.0] {
+            XCTAssertEqual(lod.byteBoundaryBlend(bytePx: px), 0, accuracy: 1e-12)
+        }
+
+        let programStartBytePx = lod.programBoundaryStartPx / 8
+        let programEndBytePx = lod.programBoundaryEndPx / 8
+        XCTAssertLessThan(programStartBytePx, lod.byteBoundaryStart,
+                          "program outer edge fades in well before byte-cell subdivisions")
+        XCTAssertLessThan(programEndBytePx, lod.byteBoundaryEnd,
+                          "program outer edge reaches full strength before byte grid")
+        // Program grid is fully faded in (bytePx well past macroEnd) while the
+        // byte grid is still off.
+        XCTAssertGreaterThan(lod.programBoundaryBlend(bytePx: 22.0), 0)
+        XCTAssertEqual(lod.byteBoundaryBlend(bytePx: 22.0), 0, accuracy: 1e-12)
+    }
+
+    func testBoundaryBlendsAreContinuousAndMonotonicSmoothsteps() {
+        let lod = LODModel()
+        var previousProgram = lod.programBoundaryBlend(bytePx: 0)
+        var previousByte = lod.byteBoundaryBlend(bytePx: 0)
+        for px in stride(from: 0.25, through: 40.0, by: 0.25) {
+            let program = lod.programBoundaryBlend(bytePx: px)
+            let byte = lod.byteBoundaryBlend(bytePx: px)
+            XCTAssertGreaterThanOrEqual(program + 1e-12, previousProgram)
+            XCTAssertGreaterThanOrEqual(byte + 1e-12, previousByte)
+            previousProgram = program
+            previousByte = byte
+        }
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 0.5 - 1e-9), 0, accuracy: 1e-9)
+        XCTAssertEqual(lod.programBoundaryBlend(bytePx: 0.5 + 1e-9), 0, accuracy: 1e-9)
+        XCTAssertEqual(lod.byteBoundaryBlend(bytePx: 24.0 - 1e-9), 0, accuracy: 1e-9)
+        XCTAssertEqual(lod.byteBoundaryBlend(bytePx: 24.0 + 1e-9), 0, accuracy: 1e-9)
+    }
+
     func testBoundaryBlendsRideInTheRenderReadoutAndUniforms() {
         // The two boundary fades are host-evaluated in exactly one place (LODReadout)
         // and handed to the shader verbatim through the uniforms — never re-derived on
         // the GPU, so the shader cannot drift from the tested thresholds.
         let lod = LODModel()
         let grid = ProgramGrid(programCount: 1024)
-        for px in [0.1, 3.0, 4.5, 6.0, 12.0, 24.0, 28.0, 32.0, 96.0] {
+        for px in [0.1, 12.0, 20.0, 22.0, 24.0, 28.0, 32.0, 96.0] {
             let camera = Camera(bytePx: px)
             let readout = LODReadout(camera: camera, lod: lod)
             XCTAssertEqual(readout.programBoundaryBlend, lod.programBoundaryBlend(bytePx: px),
@@ -297,6 +356,142 @@ final class VisualizationModelTests: XCTestCase {
         for (col, row) in [(1, 2), (300, 200), (511, 255)] {
             XCTAssertNil(g.programIndex(col: col, row: row))
         }
+    }
+
+    func testGridEdgeClassificationIsMutuallyExclusiveAndCompleteOnProgramPerimeter() {
+        let px = 32.0
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 0, inBlockY: 4,
+                                                       cellU: 0.001, cellV: 0.5,
+                                                       bytePx: px),
+                       .program)
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 4, inBlockY: 0,
+                                                       cellU: 0.5, cellV: 0.001,
+                                                       bytePx: px),
+                       .program)
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 7, inBlockY: 4,
+                                                       cellU: 0.999, cellV: 0.5,
+                                                       bytePx: px),
+                       .program)
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 4, inBlockY: 7,
+                                                       cellU: 0.5, cellV: 0.999,
+                                                       bytePx: px),
+                       .program)
+
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 3, inBlockY: 4,
+                                                       cellU: 0.001, cellV: 0.5,
+                                                       bytePx: px),
+                       .interiorByte)
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 3, inBlockY: 4,
+                                                       cellU: 0.999, cellV: 0.5,
+                                                       bytePx: px),
+                       .interiorByte)
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 4, inBlockY: 3,
+                                                       cellU: 0.5, cellV: 0.001,
+                                                       bytePx: px),
+                       .interiorByte)
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 4, inBlockY: 3,
+                                                       cellU: 0.5, cellV: 0.999,
+                                                       bytePx: px),
+                       .interiorByte)
+        XCTAssertEqual(LODModel.gridEdgeClassification(inBlockX: 4, inBlockY: 4,
+                                                       cellU: 0.5, cellV: 0.5,
+                                                       bytePx: px),
+                       .none)
+    }
+
+    func testGridEdgeAlphaPolicyAvoidsDoubleDarkening() {
+        XCTAssertGreaterThan(LODModel.programBoundaryAlpha, LODModel.byteBoundaryAlpha)
+        XCTAssertEqual(LODModel.programBoundaryAlpha, 0.80, accuracy: 1e-12)
+        XCTAssertEqual(LODModel.byteBoundaryAlpha, 0.18, accuracy: 1e-12)
+        XCTAssertEqual(LODModel.gridEdgeAlpha(.program,
+                                              programBoundaryBlend: 1,
+                                              byteBoundaryBlend: 1),
+                       LODModel.programBoundaryAlpha, accuracy: 1e-12)
+        XCTAssertEqual(LODModel.gridEdgeAlpha(.interiorByte,
+                                              programBoundaryBlend: 1,
+                                              byteBoundaryBlend: 1),
+                       LODModel.byteBoundaryAlpha, accuracy: 1e-12)
+        XCTAssertEqual(LODModel.gridEdgeAlpha(.none,
+                                              programBoundaryBlend: 1,
+                                              byteBoundaryBlend: 1),
+                       0, accuracy: 1e-12)
+
+        let lod = LODModel()
+        // Below the macro→micro crossfade (bytePx < programBoundaryStartPx/8 =
+        // 0.5), the program perimeter blend is 0; the byte grid is 0 well past
+        // that (until byteBoundaryStart = 24), so neither edge paints anything.
+        for px in [0.0, 0.1, 0.49] {
+            XCTAssertEqual(LODModel.gridEdgeAlpha(.program,
+                                                  programBoundaryBlend:
+                                                  lod.programBoundaryBlend(bytePx: px),
+                                                  byteBoundaryBlend:
+                                                  lod.byteBoundaryBlend(bytePx: px)),
+                           0, accuracy: 1e-12)
+            XCTAssertEqual(LODModel.gridEdgeAlpha(.interiorByte,
+                                                  programBoundaryBlend:
+                                                  lod.programBoundaryBlend(bytePx: px),
+                                                  byteBoundaryBlend:
+                                                  lod.byteBoundaryBlend(bytePx: px)),
+                           0, accuracy: 1e-12)
+        }
+    }
+
+    func testLightCanvasAndDedicatedSeamColorsArePinnedAndContrasting() {
+        XCTAssertEqual(SoupVisualizationTheme.background, RGB(hex: 0xF4F0E8))
+        XCTAssertEqual(SoupVisualizationTheme.programBoundary, RGB(hex: 0x181614))
+        XCTAssertEqual(SoupVisualizationTheme.byteBoundary, RGB(hex: 0xBDBAB4))
+        XCTAssertEqual(SoupVisualizationTheme.glyphDarkInk, RGB(hex: 0x171412))
+        XCTAssertEqual(SoupVisualizationTheme.glyphLightInk, RGB(hex: 0xFAF7EF))
+
+        let bgL = SoupVisualizationTheme.luminance(SoupVisualizationTheme.background)
+        let programL = SoupVisualizationTheme.luminance(SoupVisualizationTheme.programBoundary)
+        let byteL = SoupVisualizationTheme.luminance(SoupVisualizationTheme.byteBoundary)
+        XCTAssertGreaterThan(bgL, 0.92, "canvas is warm off-white")
+        XCTAssertLessThan(programL, 0.10, "program perimeter color is near-black")
+        XCTAssertGreaterThan(byteL, 0.70, "byte seam is a light neutral gray")
+        XCTAssertGreaterThan(byteL - programL, 0.60,
+                             "program perimeter is substantially darker than byte seams")
+        XCTAssertNotEqual(SoupVisualizationTheme.programBoundary,
+                          SoupVisualizationTheme.background)
+        XCTAssertNotEqual(SoupVisualizationTheme.byteBoundary,
+                          SoupVisualizationTheme.background)
+    }
+
+    func testProgramPerimeterUsesDedicatedNearBlackDuringFade() {
+        let lod = LODModel()
+        let nullBase = OpcodeVisual.color(0)
+        let midFade = SoupVisualizationTheme.edgeColor(
+            base: nullBase,
+            classification: .program,
+            programBoundaryBlend: lod.programBoundaryBlend(bytePx: 1.0),
+            byteBoundaryBlend: 0)
+        XCTAssertLessThan(SoupVisualizationTheme.luminance(midFade),
+                          SoupVisualizationTheme.luminance(nullBase) - 0.10)
+
+        for op in BFFOpcode.allCases {
+            let base = OpcodeVisual.color(op.byte)
+            let edged = SoupVisualizationTheme.edgeColor(
+                base: base,
+                classification: .program,
+                programBoundaryBlend: lod.programBoundaryBlend(bytePx: 1.0),
+                byteBoundaryBlend: 0)
+            XCTAssertLessThan(SoupVisualizationTheme.luminance(edged),
+                              SoupVisualizationTheme.luminance(base) - 0.04,
+                              "program perimeter must read during fade over \(op)")
+        }
+
+        let byteSeam = SoupVisualizationTheme.edgeColor(
+            base: OpcodeVisual.dataRampHigh,
+            classification: .interiorByte,
+            programBoundaryBlend: 1,
+            byteBoundaryBlend: 1)
+        let programSeam = SoupVisualizationTheme.edgeColor(
+            base: OpcodeVisual.dataRampHigh,
+            classification: .program,
+            programBoundaryBlend: 1,
+            byteBoundaryBlend: 1)
+        XCTAssertGreaterThan(SoupVisualizationTheme.luminance(byteSeam),
+                             SoupVisualizationTheme.luminance(programSeam) + 0.10)
     }
 
     // MARK: - LOD readout: the values the HUD displays, at the transition endpoints
@@ -435,9 +630,23 @@ final class VisualizationModelTests: XCTestCase {
 
     func testByteColoringIsStableAndDistinct() {
         // Pinned opcode colors (03 §5).
-        XCTAssertEqual(OpcodeVisual.color(BFFOp.inc), RGB(hex: 0xE08A3D))
-        XCTAssertEqual(OpcodeVisual.color(BFFOp.write), RGB(hex: 0x46E052))
+        XCTAssertEqual(BFFOpcode.allCases.map(\.color),
+                       [RGB(hex: 0x4E928C),
+                        RGB(hex: 0x6FAEA8),
+                        RGB(hex: 0x5D78A0),
+                        RGB(hex: 0x879CBC),
+                        RGB(hex: 0xC97767),
+                        RGB(hex: 0xA95C57),
+                        RGB(hex: 0x6B9B7A),
+                        RGB(hex: 0xB4778E),
+                        RGB(hex: 0x8480AE),
+                        RGB(hex: 0x9A8E5C)])
+        XCTAssertEqual(OpcodeVisual.color(BFFOp.inc), RGB(hex: 0xC97767))
+        XCTAssertEqual(OpcodeVisual.color(BFFOp.write), RGB(hex: 0x6B9B7A))
         XCTAssertEqual(OpcodeVisual.color(0), OpcodeVisual.nullColor)
+        XCTAssertEqual(OpcodeVisual.nullColor, RGB(hex: 0xEEE9DF))
+        XCTAssertEqual(OpcodeVisual.dataRampLow, RGB(hex: 0xE7E1D7))
+        XCTAssertEqual(OpcodeVisual.dataRampHigh, RGB(hex: 0x8F9A9B))
 
         // The ten opcode colors are mutually distinct.
         let colors = BFFOpcode.allCases.map { OpcodeVisual.color($0.byte) }
@@ -447,11 +656,37 @@ final class VisualizationModelTests: XCTestCase {
             }
         }
 
-        // Data ramp is deterministic and follows the documented formula.
-        let v: UInt8 = 100
-        let lum = 0.13 + 0.17 * (Double(v) / 255)
-        XCTAssertEqual(OpcodeVisual.color(v),
-                       RGB(min(lum * 0.90, 1), min(lum * 0.96, 1), min(lum * 1.12, 1)))
+        // Data ramp is deterministic, clamped to endpoints, and monotonic in
+        // luminance as byte values move away from null paper.
+        XCTAssertEqual(OpcodeVisual.color(1),
+                       SoupVisualizationTheme.mix(OpcodeVisual.dataRampLow,
+                                                  OpcodeVisual.dataRampHigh, 1.0 / 255.0))
+        XCTAssertEqual(OpcodeVisual.color(255), OpcodeVisual.dataRampHigh)
+        var previous = SoupVisualizationTheme.luminance(OpcodeVisual.color(1))
+        for v in 2 ... 255 where OpcodeVisual.classify(UInt8(v)) == nil {
+            let current = SoupVisualizationTheme.luminance(OpcodeVisual.color(UInt8(v)))
+            XCTAssertLessThanOrEqual(current, previous + 1e-12,
+                                     "data ramp luminance is monotonic at byte \(v)")
+            previous = current
+        }
+    }
+
+    func testOpcodeAndGlyphInkRemainLegibleOnTheLightField() {
+        let bgL = SoupVisualizationTheme.luminance(SoupVisualizationTheme.background)
+        for op in BFFOpcode.allCases {
+            let color = OpcodeVisual.color(op.byte)
+            let colorL = SoupVisualizationTheme.luminance(color)
+            XCTAssertGreaterThan(bgL - colorL, 0.30,
+                                 "opcode color must read against the light field for \(op)")
+
+            let ink = SoupVisualizationTheme.glyphInk(forBase: color)
+            let inkDelta = abs(SoupVisualizationTheme.luminance(ink) - colorL)
+            XCTAssertGreaterThan(inkDelta, 0.32,
+                                 "glyph ink must read against opcode color for \(op)")
+        }
+
+        XCTAssertGreaterThan(bgL - SoupVisualizationTheme.luminance(OpcodeVisual.dataRampHigh),
+                             0.30)
     }
 
     // MARK: - Adaptive batcher
@@ -541,6 +776,19 @@ final class VisualizationModelTests: XCTestCase {
         XCTAssertEqual(VizLayout.probeWordCount, 16)
         XCTAssertEqual(VizLayout.hostProbeWords(),
                        [56, 4, 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52])
+    }
+
+    func testMetricChannelUniformPropagatesAllFourFastSelectorsWithoutLayoutChange() {
+        let lod = LODModel()
+        let camera = Camera(bytePx: 24)
+        let readout = LODReadout(camera: camera, lod: lod)
+        let grid = ProgramGrid(programCount: 1024)
+        for selector in [UInt32(0), 1, 2, 3] {
+            let u = VizLayout.makeUniforms(readout: readout, camera: camera, grid: grid,
+                                           metricChannel: selector,
+                                           viewPxWidth: 800, viewPxHeight: 600)
+            XCTAssertEqual(u.metricChannel, selector)
+        }
     }
 
     // MARK: - Launch options

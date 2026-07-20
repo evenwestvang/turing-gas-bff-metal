@@ -70,6 +70,14 @@ final class ResidentSimulationDriver: @unchecked Sendable {
         runner.residentVisualizationTexture
     }
 
+    var snapshotDiagnostics: ResidentSnapshotRingDiagnostics {
+        runner.residentSnapshotDiagnostics
+    }
+
+    func acquireSnapshot(expectedByteCount: Int) -> ResidentGPUSnapshotLease? {
+        runner.acquireResidentSnapshot(expectedByteCount: expectedByteCount)
+    }
+
     var latestCompletedEpoch: Int {
         locked { latestEpochValue }
     }

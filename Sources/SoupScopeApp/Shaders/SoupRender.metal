@@ -32,16 +32,22 @@ struct VizUniforms {
     uint  gridWidth;      // 28 program grid columns
     uint  gridHeight;     // 32 program grid rows
     uint  programCount;   // 36 real programs (cells >= this render as background)
-    uint  metricChannel;  // 40 0 activity, 1 entropy, 2 life composite
+    uint  metricChannel;  // 40 resident: 0 composite, 1 R, 2 G, 3 B
     uint  flags;          // 44 reserved
-    float programBoundaryBlend; // 48 smoothstep(24,48,8*bytePx) — host-evaluated (LODModel)
+    float programBoundaryBlend; // 48 smoothstep(160,224,8*bytePx) — host-evaluated (LODModel)
     float byteBoundaryBlend;    // 52 smoothstep(24,32,bytePx)   — host-evaluated
 };                        // size 56, align 4
 
 static_assert(sizeof(VizUniforms) == 56, "VizUniforms must be 56 bytes");
 static_assert(alignof(VizUniforms) == 4, "VizUniforms must be 4-byte aligned");
 
-constant float3 kBackground = float3(0.02, 0.02, 0.03);
+constant float3 kBackground = float3(0xF4, 0xF0, 0xE8) / 255.0;
+constant float3 kProgramBoundaryColor = float3(0x18, 0x16, 0x14) / 255.0;
+constant float3 kByteBoundaryColor = float3(0xBD, 0xBA, 0xB4) / 255.0;
+constant float3 kGlyphDarkInk = float3(0x17, 0x14, 0x12) / 255.0;
+constant float3 kGlyphLightInk = float3(0xFA, 0xF7, 0xEF) / 255.0;
+constant float kProgramBoundaryAlpha = 0.80;
+constant float kByteBoundaryAlpha = 0.18;
 
 // --- Opcode identity (mirrors OpcodeVisual). -1 = data/no-op byte. ---
 static int opcode_index(uchar b) {
@@ -63,17 +69,21 @@ static int opcode_index(uchar b) {
 // Palette colors, indexed by opcode_index (03 §5; identical literals to
 // OpcodeVisual.color).
 constant float3 kOpcodeColor[10] = {
-    float3(0x2F, 0xB8, 0xAC) / 255.0, // '<'
-    float3(0x45, 0xE0, 0xD2) / 255.0, // '>'
-    float3(0x3D, 0x6F, 0xE0) / 255.0, // '{'
-    float3(0x6F, 0xA0, 0xFF) / 255.0, // '}'
-    float3(0xE0, 0x8A, 0x3D) / 255.0, // '+'
-    float3(0xC2, 0x4B, 0x4B) / 255.0, // '-'
-    float3(0x46, 0xE0, 0x52) / 255.0, // '.'
-    float3(0xE0, 0x46, 0xC8) / 255.0, // ','
-    float3(0xE0, 0xD0, 0x40) / 255.0, // '['
-    float3(0xB8, 0xA8, 0x1E) / 255.0, // ']'
+    float3(0x4E, 0x92, 0x8C) / 255.0, // '<'
+    float3(0x6F, 0xAE, 0xA8) / 255.0, // '>'
+    float3(0x5D, 0x78, 0xA0) / 255.0, // '{'
+    float3(0x87, 0x9C, 0xBC) / 255.0, // '}'
+    float3(0xC9, 0x77, 0x67) / 255.0, // '+'
+    float3(0xA9, 0x5C, 0x57) / 255.0, // '-'
+    float3(0x6B, 0x9B, 0x7A) / 255.0, // '.'
+    float3(0xB4, 0x77, 0x8E) / 255.0, // ','
+    float3(0x84, 0x80, 0xAE) / 255.0, // '['
+    float3(0x9A, 0x8E, 0x5C) / 255.0, // ']'
 };
+
+constant float3 kNullColor = float3(0xEE, 0xE9, 0xDF) / 255.0;
+constant float3 kDataRampLow = float3(0xE7, 0xE1, 0xD7) / 255.0;
+constant float3 kDataRampHigh = float3(0x8F, 0x9A, 0x9B) / 255.0;
 
 // Compact 5×5 procedural glyph, one 5-bit row mask per row (bit c = column c).
 // Not a font atlas — an inline constant, mirrored only for legibility.
@@ -93,9 +103,8 @@ constant uint kGlyphRows[10][5] = {
 static float3 palette_color(uchar b) {
     int idx = opcode_index(b);
     if (idx >= 0) return kOpcodeColor[idx];
-    if (b == 0) return float3(0x10, 0x10, 0x14) / 255.0; // null vacuum
-    float lum = 0.13 + 0.17 * (float(b) / 255.0);        // data ramp, slight blue tint
-    return min(float3(lum * 0.90, lum * 0.96, lum * 1.12), float3(1.0));
+    if (b == 0) return kNullColor;
+    return mix(kDataRampLow, kDataRampHigh, float(b) / 255.0);
 }
 
 // Glyph ink coverage in [0,1] for a byte at cell-local uv (0..1, top-left origin).
@@ -109,19 +118,79 @@ static float glyph_ink(uchar b, float2 uv) {
     return ((kGlyphRows[idx][row] >> col) & 1u) ? 1.0 : 0.0;
 }
 
-static float3 colormap(float activity, float entropy, uint channel) {
-    if (channel == 0) {                       // activity: warm ramp
-        return mix(float3(0.05, 0.02, 0.10), float3(1.0, 0.75, 0.20),
+static float3 legacy_metric_colormap(float activity, float entropy, uint channel) {
+    if (channel == 1) {                       // legacy activity: warm ramp
+        return mix(float3(0xF1, 0xED, 0xE4) / 255.0,
+                   float3(0xC9, 0x77, 0x67) / 255.0,
                    clamp(activity, 0.0, 1.0));
-    } else if (channel == 1) {                // entropy: cool ramp
-        return mix(float3(0.02, 0.05, 0.12), float3(0.55, 0.85, 1.0),
+    } else if (channel == 2) {                // legacy entropy: cool ramp
+        return mix(float3(0xF1, 0xED, 0xE4) / 255.0,
+                   float3(0x5D, 0x78, 0xA0) / 255.0,
                    clamp(entropy, 0.0, 1.0));
     }
-    // life composite: low entropy (replicators) brightens, activity warms.
+    // Legacy composite for selector 0 and resident-only selector 3: low entropy
+    // (replicators) brightens, activity warms. This keeps the CPU snapshot path
+    // coherent even though it has no resident B component.
     float life = clamp(1.0 - entropy, 0.0, 1.0);
-    float3 base = float3(life * 0.6);
-    float3 warm = float3(1.0, 0.5, 0.15) * clamp(activity, 0.0, 1.0);
+    float3 base = mix(kBackground, float3(0x4E, 0x8E, 0x86) / 255.0, life * 0.65);
+    float3 warm = mix(float3(0.0), float3(0xC9, 0x77, 0x67) / 255.0,
+                      clamp(activity, 0.0, 1.0) * 0.35);
     return min(base + warm, float3(1.0));
+}
+
+// Shared restrained scalar palette for resident component views (selectors 1...3):
+// muted blue -> teal -> muted red. It is intentionally not raw red, green, or
+// blue, so single-channel views remain legible and comparable.
+static float3 resident_scalar_palette(float value) {
+    float t = isfinite(value) ? clamp(value, 0.0, 1.0) : 0.0;
+    float3 low = float3(0x32, 0x4E, 0x67) / 255.0;
+    float3 mid = float3(0x4E, 0x8E, 0x86) / 255.0;
+    float3 high = float3(0xC9, 0x78, 0x67) / 255.0;
+    if (t < 0.5) {
+        return mix(low, mid, smoothstep(0.0, 1.0, t * 2.0));
+    }
+    return mix(mid, high, smoothstep(0.0, 1.0, (t - 0.5) * 2.0));
+}
+
+static float3 resident_composite_presentation(float3 residentRGB) {
+    float3 inverted = 1.0 - clamp(residentRGB, float3(0.0), float3(1.0));
+    float3 clamped = clamp(inverted, float3(0.20), float3(0.80));
+    float luminance = dot(clamped, float3(0.2126, 0.7152, 0.0722));
+    float3 result = mix(float3(luminance), clamped, 0.25);
+    return clamp(result, float3(0.20), float3(0.80));
+}
+
+// Resident macro helper. Selector 0 presents the producer's RGB composite through
+// a bounded low-chroma transform; selectors 1...3 view R/G/B scalar components
+// through one shared palette. Out-of-range selectors snap to the composite.
+static float3 resident_macro_color(float3 residentRGB, uint channel) {
+    if (channel == 1) return resident_scalar_palette(residentRGB.r);
+    if (channel == 2) return resident_scalar_palette(residentRGB.g);
+    if (channel == 3) return resident_scalar_palette(residentRGB.b);
+    return resident_composite_presentation(residentRGB);
+}
+
+static float3 blend_macro_micro(float3 macro, float3 micro, float microBlend) {
+    float t = clamp(microBlend, 0.0, 1.0);
+    if (t >= 1.0) return micro;
+    return mix(macro, micro, t);
+}
+
+// Mutually exclusive structural edge classification. Program perimeter wins and
+// receives only the stronger program alpha; interior byte boundaries receive only
+// the weaker byte alpha, so close-grid compositing never double-darkens a pixel.
+static uint grid_edge_kind(uint2 inBlk, float2 cellUV, float lineFrac) {
+    bool onProgramEdge = (inBlk.x == 0u && cellUV.x < lineFrac)
+                       || (inBlk.y == 0u && cellUV.y < lineFrac)
+                       || (inBlk.x == 7u && cellUV.x >= 1.0 - lineFrac)
+                       || (inBlk.y == 7u && cellUV.y >= 1.0 - lineFrac);
+    if (onProgramEdge) return 1u;
+
+    bool onInteriorByteEdge = (inBlk.x > 0u && cellUV.x < lineFrac)
+                           || (inBlk.y > 0u && cellUV.y < lineFrac)
+                           || (inBlk.x < 7u && cellUV.x >= 1.0 - lineFrac)
+                           || (inBlk.y < 7u && cellUV.y >= 1.0 - lineFrac);
+    return onInteriorByteEdge ? 2u : 0u;
 }
 
 struct VSOut {
@@ -134,6 +203,41 @@ vertex VSOut soup_vertex(uint vid [[vertex_id]]) {
     VSOut o;
     o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);
     return o;
+}
+
+static float3 micro_byte_color(constant VizUniforms &u,
+                               device const uchar *soup,
+                               uint2 inBlk,
+                               uint prog,
+                               float2 cellUV) {
+    uint byteIndex = inBlk.y * 8u + inBlk.x;   // reading order = tape order
+    uchar bv = soup[prog * 64u + byteIndex];   // canonical programID * 64 + byteIndex
+    float3 micro = palette_color(bv);
+
+    // Structural boundaries, drawn BENEATH the glyph ink so glyphs stay legible. Both
+    // fade factors are host-evaluated (LODModel, pinned by Swift tests); the shader
+    // only draws them — it never re-derives the thresholds. A padded/background cell
+    // never reaches here (the prog >= programCount guard returned), so a boundary can
+    // never bleed onto padding. Line width ≈ 1 device pixel, in cell-fraction units.
+    float lineFrac = min(0.5 / max(u.bytePx, 1e-4), 0.5);
+
+    uint edgeKind = grid_edge_kind(inBlk, cellUV, lineFrac);
+    if (edgeKind == 1u && u.programBoundaryBlend > 0.0) {
+        micro = mix(micro, kProgramBoundaryColor,
+                    kProgramBoundaryAlpha * u.programBoundaryBlend);
+    } else if (edgeKind == 2u && u.byteBoundaryBlend > 0.0) {
+        micro = mix(micro, kByteBoundaryColor, kByteBoundaryAlpha * u.byteBoundaryBlend);
+    }
+
+    // Opcode glyph ink on top of the boundaries.
+    if (u.glyphBlend > 0.0) {
+        float ink = glyph_ink(bv, cellUV) * u.glyphBlend;
+        float lum = dot(micro, float3(0.299, 0.587, 0.114));
+        float3 inkColor = lum > 0.45 ? kGlyphDarkInk : kGlyphLightInk;
+        micro = mix(micro, inkColor, ink);
+    }
+
+    return micro;
 }
 
 fragment float4 soup_fragment(VSOut in [[stage_in]],
@@ -164,50 +268,20 @@ fragment float4 soup_fragment(VSOut in [[stage_in]],
     float2 texUV = float2((float(col) + 0.5) / float(u.gridWidth),
                           (float(row) + 0.5) / float(u.gridHeight));
     float4 m = metricTex.sample(nearestSampler, texUV);
-    float3 macro = colormap(m.r, m.g, u.metricChannel);
+    float3 macro = legacy_metric_colormap(m.r, m.g, u.metricChannel);
 
     // ---- micro branch: per-byte color by stable (programID, byteIndex).
     uint2 inBlk = cellByte % 8u;
-    uint byteIndex = inBlk.y * 8u + inBlk.x;   // reading order = tape order
-    uchar bv = soup[prog * 64u + byteIndex];
-    float3 micro = palette_color(bv);
     float2 cellUV = fract(b);                  // position within this byte cell (0..1)
+    float3 micro = micro_byte_color(u, soup, inBlk, prog, cellUV);
 
-    // Structural boundaries, drawn BENEATH the glyph ink so glyphs stay legible. Both
-    // fade factors are host-evaluated (LODModel, pinned by Swift tests); the shader
-    // only draws them — it never re-derives the thresholds. A padded/background cell
-    // never reaches here (the prog >= programCount guard above returned), so a boundary
-    // can never bleed onto padding. Line width ≈ 1 device pixel, in cell-fraction units.
-    float lineFrac = min(0.5 / max(u.bytePx, 1e-4), 0.5);
-
-    // Program boundaries: the outer (top/left) edge of each 8×8 block. Absent at macro
-    // LOD (blend is 0 while a program cell is subpixel), subtle when the blocks read.
-    if (u.programBoundaryBlend > 0.0) {
-        bool onProgEdge = (inBlk.x == 0u && cellUV.x < lineFrac)
-                        || (inBlk.y == 0u && cellUV.y < lineFrac);
-        if (onProgEdge) micro = mix(micro, kBackground, 0.55 * u.programBoundaryBlend);
-    }
-
-    // Per-byte boundaries: every byte-cell edge, low alpha, closest LOD only.
-    if (u.byteBoundaryBlend > 0.0) {
-        bool onByteEdge = (cellUV.x < lineFrac) || (cellUV.y < lineFrac);
-        if (onByteEdge) micro = mix(micro, kBackground, 0.18 * u.byteBoundaryBlend);
-    }
-
-    // Opcode glyph ink on top of the boundaries.
-    if (u.glyphBlend > 0.0) {
-        float ink = glyph_ink(bv, cellUV) * u.glyphBlend;
-        float lum = dot(micro, float3(0.299, 0.587, 0.114));
-        float3 inkColor = lum > 0.45 ? float3(0.02) : float3(0.95);
-        micro = mix(micro, inkColor, ink);
-    }
-
-    float3 c = mix(macro, micro, clamp(u.microBlend, 0.0, 1.0));
+    float3 c = blend_macro_micro(macro, micro, u.microBlend);
     return float4(c, 1.0);
 }
 
 fragment float4 soup_resident_fragment(VSOut in [[stage_in]],
                                        constant VizUniforms &u [[buffer(0)]],
+                                       device const uchar *soup [[buffer(1)]],
                                        texture2d<float> residentTex [[texture(0)]]) {
     constexpr sampler nearestSampler(filter::nearest, address::clamp_to_edge);
 
@@ -232,8 +306,44 @@ fragment float4 soup_resident_fragment(VSOut in [[stage_in]],
     uint2 texel = uint2(prog % texWidth, prog / texWidth);
     float2 texUV = float2((float(texel.x) + 0.5) / float(texWidth),
                           (float(texel.y) + 0.5) / float(residentTex.get_height()));
-    float4 m = residentTex.sample(nearestSampler, texUV);
-    return float4(m.rgb, 1.0);
+    float3 macro = resident_macro_color(residentTex.sample(nearestSampler, texUV).rgb,
+                                        u.metricChannel);
+
+    uint2 inBlk = cellByte % 8u;
+    float2 cellUV = fract(b);
+    float3 micro = micro_byte_color(u, soup, inBlk, prog, cellUV);
+    return float4(blend_macro_micro(macro, micro, u.microBlend), 1.0);
+}
+
+fragment float4 soup_resident_overview_fragment(VSOut in [[stage_in]],
+                                                constant VizUniforms &u [[buffer(0)]],
+                                                texture2d<float> residentTex [[texture(0)]]) {
+    constexpr sampler nearestSampler(filter::nearest, address::clamp_to_edge);
+
+    float2 frag = in.pos.xy;
+    float2 b = float2(u.originByteX, u.originByteY) + frag / max(u.bytePx, 1e-4);
+
+    float soupW = float(u.gridWidth * 8u);
+    float soupH = float(u.gridHeight * 8u);
+    if (b.x < 0.0 || b.y < 0.0 || b.x >= soupW || b.y >= soupH) {
+        return float4(kBackground, 1.0);
+    }
+
+    uint2 cellByte = uint2(floor(b));
+    uint col = cellByte.x / 8u;
+    uint row = cellByte.y / 8u;
+    uint prog = row * u.gridWidth + col;
+    if (prog >= u.programCount) {
+        return float4(kBackground, 1.0);
+    }
+
+    uint texWidth = residentTex.get_width();
+    uint2 texel = uint2(prog % texWidth, prog / texWidth);
+    float2 texUV = float2((float(texel.x) + 0.5) / float(texWidth),
+                          (float(texel.y) + 0.5) / float(residentTex.get_height()));
+    float3 macro = resident_macro_color(residentTex.sample(nearestSampler, texUV).rgb,
+                                        u.metricChannel);
+    return float4(macro, 1.0);
 }
 
 // Layer-3 layout probe: reports sizeof/alignof/field offsets of VizUniforms as the
