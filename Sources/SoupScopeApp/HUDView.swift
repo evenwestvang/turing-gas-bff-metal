@@ -63,7 +63,7 @@ struct HUDView: View {
                     .foregroundColor(.red)
                     .fontWeight(.bold)
             }
-            Text("drag pan · scroll/pinch zoom · space pause · f fit · m channel")
+            Text("drag pan · scroll/pinch zoom · space pause · f fit · m channel · r reset")
                 .foregroundColor(.secondary)
         }
         .font(.system(size: 11, design: .monospaced))

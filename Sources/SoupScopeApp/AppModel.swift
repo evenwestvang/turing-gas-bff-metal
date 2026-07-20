@@ -58,6 +58,15 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     let context: SharedMetalContext?
     private var runner: SoupRunner?
     private var residentDriver: ResidentSimulationDriver?
+    /// Monotonically increasing lifecycle generation for the resident driver.
+    /// Every resident `onReport`/`onFailure`/`onStop` callback captures the
+    /// generation of the driver it belongs to and is inert unless it is still
+    /// current — so callbacks queued by an old driver that are still in flight
+    /// when `resetInteractiveResidentSimulation` constructs a fresh driver cannot
+    /// mutate the new state or emit a stale termination. The launch-time driver
+    /// captures generation `0`; each Reset bumps it before stopping the old
+    /// driver.
+    private var lifecycleGeneration = ResidentLifecycleGeneration()
     private var residentDisplayedEpoch = 0
     private var residentRenderedFrames = 0
     private var residentFinalDiagnosticEmitter = ResidentFinalDiagnosticEmitter()
@@ -411,20 +420,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
             return
         }
         do {
-            let driver = try ResidentSimulationDriver(
-                config: residentConfig,
-                plan: residentPlan,
-                device: context.device,
-                commandQueue: context.queue,
-                onReport: { [weak self] report, failures in
-                    self?.receiveResidentReport(report, failureCount: failures)
-                },
-                onFailure: { [weak self] message in
-                    self?.hud.setError(message)
-                },
-                onStop: { [weak self] reason, snapshot in
-                    self?.residentDidStop(reason: reason, snapshot: snapshot)
-                })
+            let driver = try makeResidentDriver(context: context, residentConfig: residentConfig)
             residentDriver = driver
             isRunning = true
             driver.start()
@@ -440,6 +436,35 @@ final class AppModel: ObservableObject, @unchecked Sendable {
                                                        unknownHalts: 0))
             }
         }
+    }
+
+    /// Construct a `ResidentSimulationDriver` from the immutable
+    /// `residentConfig`/`residentPlan` and the shared Metal device+queue, whose
+    /// `onReport`/`onFailure`/`onStop` callbacks capture the current lifecycle
+    /// generation and are inert unless it is still current — so callbacks queued
+    /// by an old driver that are still in flight after Reset cannot mutate the
+    /// new state or emit a stale termination.
+    private func makeResidentDriver(context: SharedMetalContext,
+                                   residentConfig: ResidentEpochConfig
+    ) throws -> ResidentSimulationDriver {
+        let generation = lifecycleGeneration.current
+        return try ResidentSimulationDriver(
+            config: residentConfig,
+            plan: residentPlan,
+            device: context.device,
+            commandQueue: context.queue,
+            onReport: { [weak self] report, failures in
+                guard let self, self.lifecycleGeneration.isCurrent(generation) else { return }
+                self.receiveResidentReport(report, failureCount: failures)
+            },
+            onFailure: { [weak self] message in
+                guard let self, self.lifecycleGeneration.isCurrent(generation) else { return }
+                self.hud.setError(message)
+            },
+            onStop: { [weak self] reason, snapshot in
+                guard let self, self.lifecycleGeneration.isCurrent(generation) else { return }
+                self.residentDidStop(reason: reason, snapshot: snapshot)
+            })
     }
 
     private func receiveResidentReport(_ report: ResidentEpochReport, failureCount: Int) {
@@ -510,6 +535,117 @@ final class AppModel: ObservableObject, @unchecked Sendable {
 
     func stopResidentSimulation() {
         residentDriver?.stopAndWait()
+    }
+
+    // MARK: - Interactive resident Reset
+
+    /// User-visible Reset (the `r` key): reconstruct the resident simulation
+    /// driver from its immutable `residentConfig`/`residentPlan` and the shared
+    /// Metal device+queue, restoring the seeded soup, epoch zero, the snapshot
+    /// ring/resources/generations, and all displayed/visualization/HUD/error
+    /// state, then re-fit the camera with the current drawable geometry and
+    /// restart.
+    ///
+    /// Allowed only for the interactive resident well-mixed mode — a resident
+    /// run with an `unbounded` limit, `tinyValidation` off, and no
+    /// display-independent bounded native validation armed. It is a truthful
+    /// no-op otherwise, so bounded validation and finite resident diagnostic
+    /// runs terminate exactly as configured (their termination semantics do not
+    /// change). The non-resident path is unchanged.
+    ///
+    /// Generation fence: the generation is bumped *before* the old driver is
+    /// stopped, so every `onReport`/`onFailure`/`onStop` callback the old driver
+    /// still has queued on the main queue is inert by the time it fires — it can
+    /// neither mutate the freshly reset state nor emit a stale termination. The
+    /// fresh driver's callbacks capture the new generation.
+    ///
+    /// Failure semantics: the cleared state is applied before fresh driver
+    /// construction. If construction throws after the old driver was torn down,
+    /// the app applies `ResidentResetTransition.failureRollback` — `isRunning`
+    /// becomes `false`, no driver is left installed, and an explicit error is
+    /// set on the HUD — so the app truthfully remains stopped rather than
+    /// silently presenting `isRunning == true` with no driver.
+    @discardableResult
+    func resetInteractiveResidentSimulation() -> Bool {
+        guard usesResidentRendering,
+              SoupScopeAppLifecycle.canResetInteractiveResident(
+                  plan: residentPlan, validationActive: validationActive),
+              let context,
+              let residentConfig else {
+            return false
+        }
+        // Bump the lifecycle generation first so any callback the old driver
+        // still has queued on the main queue is inert by the time it fires.
+        lifecycleGeneration.bump()
+        // Stop and join the old driver before constructing the fresh one. Its
+        // run loop exits and schedules its onStop on the main queue; that
+        // onStop captures the old generation and is inert under the fence.
+        residentDriver?.stopAndWait()
+        residentDriver = nil
+
+        // Build the production reset-state transition for the current run
+        // identity and drawable geometry. It clears HUD/error/counters,
+        // displayed/source epoch, rendered frames, viz entropy
+        // history/availability, and the metric channel, and carries the
+        // camera-refit decision and running-state intent — one transaction the
+        // shell and the tests share, instead of hand-reconstructed state.
+        //
+        // `residentFinalDiagnosticEmitter` is *not* part of the transition: it
+        // is a one-shot termination guard for bounded runs, and Reset is only
+        // allowed in the unbounded interactive mode where it has never
+        // emitted, so leaving it preserves bounded termination semantics.
+        let reset = ResidentResetTransition(deviceName: hud.deviceName,
+                                            programCount: hud.programCount,
+                                            drawableWidth: drawablePxW,
+                                            drawableHeight: drawablePxH)
+        residentDisplayedEpoch = reset.displayedEpoch
+        residentRenderedFrames = reset.renderedFrames
+        lastSnapshot = nil
+        hud = reset.hud
+        vizEntropyHistory = reset.vizEntropyHistory
+        vizEntropyAvailable = reset.vizEntropyAvailable
+        metricChannel = reset.metricChannel
+        isRunning = reset.intendsToRun
+        if frameStages != nil {
+            frameStages = AppFrameStageAccumulator()
+            lastEpochBatchSeconds = nil
+            lastSnapshotBuildSeconds = nil
+        }
+
+        // Apply the camera refit and publish the HUD LOD readout through one
+        // transition method that owns the ordering — refit first (when the
+        // drawable is usable), then read the LOD from the *post-refit* camera —
+        // so the published HUD LOD matches the post-reset camera, never the
+        // pre-refit camera the user just panned/zoomed. When no drawable has
+        // arrived yet, the transition leaves the camera untouched and returns
+        // `didFit == false` so the next `updateDrawableSize` performs the first
+        // fit — exactly like launch.
+        let refitResult = reset.applyRefitAndBuildLODReadout(
+            camera: &camera, geometry: cameraGeometry(), lod: lod)
+        didFit = refitResult.didFit
+        lodReadout = refitResult.lodReadout
+
+        // Construct the fresh driver from the unchanged immutable
+        // config/plan/shared device+queue. Its callbacks capture the new
+        // generation; no in-place reset is added to ResidentMetalEpochRunner.
+        do {
+            let driver = try makeResidentDriver(context: context, residentConfig: residentConfig)
+            residentDriver = driver
+            driver.start()
+            objectWillChange.send()
+            return true
+        } catch {
+            // Fresh construction failed after the old driver was torn down.
+            // Truthfully remain stopped: no driver (already `nil`), `isRunning`
+            // set to the failure rollback's `false`, and an explicit error on
+            // the HUD — never silently "running" with no driver.
+            let rollback = ResidentResetTransition.failureRollback
+            isRunning = rollback.isRunning
+            hud.setError((hud.errorState.map { $0 + "; " } ?? "")
+                         + "resident reset failed: \(error)")
+            objectWillChange.send()
+            return false
+        }
     }
 
     // MARK: - Bounded native validation

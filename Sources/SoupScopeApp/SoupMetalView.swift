@@ -62,6 +62,7 @@ final class SoupMTKView: MTKView {
         case " "?: appModel?.togglePause()
         case "f"?, "F"?: appModel?.fitAll()
         case "m"?, "M"?: appModel?.cycleMetricChannel()
+        case "r"?, "R"?: appModel?.resetInteractiveResidentSimulation()
         default: super.keyDown(with: event)
         }
     }
