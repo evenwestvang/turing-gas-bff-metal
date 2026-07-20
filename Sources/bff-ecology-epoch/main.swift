@@ -30,7 +30,7 @@ usage: bff-ecology-epoch [options]
   Required when --checkpoint is not given:
     --seed N                 UInt32 seed (decimal digits only).
 
-  Config (ignored when --checkpoint is given; the checkpoint is authoritative):
+  Config (rejected when --checkpoint is given; the checkpoint is authoritative):
     --budget N               per-pair step budget, > 0 (default \(BFF.stepBudget))
     --mutation-p32 N         mutate iff uint32 draw < N; 0 disables (default \(BFF.defaultMutationP32))
     --variant noheads|bff    initial head mode (default noheads)

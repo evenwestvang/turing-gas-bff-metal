@@ -107,8 +107,14 @@ final class EcologyCLIParserTests: XCTestCase {
         XCTAssertEqual(opts.epochs, 0)
         XCTAssertNil(opts.stepBudget)
         XCTAssertNil(opts.mutationP32)
-        XCTAssertEqual(opts.variant, .noheads)  // default
-        XCTAssertEqual(opts.bracketMode, .dynamicScan)  // default
+        // The parser intentionally leaves variant/bracketMode nil when the
+        // flags are absent; `main` applies the defaults (`bff-ecology-epoch`
+        // main.swift: `options.variant ?? .noheads`,
+        // `options.bracketMode ?? .dynamicScan`). Asserting a default here
+        // would couple the parser to a policy that lives in the CLI entry
+        // point and weaken the rejection contract for `--info`/`--checkpoint`.
+        XCTAssertNil(opts.variant)
+        XCTAssertNil(opts.bracketMode)
         XCTAssertNil(opts.checkpointURL)
         XCTAssertNil(opts.saveURL)
         XCTAssertFalse(opts.infoOnly)
@@ -366,6 +372,34 @@ final class EcologyCheckpointFileTests: XCTestCase {
         return try EcologyCheckpoint(capturing: runner).jsonData()
     }
 
+    /// Decode a checkpoint through the synthesized `Codable` path (which
+    /// performs no contract validation), apply `mutate`, and re-encode with
+    /// the production `jsonData()` formatter settings (`.prettyPrinted`,
+    /// `.sortedKeys`). This bypasses `validateMetadata()` so a malformed
+    /// checkpoint can be serialized, then routed back through
+    /// `EcologyCheckpointFile.decode` to assert the controlled rejection.
+    /// Returns the re-encoded bytes and the decoded mutated checkpoint so each
+    /// caller can prove the mutation took effect before asserting rejection.
+    ///
+    /// String-patching the pretty-printed JSON is unsafe here: Foundation
+    /// pretty-prints with a `" : "` separator, so a needle like
+    /// `"engineID":"ecology-v1"` never matches and the replacement silently
+    /// no-ops, leaving the test asserting a rejection of unmutated (valid)
+    /// input. Mutating the decoded value and re-encoding through the same
+    /// production formatter is immune to that class of bug.
+    private func reencodeCheckpoint(
+        from data: Data,
+        mutate: (inout EcologyCheckpoint) -> Void
+    ) throws -> (bytes: Data, mutated: EcologyCheckpoint) {
+        var cp = try JSONDecoder().decode(EcologyCheckpoint.self, from: data)
+        mutate(&cp)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let bytes = try encoder.encode(cp)
+        let mutated = try JSONDecoder().decode(EcologyCheckpoint.self, from: bytes)
+        return (bytes, mutated)
+    }
+
     // MARK: - Valid round-trip
 
     func testLoadValidCheckpoint() throws {
@@ -466,12 +500,19 @@ final class EcologyCheckpointFileTests: XCTestCase {
 
     func testWrongEngineIDRejected() throws {
         let data = try makeCheckpointData()
-        var text = String(decoding: data, as: UTF8.self)
-        text = text.replacingOccurrences(
-            of: "\"engineID\":\"ecology-v1\"",
-            with: "\"engineID\":\"well-mixed\"")
+        let original = try JSONDecoder().decode(EcologyCheckpoint.self, from: data)
+        let reencoded = try reencodeCheckpoint(from: data) { cp in
+            cp.engineID = "well-mixed"
+        }
+        // Prove the mutation actually took effect in the re-encoded bytes
+        // before asserting rejection: the field must hold the intended bad
+        // value and the bytes must differ from the valid checkpoint.
+        XCTAssertEqual(reencoded.mutated.engineID, "well-mixed")
+        XCTAssertNotEqual(reencoded.mutated.engineID, original.engineID)
+        XCTAssertNotEqual(reencoded.bytes, data)
+
         XCTAssertThrowsError(
-            try EcologyCheckpointFile.decode(data: Data(text.utf8))
+            try EcologyCheckpointFile.decode(data: reencoded.bytes)
         ) { error in
             XCTAssertEqual(error as? EcologyCheckpointLoadError,
                            .contractViolation(
@@ -481,12 +522,17 @@ final class EcologyCheckpointFileTests: XCTestCase {
 
     func testWrongSchemaVersionRejected() throws {
         let data = try makeCheckpointData()
-        var text = String(decoding: data, as: UTF8.self)
-        text = text.replacingOccurrences(
-            of: "\"schemaVersion\":1",
-            with: "\"schemaVersion\":2")
+        let original = try JSONDecoder().decode(EcologyCheckpoint.self, from: data)
+        let reencoded = try reencodeCheckpoint(from: data) { cp in
+            cp.schemaVersion = 2
+        }
+        // Prove the mutation took effect before asserting rejection.
+        XCTAssertEqual(reencoded.mutated.schemaVersion, 2)
+        XCTAssertNotEqual(reencoded.mutated.schemaVersion, original.schemaVersion)
+        XCTAssertNotEqual(reencoded.bytes, data)
+
         XCTAssertThrowsError(
-            try EcologyCheckpointFile.decode(data: Data(text.utf8))
+            try EcologyCheckpointFile.decode(data: reencoded.bytes)
         ) { error in
             XCTAssertEqual(error as? EcologyCheckpointLoadError,
                            .contractViolation(
@@ -496,12 +542,17 @@ final class EcologyCheckpointFileTests: XCTestCase {
 
     func testMalformedStepBudgetRejectedWithoutTrap() throws {
         let data = try makeCheckpointData()
-        var text = String(decoding: data, as: UTF8.self)
-        text = text.replacingOccurrences(
-            of: "\"stepBudget\":16",
-            with: "\"stepBudget\":0")
+        let original = try JSONDecoder().decode(EcologyCheckpoint.self, from: data)
+        let reencoded = try reencodeCheckpoint(from: data) { cp in
+            cp.stepBudget = 0
+        }
+        // Prove the mutation took effect before asserting rejection.
+        XCTAssertEqual(reencoded.mutated.stepBudget, 0)
+        XCTAssertNotEqual(reencoded.mutated.stepBudget, original.stepBudget)
+        XCTAssertNotEqual(reencoded.bytes, data)
+
         XCTAssertThrowsError(
-            try EcologyCheckpointFile.decode(data: Data(text.utf8))
+            try EcologyCheckpointFile.decode(data: reencoded.bytes)
         ) { error in
             XCTAssertEqual(error as? EcologyCheckpointLoadError,
                            .contractViolation(
@@ -511,18 +562,20 @@ final class EcologyCheckpointFileTests: XCTestCase {
 
     func testCorruptSoupBase64Rejected() throws {
         let data = try makeCheckpointData()
-        var text = String(decoding: data, as: UTF8.self)
-        // Replace the base64 soup field with invalid characters.
-        let pattern = "\"soupBase64\":\""
-        if let range = text.range(of: pattern) {
-            let valueStart = range.upperBound
-            if let endQuote = text[valueStart...].firstIndex(of: "\"") {
-                text.replaceSubrange(valueStart..<endQuote,
-                                     with: "@@@@")
-            }
+        let original = try JSONDecoder().decode(EcologyCheckpoint.self, from: data)
+        // Replace the base64 soup field with invalid base64 characters. The
+        // synthesized Codable path treats `soupBase64` as an opaque String, so
+        // this re-encodes without triggering `soupBytes()` validation.
+        let reencoded = try reencodeCheckpoint(from: data) { cp in
+            cp.soupBase64 = "@@@@"
         }
+        // Prove the mutation took effect before asserting rejection.
+        XCTAssertEqual(reencoded.mutated.soupBase64, "@@@@")
+        XCTAssertNotEqual(reencoded.mutated.soupBase64, original.soupBase64)
+        XCTAssertNotEqual(reencoded.bytes, data)
+
         XCTAssertThrowsError(
-            try EcologyCheckpointFile.decode(data: Data(text.utf8))
+            try EcologyCheckpointFile.decode(data: reencoded.bytes)
         ) { error in
             guard case .contractViolation = (error as? EcologyCheckpointLoadError) else {
                 XCTFail("expected contractViolation, got \(error)")

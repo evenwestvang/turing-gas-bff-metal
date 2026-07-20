@@ -473,12 +473,3 @@ final class EcologyCLIProcessTests: XCTestCase {
                        "two identical runs must produce byte-identical stdout")
     }
 }
-
-private extension Character {
-    var isHexDigit: Bool {
-        switch self {
-        case "0"..."9", "a"..."f", "A"..."F": return true
-        default: return false
-        }
-    }
-}

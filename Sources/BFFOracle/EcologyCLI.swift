@@ -135,12 +135,13 @@ public struct EcologyCLIOptions: Equatable, Sendable {
 
 public enum EcologyCLIParser {
 
-    /// Parse a strict decimal `UInt32`: ASCII digits `0...9` only. Rejects empty
-    /// strings, signs, whitespace, hex/octal prefixes, exponents, and non-ASCII
-    /// Unicode digit characters. Returns a `malformedNumber` error for any
-    /// non-digit byte; an `outOfRange` error when all bytes are digits but the
-    /// value does not fit in `UInt32`.
-    public static func parseUInt32(_ raw: String, name: String) throws -> UInt32 {
+    /// Validate that `raw` is non-empty and contains only ASCII decimal
+    /// digits `0...9`. Throws `malformedNumber` on any non-digit byte
+    /// (whitespace, signs, hex/octal prefixes, exponents, non-ASCII Unicode
+    /// digit characters). This is the shared strict-lexical core for both
+    /// `parseUInt32` and `parseNonNegativeInt`; the caller performs the
+    /// range-checked conversion to the destination integer type.
+    private static func validateStrictDecimal(_ raw: String, name: String) throws {
         guard !raw.isEmpty else {
             throw EcologyCLIError.malformedNumber(name: name, raw: raw)
         }
@@ -149,6 +150,15 @@ public enum EcologyCLIParser {
                 throw EcologyCLIError.malformedNumber(name: name, raw: raw)
             }
         }
+    }
+
+    /// Parse a strict decimal `UInt32`: ASCII digits `0...9` only. Rejects empty
+    /// strings, signs, whitespace, hex/octal prefixes, exponents, and non-ASCII
+    /// Unicode digit characters. Returns a `malformedNumber` error for any
+    /// non-digit byte; an `outOfRange` error when all bytes are digits but the
+    /// value does not fit in `UInt32`.
+    public static func parseUInt32(_ raw: String, name: String) throws -> UInt32 {
+        try validateStrictDecimal(raw, name: name)
         guard let value = UInt32(raw) else {
             throw EcologyCLIError.outOfRange(name: name, raw: raw)
         }
@@ -159,14 +169,7 @@ public enum EcologyCLIParser {
     /// Same lexical rules as `parseUInt32`; the result is an `Int` so callers
     /// can apply their own upper-bound range checks (e.g. step budget).
     public static func parseNonNegativeInt(_ raw: String, name: String) throws -> Int {
-        guard !raw.isEmpty else {
-            throw EcologyCLIError.malformedNumber(name: name, raw: raw)
-        }
-        for scalar in raw.unicodeScalars {
-            guard scalar.value >= 0x30 && scalar.value <= 0x39 else {
-                throw EcologyCLIError.malformedNumber(name: name, raw: raw)
-            }
-        }
+        try validateStrictDecimal(raw, name: name)
         guard let value = Int(raw) else {
             throw EcologyCLIError.outOfRange(name: name, raw: raw)
         }
