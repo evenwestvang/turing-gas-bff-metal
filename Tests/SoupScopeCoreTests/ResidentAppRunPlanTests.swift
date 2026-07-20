@@ -4,11 +4,17 @@ import BFFMetal
 @testable import SoupScopeCore
 
 final class ResidentAppRunPlanTests: XCTestCase {
-    func testResidentModeIsOptInAndDefaultsDoNotReadBackSoup() throws {
+    func testResidentDefaultAndExplicitResidentDoNotReadBackSoup() throws {
+        // The empty launch (no application args after the executable name) now
+        // selects resident mode — the narrow launch-default correction — while
+        // inheriting the keyed planner and 131,072 ProgramGrid.capacity defaults
+        // from the AppLaunchOptions initializer (no duplicated constants here).
         let defaults = try AppLaunchOptions.parse([])
-        XCTAssertEqual(defaults.simulationMode, .nonResident)
-        XCTAssertFalse(defaults.residentRunPlan().enabled)
-        XCTAssertEqual(defaults.residentRunPlan().rendererSource, .cpuSnapshot)
+        XCTAssertEqual(defaults.simulationMode, .resident)
+        XCTAssertTrue(defaults.residentRunPlan().enabled)
+        XCTAssertEqual(defaults.residentPlanner, .keyed)
+        XCTAssertEqual(defaults.programCount, ProgramGrid.capacity)
+        XCTAssertEqual(defaults.residentRunPlan().rendererSource, .residentVisualizationTexture)
 
         let resident = try AppLaunchOptions.parse(["--resident"])
         let plan = resident.residentRunPlan()

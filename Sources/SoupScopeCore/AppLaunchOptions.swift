@@ -130,6 +130,15 @@ public struct AppLaunchOptions: Equatable, Sendable {
     /// whole argument list is consumed).
     public static func parse(_ args: [String]) throws -> AppLaunchOptions {
         var options = AppLaunchOptions()
+        // An empty application argument list (exactly the post-executable-name
+        // form `SoupScopeApp` hands here) selects resident mode. Every nonempty
+        // explicit CLI invocation keeps its existing routing: non-resident
+        // unless a `--resident`-family flag flips it. The keyed planner and
+        // 131,072 ProgramGrid.capacity population defaults come from the
+        // `AppLaunchOptions()` initializer below — no duplicated constants.
+        if args.isEmpty {
+            options.simulationMode = .resident
+        }
         var shadowSampleAll = false
         var i = 0
         func value(_ flag: String) throws -> String {

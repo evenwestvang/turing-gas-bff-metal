@@ -15,7 +15,10 @@ final class ResidentAppLifecycleTests: XCTestCase {
     }
 
     func testNonResidentPlanComposesSharedWindowGroupAndConstructsLegacyCPURunner() {
-        let nonResident = try! AppLaunchOptions.parse([]).residentRunPlan()
+        // A representative nonempty explicit CLI invocation (no --resident-family
+        // flag) preserves the prior non-resident routing — the narrow launch-
+        // default correction only flips the *empty* launch, not any explicit CLI.
+        let nonResident = try! AppLaunchOptions.parse(["--programs", "8"]).residentRunPlan()
 
         XCTAssertEqual(SoupScopeAppLifecycle.sceneComposition(for: nonResident),
                        .sharedWindowGroup(id: SoupScopeAppLifecycle.windowSceneID))
@@ -36,7 +39,10 @@ final class ResidentAppLifecycleTests: XCTestCase {
                        .none,
                        "resident mode must not seed lastSnapshot from a CPU runner")
 
-        let nonResident = try! AppLaunchOptions.parse([]).residentRunPlan()
+        // A representative nonempty explicit CLI invocation (no --resident-family
+        // flag) preserves the prior non-resident routing; the empty launch now
+        // routes to resident (covered in AppLaunchDefaultRoutingTests).
+        let nonResident = try! AppLaunchOptions.parse(["--programs", "8"]).residentRunPlan()
         XCTAssertEqual(SoupScopeAppLifecycle.initialSnapshotSource(for: nonResident),
                        .legacyCPURunner,
                        "non-resident mode must seed lastSnapshot from the legacy CPU runner")
