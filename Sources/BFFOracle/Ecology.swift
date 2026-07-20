@@ -610,6 +610,14 @@ public struct EcologyCheckpoint: Equatable, Sendable, Codable {
         guard rngContractID == EcologyConfig.rngContractID else {
             throw EcologyContractError.rngContractID(rngContractID)
         }
+        // stepBudget must be rejected as a clean EcologyContractError before any
+        // EcologyConfig initializer can run: the preconditioned initializer would
+        // trap on stepBudget <= 0, turning a malformed-checkpoint rejection into a
+        // process crash. This guard also covers the equivalent decode/json path
+        // (jsonData/decode/config all route through validateMetadata), which is the
+        // only malformed-input trap in this file — see EcologyConfig.init(from:) for
+        // the decoder path that already validates budget > 0 before assignment.
+        guard stepBudget > 0 else { throw EcologyContractError.invalidStepBudget(stepBudget) }
         let expectedEvaluator = EcologyConfig(seed: seed, stepBudget: stepBudget,
                                               mutationP32: mutationP32, variant: variant,
                                               bracketMode: bracketMode)
@@ -617,7 +625,6 @@ public struct EcologyCheckpoint: Equatable, Sendable, Codable {
         guard evaluatorContractID == expectedEvaluator else {
             throw EcologyContractError.evaluatorContractID(evaluatorContractID)
         }
-        guard stepBudget > 0 else { throw EcologyContractError.invalidStepBudget(stepBudget) }
         guard epoch <= UInt64(UInt32.max) else {
             throw EcologyContractError.epochOutOfRange(epoch)
         }
