@@ -453,8 +453,8 @@ public final class EcologyMetalEpochRunner {
             guard let blit = cb.makeBlitCommandEncoder() else {
                 throw RunnerError.commandEncodingFailed("mutate counter fill")
             }
-            blit.fill(buffer: countersBuffer,
-                      range: 0..<counterByteCount, value: 0)
+            blit.fill(buffer: self.countersBuffer,
+                      range: 0..<self.counterByteCount, value: 0)
             blit.endEncoding()
         } encode: { enc in
             enc.setComputePipelineState(mutatePipeline)
