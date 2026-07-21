@@ -283,22 +283,26 @@ final class SpatialMetricsTests: XCTestCase {
 
     func testCanonicalScalePerformance() throws {
         // 512×256 = 131,072 sites, 8,388,608 bytes.
-        // Use a simple pattern: program[i] = byte i mod 256 in first position.
-        // This creates no large clone components (each program differs by first byte)
-        // unless i mod 256 wraps, creating small components of size 512.
-        // Actually: site 0 and site 256 both have first byte 0 → they are NOT
-        // adjacent in the 512-wide grid (they're one row apart). The identical
-        // programs are separated by 512 sites → no clone adjacency.
+        // Each program is a 64-byte constant fill with value site % 256.
+        // This gives 256 unique programs, each repeated 512 times, and a
+        // perfectly uniform 256-bin byte distribution (each value appears
+        // 512 × 64 = 32,768 times) → entropy = 8.0 exactly.
+        // Spatial structure: columns share the same fill (y·512+x mod 256 =
+        // x mod 256), so all south edges are identical, no east edges are,
+        // and each column is a vertical toroidal clone ring of 256 sites.
         let siteCount = SpatialMetrics.canonicalSiteCount
         var soup = [UInt8](repeating: 0, count: siteCount * ps)
         for site in 0..<siteCount {
-            soup[site * ps] = UInt8(site % 256)
+            let fillByte = UInt8(site % 256)
+            for j in 0..<ps {
+                soup[site * ps + j] = fillByte
+            }
         }
 
-        // Entropy
+        // Entropy: exact uniform 256-bin distribution → 8.0 bits/byte
         let entropy = SpatialMetrics.byteEntropy(soup)
-        XCTAssertGreaterThan(entropy, 7.0, "256 distinct first bytes → near-max entropy")
-        XCTAssertLessThanOrEqual(entropy, 8.0)
+        XCTAssertEqual(entropy, 8.0, accuracy: 1e-12,
+                       "uniform 256-bin distribution → max entropy")
 
         // Unique programs
         let unique = try SpatialMetrics.uniqueProgramCount(soup: soup, width: 512, height: 256)
