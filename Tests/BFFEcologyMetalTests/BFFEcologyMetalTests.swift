@@ -61,6 +61,44 @@ final class BFFEcologyMetalTests: XCTestCase {
 
     // MARK: - Metal tests (skip on non-Metal hosts)
 
+    // MARK: - CPU frozen-table direction-agnostic contract
+
+    func testBuildJumpTableIsDirectionAgnostic() {
+        // The CPU's buildJumpTable stores the bracket partner at each index
+        // based on the INITIAL tape. When a byte self-modifies from [ to ]
+        // (or vice versa) mid-run, the frozen lookup at that index still
+        // returns the original partner — it does NOT check the live opcode
+        // direction. This is the property the Metal frozen_target function
+        // must mirror.
+
+        var tape = [UInt8](repeating: 0, count: BFF.pairTapeSize)
+        tape[2] = BFFOp.loopOpen   // [
+        tape[4] = BFFOp.loopClose  // ]
+
+        let frozen = BFFInterpreter.buildJumpTable(for: tape)
+
+        // Frozen partners are symmetric
+        XCTAssertEqual(frozen[2], 4, "[ at 2 matches ] at 4")
+        XCTAssertEqual(frozen[4], 2, "] at 4 matches [ at 2")
+
+        // Simulate self-modification: position 2 changes from [ to ]
+        tape[2] = BFFOp.loopClose  // now ] at runtime
+
+        // The CPU interpreter looks up frozen[pc] regardless of the live
+        // opcode direction. frozen[2] is still 4 (the forward partner
+        // from the initial tape), NOT -1.
+        let frozenAtModifiedPosition = frozen[2]
+        XCTAssertEqual(frozenAtModifiedPosition, 4,
+                       "frozen[2] returns original partner 4 even though "
+                       + "live tape[2] is now ] — direction-agnostic lookup")
+
+        // The Metal bug: frozen_backward(initialTape, 2) would check
+        // initialTape[2] == ] (false, it was [), returning -1. This
+        // differs from the CPU's 4, causing a remapEvents undercount.
+        // The fix: bff_ecology_frozen_target checks the INITIAL byte
+        // and scans in the initial direction, matching the CPU.
+    }
+
     #if canImport(Metal)
 
     /// Helper: create a runner with a quick-halting soup for deterministic testing.
@@ -560,6 +598,120 @@ final class BFFEcologyMetalTests: XCTestCase {
 
         XCTAssertEqual(runner.lastEpochCounters, knownCounters,
                        "Runner must restore lastEpochCounters from checkpoint")
+    }
+
+    // MARK: - Remap parity: seeded heads, default mutation, dynamicScan
+
+    /// Regression for the seeded-heads remapEvents discrepancy (CPU 217 vs
+    /// Metal 215). The root cause: Metal's frozen_forward/frozen_backward
+    /// used direction-specific initial-byte guards, while the CPU's
+    /// buildJumpTable lookup is direction-agnostic. When a byte that was
+    /// `[` at interaction start self-modifies to `]` mid-run and is later
+    /// executed as `]`, the Metal frozen lookup returned -1 (wrong) while
+    /// the CPU returned the original forward partner (correct). This test
+    /// uses the exact failing configuration (seed 123, stepBudget 128,
+    /// default mutationP32, seededHeads, dynamicScan) and compares per-pair
+    /// remapEvents across all 65536 pairs. Fails on 3da4a29, passes on the
+    /// corrected child.
+    func testRemapParitySeededHeadsDefaultMutation() throws {
+        try skipIfNoMetal()
+
+        // Real initial soup for seed 123 — NOT quickHaltingSoup. The
+        // default mutation rate (1/4096) produces a natural mix of
+        // brackets, and seededHeads creates execution paths that
+        // self-modify bracket bytes across directions.
+        let soup = EcologyRandom.initialSoup(seed: 123)
+
+        // Run Metal with capture
+        let checkpoint = EcologyCheckpoint(
+            seed: 123, epoch: 0, mutationP32: BFF.defaultMutationP32,
+            stepBudget: 128, variant: .seededHeads, bracketMode: .dynamicScan,
+            soup: soup, lastEpochCounters: nil)
+
+        let runner = try EcologyMetalEpochRunner(
+            checkpoint: checkpoint, capturePairTapes: true)
+        let gpuReport = try runner.runEpoch()
+
+        // Build CPU oracle results for the same epoch
+        var cpuSoup = soup
+        _ = EcologyRandom.mutate(soup: &cpuSoup, seed: 123, epoch: 0,
+                                   mutationP32: BFF.defaultMutationP32)
+        let phase = EcologyMatchingPhase(epoch: 0)
+
+        var mismatches = 0
+        for pairIndex in 0..<EcologyTopology.pairCount {
+            let pair = EcologyTopology.pair(at: pairIndex, phase: phase)
+            let rangeA = pair.a * BFF.tapeSize ..< (pair.a + 1) * BFF.tapeSize
+            let rangeB = pair.b * BFF.tapeSize ..< (pair.b + 1) * BFF.tapeSize
+            let pairTape = Array(cpuSoup[rangeA]) + Array(cpuSoup[rangeB])
+            let cpuResult = BFFInterpreter.run(
+                pairTape: pairTape, variant: .seededHeads,
+                bracketMode: .dynamicScan, stepBudget: 128)
+
+            let gpuResult = gpuReport.capturedPairResults[pairIndex]
+
+            if gpuResult.remapEvents != cpuResult.remapEvents {
+                mismatches += 1
+                if mismatches <= 5 {
+                    XCTFail("pair \(pairIndex) remapEvents: "
+                            + "GPU=\(gpuResult.remapEvents) "
+                            + "CPU=\(cpuResult.remapEvents)")
+                }
+            }
+        }
+        XCTAssertEqual(mismatches, 0,
+                       "remapEvents must match for all 65536 pairs")
+    }
+
+    /// Same configuration but with jumpTable bracket mode. The frozen
+    /// target is used for control flow, so the direction-agnostic fix
+    /// affects both remapEvents counting AND jump targets. Both must
+    /// match the CPU oracle.
+    func testRemapParitySeededHeadsJumpTable() throws {
+        try skipIfNoMetal()
+
+        let soup = EcologyRandom.initialSoup(seed: 123)
+
+        let checkpoint = EcologyCheckpoint(
+            seed: 123, epoch: 0, mutationP32: BFF.defaultMutationP32,
+            stepBudget: 128, variant: .seededHeads, bracketMode: .jumpTable,
+            soup: soup, lastEpochCounters: nil)
+
+        let runner = try EcologyMetalEpochRunner(
+            checkpoint: checkpoint, capturePairTapes: true)
+        let gpuReport = try runner.runEpoch()
+
+        var cpuSoup = soup
+        _ = EcologyRandom.mutate(soup: &cpuSoup, seed: 123, epoch: 0,
+                                   mutationP32: BFF.defaultMutationP32)
+        let phase = EcologyMatchingPhase(epoch: 0)
+
+        var mismatches = 0
+        for pairIndex in 0..<EcologyTopology.pairCount {
+            let pair = EcologyTopology.pair(at: pairIndex, phase: phase)
+            let rangeA = pair.a * BFF.tapeSize ..< (pair.a + 1) * BFF.tapeSize
+            let rangeB = pair.b * BFF.tapeSize ..< (pair.b + 1) * BFF.tapeSize
+            let pairTape = Array(cpuSoup[rangeA]) + Array(cpuSoup[rangeB])
+            let cpuResult = BFFInterpreter.run(
+                pairTape: pairTape, variant: .seededHeads,
+                bracketMode: .jumpTable, stepBudget: 128)
+
+            let gpuResult = gpuReport.capturedPairResults[pairIndex]
+
+            if gpuResult.remapEvents != cpuResult.remapEvents
+                || gpuResult.steps != cpuResult.steps
+                || gpuResult.halt != cpuResult.halt {
+                mismatches += 1
+                if mismatches <= 5 {
+                    XCTFail("pair \(pairIndex): remap GPU=\(gpuResult.remapEvents) "
+                            + "CPU=\(cpuResult.remapEvents), "
+                            + "steps GPU=\(gpuResult.steps) CPU=\(cpuResult.steps), "
+                            + "halt GPU=\(gpuResult.halt) CPU=\(cpuResult.halt)")
+                }
+            }
+        }
+        XCTAssertEqual(mismatches, 0,
+                       "remapEvents, steps, and halt must match for all pairs")
     }
 
     #endif // canImport(Metal)

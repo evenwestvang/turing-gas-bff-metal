@@ -171,17 +171,19 @@ static int bff_ecology_scan_backward(thread const uchar *tape, int p) {
 }
 
 // --- Frozen bracket scan on the immutable interaction-start tape ---
-// Equivalent to BFFInterpreter.buildJumpTable: if the byte at pc was NOT a
-// bracket at interaction start, the frozen target is -1 (unmatched). If it was,
-// scan the initial tape for the match.
-static int bff_ecology_frozen_forward(thread const uchar *initialTape, int p) {
-    if (initialTape[p] != BFF_ECO_OP_LOOP_OPEN) return -1;
-    return bff_ecology_scan_forward(initialTape, p);
-}
-
-static int bff_ecology_frozen_backward(thread const uchar *initialTape, int p) {
-    if (initialTape[p] != BFF_ECO_OP_LOOP_CLOSE) return -1;
-    return bff_ecology_scan_backward(initialTape, p);
+// Equivalent to BFFInterpreter.buildJumpTable: the frozen target at pc is
+// determined by the INITIAL byte at pc, NOT the live opcode direction. If the
+// initial byte was '[', its frozen target is the forward match; if it was ']',
+// the backward match; otherwise -1 (unmatched). This mirrors the CPU's
+// direction-agnostic `frozen[pc]` table lookup exactly.
+static int bff_ecology_frozen_target(thread const uchar *initialTape, int p) {
+    uchar c = initialTape[p];
+    if (c == BFF_ECO_OP_LOOP_OPEN) {
+        return bff_ecology_scan_forward(initialTape, p);
+    } else if (c == BFF_ECO_OP_LOOP_CLOSE) {
+        return bff_ecology_scan_backward(initialTape, p);
+    }
+    return -1;
 }
 
 // ============================================================
@@ -312,7 +314,7 @@ kernel void bff_ecology_eval_scatter(
             loopOps++;
             if (tape[h0] == 0u) {
                 int liveTarget = bff_ecology_scan_forward(tape, pc);
-                int frozenTarget = bff_ecology_frozen_forward(initialTape, pc);
+                int frozenTarget = bff_ecology_frozen_target(initialTape, pc);
                 if (liveTarget != frozenTarget) remapEvents++;
                 int target = (params.bracketMode == BFF_ECO_BRACKET_DYNAMIC_SCAN)
                     ? liveTarget : frozenTarget;
@@ -324,7 +326,7 @@ kernel void bff_ecology_eval_scatter(
             loopOps++;
             if (tape[h0] != 0u) {
                 int liveTarget = bff_ecology_scan_backward(tape, pc);
-                int frozenTarget = bff_ecology_frozen_backward(initialTape, pc);
+                int frozenTarget = bff_ecology_frozen_target(initialTape, pc);
                 if (liveTarget != frozenTarget) remapEvents++;
                 int target = (params.bracketMode == BFF_ECO_BRACKET_DYNAMIC_SCAN)
                     ? liveTarget : frozenTarget;
