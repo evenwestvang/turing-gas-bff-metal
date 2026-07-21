@@ -575,6 +575,38 @@ public struct EcologyCheckpoint: Equatable, Sendable, Codable {
         self.lastEpochCounters = runner.lastEpochCounters
     }
 
+    /// Public memberwise initializer for cross-CLI checkpoint construction.
+    /// Used by the Metal CLI (`bff-ecology-metal-epoch`) which has its own
+    /// runner type but shares the BFFECO1 format. Defaults match the capturing
+    /// init's contract: magic/schema/IDs always pinned to current ecology v1.
+    public init(seed: UInt32,
+                epoch: UInt64,
+                mutationP32: UInt32,
+                stepBudget: Int,
+                variant: BFFVariant,
+                bracketMode: BracketMode,
+                soup: [UInt8],
+                lastEpochCounters: EcologyEpochCounters?) {
+        self.magic = Self.magicString
+        self.schemaVersion = Self.currentSchemaVersion
+        self.engineID = EcologyConfig.engineID
+        self.topologyID = EcologyConfig.topologyID
+        self.schedulerID = EcologyConfig.schedulerID
+        self.rngContractID = EcologyConfig.rngContractID
+        let config = EcologyConfig(seed: seed, stepBudget: stepBudget,
+                                    mutationP32: mutationP32, variant: variant,
+                                    bracketMode: bracketMode)
+        self.evaluatorContractID = config.evaluatorContractID
+        self.seed = seed
+        self.epoch = epoch
+        self.mutationP32 = mutationP32
+        self.stepBudget = stepBudget
+        self.variant = variant
+        self.bracketMode = bracketMode
+        self.soupBase64 = Data(soup).base64EncodedString()
+        self.lastEpochCounters = lastEpochCounters
+    }
+
     public func config() throws -> EcologyConfig {
         try validateMetadata()
         return EcologyConfig(seed: seed, stepBudget: stepBudget,

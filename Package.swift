@@ -9,6 +9,11 @@ let package = Package(
     products: [
         .library(name: "BFFOracle", targets: ["BFFOracle"]),
         .library(name: "BFFMetal", targets: ["BFFMetal"]),
+        // Experimental GPU-resident ecology epoch runner library. Separate engine
+        // from ResidentMetalEpochRunner; ports the BFF-Ecology v1 contract
+        // (torus-512x256, edge-color-sync scheduler, ecology-counter-pcg RNG) to
+        // Metal with byte-exact CPU parity against EcologyOracleRunner.
+        .library(name: "BFFEcologyMetal", targets: ["BFFEcologyMetal"]),
         .executable(name: "bff-oracle", targets: ["bff-oracle"]),
         .executable(name: "bff-metal-parity", targets: ["bff-metal-parity"]),
         .executable(name: "bff-metal-soup", targets: ["bff-metal-soup"]),
@@ -19,6 +24,12 @@ let package = Package(
         // "Experimental Spatial Ecology" label. Existing products keep their
         // defaults and output contracts.
         .executable(name: "bff-ecology-epoch", targets: ["bff-ecology-epoch"]),
+        // Headless Metal ecology epoch runner CLI (exits 2 on non-Metal hosts).
+        // Emits byte-identical output to bff-ecology-epoch for stepBudget
+        // 1...8192. The Metal contract pins stepBudget to that range; larger
+        // budgets are rejected clearly, never clamped.
+        .executable(name: "bff-ecology-metal-epoch",
+                    targets: ["bff-ecology-metal-epoch"]),
         .executable(name: "SoupScope", targets: ["SoupScopeApp"]),
     ],
     targets: [
@@ -27,6 +38,10 @@ let package = Package(
         // Shared CPU/MSL byte layouts: one C header, compile-time asserted on
         // every platform (see Sources/CBFFShared/include/BFFShared.h).
         .target(name: "CBFFShared"),
+        // Shared host/MSL byte layout for the ecology Metal runner: one C
+        // header, compile-time asserted on every platform. Same three-layer
+        // mirror contract pattern as CBFFShared.h.
+        .target(name: "CBFFEcologyShared"),
         // Shared host/MSL layout of the render uniform block; same C-header
         // pattern so its layout asserts are checked on every platform.
         .target(name: "CSoupRender"),
@@ -56,6 +71,18 @@ let package = Package(
                 .copy("Shaders/BFFResidentEpoch.metal"),
             ]
         ),
+        // Experimental GPU-resident ecology epoch runner host. Builds everywhere;
+        // the Metal dispatch paths are #if canImport(Metal). The shader source is
+        // bundled as a .copy resource and compiled at runtime via makeLibrary.
+        // Does NOT change BFFMetal's resource list (2 shaders) or SoupScopeApp's
+        // (3 shaders) — BFFEcologyMetal carries its own shader resource.
+        .target(
+            name: "BFFEcologyMetal",
+            dependencies: ["BFFOracle", "BFFMetal", "CBFFEcologyShared"],
+            resources: [
+                .copy("Shaders/BFFEcologyEpoch.metal"),
+            ]
+        ),
         // Command-line GPU fixture parity runner (exits 2 on non-Metal hosts).
         .executableTarget(name: "bff-metal-parity",
                           dependencies: ["BFFMetal", "BFFOracle"]),
@@ -77,6 +104,10 @@ let package = Package(
         // products keep their defaults and output contracts.
         .executableTarget(name: "bff-ecology-epoch",
                           dependencies: ["BFFOracle"]),
+        // Headless Metal ecology epoch runner CLI. Emits byte-identical output to
+        // bff-ecology-epoch for stepBudget 1...8192. Exits 2 on non-Metal hosts.
+        .executableTarget(name: "bff-ecology-metal-epoch",
+                          dependencies: ["BFFEcologyMetal", "BFFOracle"]),
         // Platform-independent app core: grid/camera/LOD/normalization/opcode/
         // batcher/HUD/snapshot pure models + launch-option parsing. Depends on
         // BFFMetal for the soup runner and epoch types; builds and is tested on
@@ -103,6 +134,16 @@ let package = Package(
         .testTarget(
             name: "BFFMetalTests",
             dependencies: ["BFFMetal", "BFFOracle", "CBFFShared"]
+        ),
+        // Experimental GPU-resident ecology epoch runner tests. Verifies:
+        // 1. Layout probe (Metal-compiled struct sizes match host MemoryLayout)
+        // 2. RNG boundary vectors (pinned literals from EcologyTests)
+        // 3. Pair-probe topology (invariants from EcologyTests)
+        // 4. Full-epoch parity (16K stress, 131K smoke) against EcologyOracleRunner
+        // Builds everywhere; Metal dispatch tests skip on non-Metal hosts.
+        .testTarget(
+            name: "BFFEcologyMetalTests",
+            dependencies: ["BFFEcologyMetal", "BFFOracle", "CBFFEcologyShared"]
         ),
         // Fixture + version-gate coverage for the Brotli 1.1.0 q2 integration.
         // Requires libbrotli (apt/brew); the exact-byte-count assertions hold on
