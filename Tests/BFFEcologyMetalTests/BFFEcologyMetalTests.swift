@@ -49,7 +49,7 @@ final class BFFEcologyMetalTests: XCTestCase {
 
     // MARK: - Non-Metal stub (all platforms)
 
-    func testRunnerErrorDescriptionsAreNonEmpty() {
+    func testRunnerErrorDescriptionsAreNonEmpty() throws {
         #if canImport(Metal)
         throw XCTSkip("Metal available — stub not tested here")
         #else
@@ -144,7 +144,7 @@ final class BFFEcologyMetalTests: XCTestCase {
         ]
 
         for v in seedVectors {
-            let cpuDraw = EcologyRandom.draw(seed: v.seed, purpose: .initBytes,
+            let cpuDraw = try EcologyRandom.draw(seed: v.seed, purpose: .initBytes,
                                               epoch: 0, element: 0)
             let gpuDraws = try runner.runRNGProbe(inputs: [
                 (v.seed, BFF_ECO_RNG_INIT_BYTES, 0, 0)
@@ -287,7 +287,7 @@ final class BFFEcologyMetalTests: XCTestCase {
             stepBudget: 1, variant: .noheads, bracketMode: .dynamicScan,
             soup: soup, lastEpochCounters: nil)
         let runner = try EcologyMetalEpochRunner(checkpoint: checkpoint)
-        let cpuRunner = try EcologyOracleRunner(checkpoint: checkpoint)
+        var cpuRunner = try EcologyOracleRunner(checkpoint: checkpoint)
 
         // Epoch 0
         let gpuReport0 = try runner.runEpoch()
