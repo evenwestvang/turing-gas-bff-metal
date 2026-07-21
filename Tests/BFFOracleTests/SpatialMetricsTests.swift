@@ -306,8 +306,7 @@ final class SpatialMetricsTests: XCTestCase {
 
         // Unique programs
         let unique = try SpatialMetrics.uniqueProgramCount(soup: soup, width: 512, height: 256)
-        // Programs 0..255 have distinct first bytes, but program 256 == program 0, etc.
-        // 131072 sites / 256 distinct → 512 unique programs
+        // 256 distinct constant-fill programs (fill = 0..255), each repeated 512 times.
         XCTAssertEqual(unique, 256)
 
         // Identical neighbor fraction: neighbors differ in first byte most of the time.
@@ -337,13 +336,10 @@ final class SpatialMetricsTests: XCTestCase {
         let frac = try SpatialMetrics.identicalNeighborFraction(soup: soup, width: 512, height: 256)
         XCTAssertEqual(frac, 0.5, accuracy: 1e-12)
 
-        // Largest clone component: all programs in a column share the same first byte
-        // (because y*512+x mod 256 = x mod 256 regardless of y).
-        // So column x has 256 sites all with first byte x mod 256.
-        // But are they connected? Site (x, 0) and (x, 1) are south neighbors.
-        // Their programs: first byte x mod 256 for both. But do the OTHER 63 bytes
-        // match? In our soup, only byte[0] varies, rest are 0. So yes, full 64-byte
-        // programs are identical within a column.
+        // Largest clone component: all 64 bytes per program are the same fill
+        // (site % 256). Column x has 256 sites all with fill x mod 256, so
+        // every program in the column is byte-identical. Site (x, y) and
+        // (x, y+1) are south neighbors with identical programs → connected.
         // So each column of 256 sites is one component. But toroidal:
         // column x and column x+512 → same column (width=512). So 512 columns × 256
         // sites each = 512 components of size 256.
