@@ -18,7 +18,10 @@ struct ContentView: View {
                     residentChannel: appModel.usesResidentRendering
                         ? appModel.residentVizChannel
                         : nil,
-                    running: appModel.isRunning)
+                    running: appModel.isRunning,
+                    vizEntropyBitsPerByte: appModel.vizEntropyAvailable
+                        ? appModel.vizEntropyHistory.latest?.meanByteEntropyBitsPerByte
+                        : nil)
             if appModel.usesResidentRendering {
                 VizEntropyOverlay(history: appModel.vizEntropyHistory,
                                   available: appModel.vizEntropyAvailable,

@@ -4,6 +4,11 @@ import SoupScopeCore
 
 /// Compact, diagnostic HUD overlay (REQUIRED 6). Monospaced text only — no charts,
 /// no profiling UI. Reads the published `HUDModel`.
+///
+/// The HUD is split into a **primary** section (engine/mode, epoch, rate, channel,
+/// entropy status, error) and a **Raw metrics** disclosure that is collapsed by
+/// default. The disclosure state is `@State` so it survives ordinary SwiftUI body
+/// updates for the view's lifetime.
 struct HUDView: View {
     let hud: HUDModel
     let lod: LODReadout
@@ -11,6 +16,10 @@ struct HUDView: View {
     /// Resident path channel label, or nil on the legacy CPU-snapshot path.
     let residentChannel: ResidentVizChannel?
     let running: Bool
+    /// Latest visualization entropy in bits/byte, or nil when unavailable.
+    let vizEntropyBitsPerByte: Double?
+
+    @State private var rawMetricsExpanded = false
 
     private func f(_ x: Double, _ p: Int = 3) -> String {
         String(format: "%.\(p)f", x)
@@ -32,37 +41,54 @@ struct HUDView: View {
         }
     }
 
+    private var usesResident: Bool { residentChannel != nil }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
+            // ── Primary HUD ──
             Text("SoupScope  epoch \(hud.epoch)\(running ? "" : "  [PAUSED]")")
                 .fontWeight(.semibold)
-            Text("batch \(hud.lastBatchEpochs) ep in \(f(hud.lastBatchMs)) ms "
-                 + "(\(f(hud.msPerEpoch, 4)) ms/ep)")
-            Text("steps raw \(hud.rawSteps)  noop \(hud.noopSteps)  cmd \(hud.commandSteps)")
-            Text("halt  budget \(hud.haltBudget)  pcOut \(hud.haltPCOut)  "
-                 + "unmatched \(hud.haltUnmatched)  unknown \(hud.haltUnknown)")
-            Text("copyWrites \(hud.copyWrites)   channel \(channelName)")
-            Text("zoom \(f(lod.bytePx, 2)) px/byte   "
-                 + "macro/micro \(f(lod.macroBlend, 2))/\(f(lod.microBlend, 2))   "
-                 + "glyph \(f(lod.glyphBlend, 2))")
-            Text("shadow checked \(hud.shadowChecked)  mismatch \(hud.shadowMismatch)")
-            if let resident = hud.resident {
-                Text("resident src \(resident.sourceEpoch)  shown \(resident.displayedEpoch)  "
-                     + "planner \(resident.plannerCLI) \(resident.plannerModeID)")
-                Text("resident epoch \(f(resident.epochWallMs)) ms  "
-                     + "gpu m/p/e/v "
-                     + "\(opt(resident.mutationGpuMs))/\(opt(resident.plannerGpuMs))/"
-                     + "\(opt(resident.evalGpuMs))/\(opt(resident.visualizationGpuMs))")
-                Text("checkpoint every \(resident.checkpointInterval)  "
-                     + "checkpointBytes \(resident.checkpointBytes)  "
-                     + "readbackBytes \(resident.readbackBytes)  failures \(resident.failureCount)")
+            Text("\(f(hud.msPerEpoch, 4)) ms/ep   channel \(channelName)")
+            if let entropy = vizEntropyBitsPerByte {
+                Text("Entropy  \(f(entropy)) bits/byte")
+            } else if usesResident {
+                Text("Entropy  —")
             }
-            Text("programs \(hud.programCount)   \(hud.deviceName)")
             if let error = hud.errorState {
                 Text("ERROR: \(error)")
                     .foregroundColor(.red)
                     .fontWeight(.bold)
             }
+
+            // ── Raw metrics (collapsed by default) ──
+            DisclosureGroup("Raw metrics", isExpanded: $rawMetricsExpanded) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("batch \(hud.lastBatchEpochs) ep in \(f(hud.lastBatchMs)) ms")
+                    Text("steps raw \(hud.rawSteps)  noop \(hud.noopSteps)  cmd \(hud.commandSteps)")
+                    Text("halt  budget \(hud.haltBudget)  pcOut \(hud.haltPCOut)  "
+                         + "unmatched \(hud.haltUnmatched)  unknown \(hud.haltUnknown)")
+                    Text("copyWrites \(hud.copyWrites)")
+                    Text("zoom \(f(lod.bytePx, 2)) px/byte   "
+                         + "macro/micro \(f(lod.macroBlend, 2))/\(f(lod.microBlend, 2))   "
+                         + "glyph \(f(lod.glyphBlend, 2))")
+                    Text("shadow checked \(hud.shadowChecked)  mismatch \(hud.shadowMismatch)")
+                    if let resident = hud.resident {
+                        Text("resident src \(resident.sourceEpoch)  shown \(resident.displayedEpoch)  "
+                             + "planner \(resident.plannerCLI) \(resident.plannerModeID)")
+                        Text("resident epoch \(f(resident.epochWallMs)) ms  "
+                             + "gpu m/p/e/v "
+                             + "\(opt(resident.mutationGpuMs))/\(opt(resident.plannerGpuMs))/"
+                             + "\(opt(resident.evalGpuMs))/\(opt(resident.visualizationGpuMs))")
+                        Text("checkpoint every \(resident.checkpointInterval)  "
+                             + "checkpointBytes \(resident.checkpointBytes)  "
+                             + "readbackBytes \(resident.readbackBytes)  failures \(resident.failureCount)")
+                    }
+                    Text("programs \(hud.programCount)   \(hud.deviceName)")
+                }
+                .padding(.top, 2)
+            }
+            .accessibilityLabel("Raw metrics diagnostics")
+
             Text("drag pan · scroll/pinch zoom · space pause · f fit · m channel · r reset")
                 .foregroundColor(.secondary)
         }

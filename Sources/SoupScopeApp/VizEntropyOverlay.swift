@@ -5,7 +5,7 @@ import SoupScopeCore
 /// Compact bounded entropy-over-time overlay for the resident visualization path.
 /// The state is explicit:
 ///
-/// - unavailable: no real viz entropy source is connected; show this visibly.
+/// - unavailable: no real viz entropy source is connected.
 /// - waiting: a real source is available, but no sample has arrived yet.
 /// - data: one or more bounded history samples are present.
 ///
@@ -22,7 +22,6 @@ struct VizEntropyOverlay: View {
     private static let charcoalSecondary = Color(red: 0.38, green: 0.34, blue: 0.30)
     private static let dataLine = Color(red: 0.22, green: 0.40, blue: 0.62)
     private static let gridRule = Color(red: 0.78, green: 0.74, blue: 0.68, opacity: 0.55)
-    private static let unavailableColor = Color(red: 0.62, green: 0.22, blue: 0.18)
 
     private static let plotWidth: CGFloat = 220
     private static let plotHeight: CGFloat = 48
@@ -41,10 +40,7 @@ struct VizEntropyOverlay: View {
     private var unavailablePanel: some View {
         VStack(alignment: .leading, spacing: 2) {
             title
-            Text("viz entropy unavailable")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(Self.unavailableColor)
-            Text("resident entropy source not connected")
+            Text("Unavailable")
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundColor(Self.charcoalSecondary)
         }
@@ -55,7 +51,7 @@ struct VizEntropyOverlay: View {
         .cornerRadius(4)
         .overlay(
             RoundedRectangle(cornerRadius: 4)
-                .stroke(Self.unavailableColor.opacity(0.6), lineWidth: 0.5))
+                .stroke(Self.charcoal.opacity(0.35), lineWidth: 0.5))
         .padding(10)
     }
 
@@ -81,7 +77,7 @@ struct VizEntropyOverlay: View {
     }
 
     private var title: some View {
-        Text("Mean byte entropy - viz approx")
+        Text("Entropy")
             .font(.system(size: 10, weight: .semibold, design: .monospaced))
             .foregroundColor(Self.charcoal)
     }
@@ -89,7 +85,7 @@ struct VizEntropyOverlay: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 1) {
             title
-            Text("history: mean byte entropy   |   bits/byte")
+            Text("bits/byte")
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundColor(Self.charcoalSecondary)
         }
