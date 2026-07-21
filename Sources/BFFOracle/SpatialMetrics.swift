@@ -1,6 +1,6 @@
 import Foundation
 
-/// Bounded spatial metrics for the ecology torus.
+/// Bounded spatial metrics for the program-grid torus.
 ///
 /// Pure deterministic functions over flat byte soups arranged as
 /// `width × height` programs of `BFF.tapeSize` (64) bytes each.

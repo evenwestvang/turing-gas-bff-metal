@@ -215,11 +215,8 @@ final class SpatialMetricsTests: XCTestCase {
 
     func testByteTurnoverHalfChanged() throws {
         let a = [UInt8](repeating: 0, count: 100)
-        var b = [UInt8](repeating: 1, count: 50) + [UInt8](repeating: 0, count: 50)
-        b.reserveCapacity(100)
-        // Actually let's be precise:
-        let bb = [UInt8](repeating: 1, count: 50) + [UInt8](repeating: 0, count: 50)
-        let f = try SpatialMetrics.byteTurnover(a, bb)
+        let b = [UInt8](repeating: 1, count: 50) + [UInt8](repeating: 0, count: 50)
+        let f = try SpatialMetrics.byteTurnover(a, b)
         XCTAssertEqual(f, 0.5, accuracy: 1e-12)
     }
 
