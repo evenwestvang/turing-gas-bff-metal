@@ -9,12 +9,19 @@ import SoupScopeCore
 /// entropy status, error) and a **Raw metrics** disclosure that is collapsed by
 /// default. The disclosure state is `@State` so it survives ordinary SwiftUI body
 /// updates for the view's lifetime.
+///
+/// In ecology mode the primary section persistently shows the
+/// "Experimental Spatial Ecology" signage (`HUDPrimaryModeLine`), so the
+/// explicit route stays visibly labeled while Raw metrics is collapsed; the
+/// produced/published/displayed provenance detail stays in the disclosure.
 struct HUDView: View {
     let hud: HUDModel
     let lod: LODReadout
     let metricChannel: UInt32
     /// Resident path channel label, or nil on the legacy CPU-snapshot path.
     let residentChannel: ResidentVizChannel?
+    /// Ecology path channel label, or nil when the app is not in ecology mode.
+    let ecologyChannel: EcologyVizChannel?
     let running: Bool
     /// Latest visualization entropy in bits/byte, or nil when unavailable.
     let vizEntropyBitsPerByte: Double?
@@ -30,6 +37,9 @@ struct HUDView: View {
     }
 
     private var channelName: String {
+        if let ecologyChannel {
+            return ecologyChannel.label
+        }
         if let residentChannel {
             return residentChannel.label
         }
@@ -48,6 +58,11 @@ struct HUDView: View {
             // ── Primary HUD ──
             Text("SoupScope  epoch \(hud.epoch)\(running ? "" : "  [PAUSED]")")
                 .fontWeight(.semibold)
+            // Persistent ecology-route signage: visible whenever ecology mode
+            // is active, independent of the Raw metrics disclosure below.
+            if let modeLine = HUDPrimaryModeLine.text(ecologyChannel: ecologyChannel) {
+                Text(modeLine)
+            }
             Text("\(f(hud.msPerEpoch, 4)) ms/ep   channel \(channelName)")
             if let entropy = vizEntropyBitsPerByte {
                 Text("Entropy  \(f(entropy)) bits/byte")
@@ -82,6 +97,37 @@ struct HUDView: View {
                         Text("checkpoint every \(resident.checkpointInterval)  "
                              + "checkpointBytes \(resident.checkpointBytes)  "
                              + "readbackBytes \(resident.readbackBytes)  failures \(resident.failureCount)")
+                    }
+                    if let ecology = hud.ecology {
+                        // HUD text describing visible state uses ONLY the displayed
+                        // lease's source epoch/phase. Produced/published diagnostics
+                        // are reported on separate lines so simulation reports never
+                        // alternate the meaning of the visible-state line. The mode
+                        // signage itself lives in the primary section above
+                        // (HUDPrimaryModeLine), not in this disclosure.
+                        let displayedEpochText = ecology.displayedSourceEpoch
+                            .map(String.init) ?? "unavailable"
+                        let displayedPhaseText = ecology.displayedPhase ?? "—"
+                        Text("ecology displayed src \(displayedEpochText)  "
+                             + "phase \(displayedPhaseText)")
+                        // Simulation diagnostics: latest completed/produced epoch and
+                        // producing phase, separately from the displayed lease.
+                        let publishedEpochText = ecology.publishedSourceEpoch
+                            .map(String.init) ?? "unavailable"
+                        let publishedPhaseText = ecology.publishedPhase ?? "—"
+                        let producedPhaseText = ecology.producedPhase ?? "—"
+                        Text("ecology produced \(ecology.producedEpoch)  "
+                             + "phase \(producedPhaseText)  "
+                             + "published src \(publishedEpochText)  "
+                             + "phase \(publishedPhaseText)")
+                        Text("ecology epoch \(f(ecology.epochWallMs)) ms  "
+                             + "gpu m/e/v "
+                             + "\(opt(ecology.mutateGpuMs))/\(opt(ecology.evalGpuMs))"
+                             + "/\(opt(ecology.visualizationGpuMs))")
+                        Text("ecology snapshotBytes \(ecology.snapshotBytes)  "
+                             + "readbackBytes \(ecology.readbackBytes)  "
+                             + "failures \(ecology.failureCount)  "
+                             + "spatial metrics: unavailable")
                     }
                     Text("programs \(hud.programCount)   \(hud.deviceName)")
                 }

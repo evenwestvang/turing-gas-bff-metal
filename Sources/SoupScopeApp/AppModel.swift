@@ -5,6 +5,7 @@ import Combine
 import Metal
 import MetalKit
 import BFFMetal
+import BFFEcologyMetal
 import BFFOracle
 import SoupScopeCore
 import CSoupRender
@@ -18,9 +19,11 @@ import CSoupRender
 final class AppModel: ObservableObject, @unchecked Sendable {
     let options: AppLaunchOptions
     let residentPlan: ResidentAppRunPlan
+    let ecologyPlan: EcologyAppRunPlan
     private let constructsLegacyCPURunner: Bool
     let config: SoupConfig
     private let residentConfig: ResidentEpochConfig?
+    private let ecologyConfig: EcologyMetalEpochConfig?
     let grid: ProgramGrid
     let lod = LODModel()
     let normalization: MetricNormalization
@@ -46,6 +49,13 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     /// UI must report unavailable rather than inventing zeroes or empty data.
     @Published private(set) var vizEntropyAvailable = false
 
+    /// Truthful ecology visualization availability. Scalar soup-derived
+    /// channels become available after the first ecology epoch report; exact
+    /// spatial metrics are **never** available from this producer (the UI must
+    /// report them neutrally unavailable rather than inventing them).
+    @Published private(set) var ecologyVizAvailability =
+        EcologyVizAvailability.initial
+
     /// The LOD readout of the most recently submitted render frame — the exact
     /// `LODReadout` that fed the shader uniforms, surfaced for the HUD so the
     /// displayed zoom/blend values are byte-for-byte what is being rendered. It is
@@ -58,6 +68,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     let context: SharedMetalContext?
     private var runner: SoupRunner?
     private var residentDriver: ResidentSimulationDriver?
+    private var ecologyDriver: EcologySimulationDriver?
     /// Monotonically increasing lifecycle generation for the resident driver.
     /// Every resident `onReport`/`onFailure`/`onStop` callback captures the
     /// generation of the driver it belongs to and is inert unless it is still
@@ -70,6 +81,10 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     private var residentDisplayedEpoch = 0
     private var residentRenderedFrames = 0
     private var residentFinalDiagnosticEmitter = ResidentFinalDiagnosticEmitter()
+    /// Ecology final-diagnostic emitter. Distinct from the resident emitter so
+    /// the resident path's schema/default behavior is preserved exactly; the
+    /// app routes to one engine per run, so only one emitter is ever active.
+    private var ecologyFinalDiagnosticEmitter = EcologyFinalDiagnosticEmitter()
     private(set) var lastSnapshot: RenderSnapshot?
 
     // Opt-in per-frame host-stage timing (`--frame-stage-timing`). `nil` (off) unless the
@@ -115,8 +130,22 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         self.options = parsed
         let resolvedResidentPlan = parsed.residentRunPlan()
         self.residentPlan = resolvedResidentPlan
-        let resolvedConstructsLegacyCPURunner =
-            SoupScopeAppLifecycle.constructsLegacyCPURunner(for: resolvedResidentPlan)
+        let resolvedEcologyPlan = parsed.ecologyPlan
+        self.ecologyPlan = resolvedEcologyPlan
+        // Ecology is a separate engine: it constructs neither the legacy CPU
+        // `SoupRunner` nor the grounded `ResidentSimulationDriver`. Only the
+        // non-resident, non-ecology path constructs the legacy CPU runner; the
+        // resident path keeps its existing (resident-only) routing. Plain/empty
+        // launch stays the grounded resident route; only an explicit `--ecology`
+        // invocation routes here.
+        let resolvedConstructsLegacyCPURunner: Bool
+        if parsed.simulationMode == .ecology {
+            resolvedConstructsLegacyCPURunner =
+                SoupScopeAppLifecycle.constructsLegacyCPURunner(forEcology: resolvedEcologyPlan)
+        } else {
+            resolvedConstructsLegacyCPURunner =
+                SoupScopeAppLifecycle.constructsLegacyCPURunner(for: resolvedResidentPlan)
+        }
         self.constructsLegacyCPURunner = resolvedConstructsLegacyCPURunner
 
         let resolvedConfig: SoupConfig
@@ -142,6 +171,16 @@ final class AppModel: ObservableObject, @unchecked Sendable {
             }
         } else {
             self.residentConfig = nil
+        }
+        if resolvedEcologyPlan.enabled {
+            do {
+                self.ecologyConfig = try parsed.ecologyConfig()
+            } catch {
+                self.ecologyConfig = nil
+                startupError = (startupError.map { $0 + "; " } ?? "") + "ecology config: \(error)"
+            }
+        } else {
+            self.ecologyConfig = nil
         }
         self.grid = ProgramGrid(programCount: resolvedConfig.programCount)
         self.normalization = MetricNormalization(stepBudget: resolvedConfig.stepBudget)
@@ -175,9 +214,16 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         // renderer something deterministic to draw before the first epoch batch.
         // Resident mode routes to `.none` (its soup lives on the GPU), so it must
         // not try to build from an empty CPU soup; `lastSnapshot` stays `nil`
-        // until the resident driver produces a frame.
-        let resolvedInitialSnapshotSource =
-            SoupScopeAppLifecycle.initialSnapshotSource(for: resolvedResidentPlan)
+        // until the resident driver produces a frame. Ecology routes to `.none`
+        // for the same reason (its soup lives on the GPU under the runner).
+        let resolvedInitialSnapshotSource: InitialSnapshotSource
+        if parsed.simulationMode == .ecology {
+            resolvedInitialSnapshotSource =
+                SoupScopeAppLifecycle.initialSnapshotSource(forEcology: resolvedEcologyPlan)
+        } else {
+            resolvedInitialSnapshotSource =
+                SoupScopeAppLifecycle.initialSnapshotSource(for: resolvedResidentPlan)
+        }
         self.lastSnapshot = resolvedInitialSnapshotSource == .legacyCPURunner
             ? (try? RenderSnapshot.initial(programCount: resolvedConfig.programCount,
                                            soup: runner?.soup ?? []))
@@ -187,13 +233,18 @@ final class AppModel: ObservableObject, @unchecked Sendable {
         // launch, which omits --validation-seconds).
         beginValidationIfNeeded()
         startResidentIfNeeded()
+        startEcologyIfNeeded()
     }
 
     deinit {
-        if residentFinalDiagnosticEmitter.emitted {
+        let residentEmitted = residentFinalDiagnosticEmitter.emitted
+        let ecologyEmitted = ecologyFinalDiagnosticEmitter.emitted
+        if residentEmitted || ecologyEmitted {
             residentDriver?.stop()
+            ecologyDriver?.stop()
         } else {
             residentDriver?.stopAndWait()
+            ecologyDriver?.stopAndWait()
         }
     }
 
@@ -328,13 +379,23 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     func togglePause() {
         if let residentDriver {
             isRunning = residentDriver.togglePause()
+        } else if let ecologyDriver {
+            isRunning = ecologyDriver.togglePause()
         } else {
             isRunning.toggle()
         }
         objectWillChange.send()          // reflect the paused flag immediately
     }
     func cycleMetricChannel() {
-        metricChannel = ResidentVizChannel.cyclingRawValue(after: metricChannel)
+        // Ecology and resident share the 0...3 `metricChannel` word; each
+        // cycles only through its own supported selections so an out-of-range
+        // value snaps back to the default rather than selecting a component
+        // of the other engine.
+        if ecologyDriver != nil {
+            metricChannel = EcologyVizChannel.cyclingRawValue(after: metricChannel)
+        } else {
+            metricChannel = ResidentVizChannel.cyclingRawValue(after: metricChannel)
+        }
         objectWillChange.send()
     }
 
@@ -343,6 +404,13 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     /// resident-specific names.
     var residentVizChannel: ResidentVizChannel {
         ResidentVizChannel(rawValue: metricChannel) ?? ResidentVizChannel.defaultChannel
+    }
+
+    /// The ecology-path channel the current `metricChannel` selects. Used by
+    /// the HUD/overlay to label the active ecology signal with its truthful,
+    /// soup-derived, non-spatial-metric names.
+    var ecologyVizChannel: EcologyVizChannel {
+        EcologyVizChannel(rawValue: metricChannel) ?? EcologyVizChannel.defaultChannel
     }
 
     /// The uniforms for the current frame. Evaluates the frame's `LODReadout` once
@@ -391,6 +459,288 @@ final class AppModel: ObservableObject, @unchecked Sendable {
     func noteResidentFrameSubmitted(sourceEpoch: Int) {
         residentRenderedFrames += 1
         noteResidentDisplayedEpoch(sourceEpoch)
+    }
+
+    // MARK: - Ecology rendering accessors
+    //
+    // The renderer leases the same `ResidentGPUSnapshotLease` type (the ecology
+    // engine reuses the public `ResidentGPUSnapshotRing`), so the renderer's
+    // lease/release plumbing is shared; only the source driver differs. The
+    // renderer NEVER reads the producer's live overview texture, so no live
+    // texture accessor is exposed here.
+
+    var usesEcologyRendering: Bool {
+        ecologyDriver != nil
+    }
+
+    var ecologySnapshotDiagnostics: ResidentSnapshotRingDiagnostics? {
+        ecologyDriver?.snapshotDiagnostics
+    }
+
+    func acquireEcologySnapshot() -> ResidentGPUSnapshotLease? {
+        ecologyDriver?.acquireSnapshot(expectedByteCount: EcologyTopology.soupByteCount)
+    }
+
+    /// The latest successfully published immutable snapshot source epoch,
+    /// sourced from the ecology snapshot ring's `publishedSourceEpoch`
+    /// (set only when `state.publish()` succeeds). `nil` if no publication
+    /// has completed yet, or if there is no ecology driver / ring.
+    private var ecologyPublishedSourceEpoch: Int? {
+        ecologyDriver?.snapshotDiagnostics.publishedSourceEpoch
+    }
+
+    /// Record a frame that rendered a leased ecology snapshot. The displayed
+    /// source epoch/phase update ONLY on this path — derived from the lease's
+    /// `sourceEpoch` — so they always correspond to the immutable resource
+    /// actually rendered this frame. The neutral fallback path never calls
+    /// this and never fabricates these values.
+    ///
+    /// Phase convention: a snapshot published after the producer ran ecology
+    /// epoch `e` carries `sourceEpoch = e + 1` (completed epochs) and the
+    /// phase for the producing epoch `e` (`EcologyMatchingPhase(epoch: e)`).
+    /// Therefore the displayed phase for a rendered lease is
+    /// `EcologyMatchingPhase(epoch: sourceEpoch - 1)`; `sourceEpoch` is always
+    /// `>= 1` for a real publication (the first publication follows epoch 0),
+    /// so the subtraction is safe.
+    func noteEcologyFrameSubmitted(sourceEpoch: Int) {
+        residentRenderedFrames += 1
+        hud.noteEcologyDisplayedLease(sourceEpoch: sourceEpoch)
+    }
+
+    /// Record a frame that rendered the neutral/unavailable background
+    /// because no published immutable snapshot lease was available. The HUD's
+    /// displayed source epoch/phase are NOT fabricated: they retain their
+    /// prior value (the last valid lease rendered) or stay `nil` if no valid
+    /// lease has ever been rendered. `residentRenderedFrames` is NOT
+    /// incremented here — it counts frames that actually rendered an ecology
+    /// lease (the original semantics), so the final diagnostic's `frameCount`
+    /// truthfully reflects ecology-content frames, not every cleared frame.
+    func noteEcologyFrameUnavailable() {
+        hud.noteEcologyDisplayUnavailable()
+    }
+
+    private func startEcologyIfNeeded() {
+        guard ecologyPlan.enabled else { return }
+        guard let context else {
+            hud.setError((hud.errorState.map { $0 + "; " } ?? "")
+                         + "ecology mode requires Metal")
+            if ecologyPlan.limit.isBounded || ecologyPlan.tinyValidation {
+                emitEcologyFinalDiagnosticAndTerminate(
+                    reason: .failure,
+                    snapshot: ResidentProgressSnapshot(simulationEpoch: 0,
+                                                       textureSourceEpoch: 0,
+                                                       failures: 1,
+                                                       unknownHalts: 0))
+            }
+            return
+        }
+        guard let ecologyConfig else {
+            if ecologyPlan.limit.isBounded || ecologyPlan.tinyValidation {
+                emitEcologyFinalDiagnosticAndTerminate(
+                    reason: .failure,
+                    snapshot: ResidentProgressSnapshot(simulationEpoch: 0,
+                                                       textureSourceEpoch: 0,
+                                                       failures: 1,
+                                                       unknownHalts: 0))
+            }
+            return
+        }
+        do {
+            let driver = try makeEcologyDriver(context: context, ecologyConfig: ecologyConfig)
+            ecologyDriver = driver
+            isRunning = true
+            driver.start()
+        } catch {
+            hud.setError((hud.errorState.map { $0 + "; " } ?? "")
+                         + "ecology start failed: \(error)")
+            if ecologyPlan.limit.isBounded || ecologyPlan.tinyValidation {
+                emitEcologyFinalDiagnosticAndTerminate(
+                    reason: .failure,
+                    snapshot: ResidentProgressSnapshot(simulationEpoch: 0,
+                                                       textureSourceEpoch: 0,
+                                                       failures: 1,
+                                                       unknownHalts: 0))
+            }
+        }
+    }
+
+    /// Construct an `EcologySimulationDriver` from the immutable
+    /// `ecologyConfig`/`ecologyPlan` and the shared Metal device+queue, whose
+    /// callbacks capture the current lifecycle generation and are inert unless
+    /// it is still current — so callbacks queued by an old driver that are
+    /// still in flight after Reset cannot mutate the new state or emit a stale
+    /// termination. The same `ResidentLifecycleGeneration` fence the resident
+    /// path uses is reused unchanged (it is a generic UInt64 counter).
+    private func makeEcologyDriver(context: SharedMetalContext,
+                                  ecologyConfig: EcologyMetalEpochConfig
+    ) throws -> EcologySimulationDriver {
+        let generation = lifecycleGeneration.current
+        return try EcologySimulationDriver(
+            config: ecologyConfig,
+            plan: ecologyPlan,
+            device: context.device,
+            commandQueue: context.queue,
+            onReport: { [weak self] report, failures in
+                guard let self, self.lifecycleGeneration.isCurrent(generation) else { return }
+                self.receiveEcologyReport(report, failureCount: failures)
+            },
+            onFailure: { [weak self] message in
+                guard let self, self.lifecycleGeneration.isCurrent(generation) else { return }
+                self.hud.setError(message)
+            },
+            onStop: { [weak self] reason, snapshot in
+                guard let self, self.lifecycleGeneration.isCurrent(generation) else { return }
+                self.ecologyDidStop(reason: reason, snapshot: snapshot)
+            })
+    }
+
+    private func receiveEcologyReport(_ report: EcologyMetalEpochReport, failureCount: Int) {
+        // The published source epoch is sourced from the snapshot ring's
+        // `publishedSourceEpoch` — set only on actual successful ring
+        // publication, not on attempted production. At the moment a report
+        // arrives, the publication blit for this epoch has been *submitted*
+        // (async) but may not have *completed* yet; `publishedSourceEpoch`
+        // therefore truthfully reflects the latest *completed* publication,
+        // which may be one behind the produced epoch (or `nil` if no
+        // publication has completed yet — first-publication absence, skipped
+        // reservation, or failed blit).
+        let publishedSourceEpoch = ecologyPublishedSourceEpoch
+        hud.record(ecology: report,
+                   publishedSourceEpoch: publishedSourceEpoch,
+                   failureCount: failureCount)
+        // The first app-safe epoch report means the producer has begun writing
+        // soup-derived scalar overview texels; exact spatial metrics remain
+        // neutrally unavailable.
+        ecologyVizAvailability = .afterFirstEpoch
+        objectWillChange.send()
+    }
+
+    private func ecologyDidStop(reason: ResidentDriverStopReason,
+                                snapshot: ResidentProgressSnapshot) {
+        isRunning = false
+        objectWillChange.send()
+        guard ecologyPlan.limit.isBounded || ecologyPlan.tinyValidation
+                || reason == .failure else { return }
+        emitEcologyFinalDiagnosticAndTerminate(reason: reason, snapshot: snapshot)
+    }
+
+    /// Emit the bounded ecology final diagnostic, labeled
+    /// `ecologyFinalDiagnostic` (never `residentFinalDiagnostic`), then
+    /// terminate. Uses the distinct `EcologyFinalDiagnosticEmitter` so the
+    /// resident path's schema/default behavior is preserved exactly. The
+    /// diagnostic carries explicit `producedEpoch`/`producedPhase`,
+    /// `publishedSourceEpoch`/`publishedPhase` (nullable), and
+    /// `displayedSourceEpoch`/`displayedPhase` (nullable) fields with truthful
+    /// names — it must not label latest-produced state as texture source /
+    /// published / displayed. The produced epoch/phase come from the stop
+    /// snapshot's `simulationEpoch`; the published source epoch comes from the
+    /// snapshot ring's `publishedSourceEpoch`; the displayed source epoch
+    /// comes from the HUD's `ecology.displayedSourceEpoch` (set only on a
+    /// valid-lease render submission).
+    private func emitEcologyFinalDiagnosticAndTerminate(
+        reason: ResidentDriverStopReason,
+        snapshot: ResidentProgressSnapshot
+    ) {
+        let producedEpoch = snapshot.simulationEpoch
+        // If no ecology epoch has completed (`producedEpoch == 0`), the
+        // producing phase is unavailable — never fabricated as H0.
+        let producedPhase: String? = producedEpoch > 0
+            ? EcologyMatchingPhase(epoch: UInt32(producedEpoch - 1)).label
+            : nil
+        let publishedSourceEpoch = ecologyPublishedSourceEpoch
+        let publishedPhase = publishedSourceEpoch
+            .map { EcologyMatchingPhase(epoch: UInt32($0 - 1)).label }
+        let displayedSourceEpoch = hud.ecology?.displayedSourceEpoch
+        let displayedPhase = hud.ecology?.displayedPhase
+        let diagnostic = EcologyFinalDiagnostic(
+            producedEpoch: producedEpoch,
+            producedPhase: producedPhase,
+            publishedSourceEpoch: publishedSourceEpoch,
+            publishedPhase: publishedPhase,
+            displayedSourceEpoch: displayedSourceEpoch,
+            displayedPhase: displayedPhase,
+            frameCount: residentRenderedFrames,
+            failures: snapshot.failures,
+            unknownHalts: snapshot.unknownHalts,
+            stopReason: reason)
+        guard ecologyFinalDiagnosticEmitter.emit(diagnostic, write: { print($0) }) else {
+            return
+        }
+        let exitCode = ResidentTerminationPolicy.exitCode(
+            reason: reason,
+            metalAvailable: context != nil,
+            hasError: hud.errorState != nil)
+        if exitCode == 0 {
+            NSApplication.shared.terminate(nil)
+        } else {
+            exit(exitCode)
+        }
+    }
+
+    // MARK: - Ecology interactive Reset
+    //
+    // Mirrors `resetInteractiveResidentSimulation`: reconstruct the ecology
+    // driver from the immutable `ecologyConfig`/`ecologyPlan` and the shared
+    // Metal device+queue, restoring the seeded soup, epoch zero, the snapshot
+    // ring/resources/generation, and all displayed/visualization/HUD/error
+    // state, then re-fit the camera and restart. Generation fence: the
+    // generation is bumped *before* the old driver is stopped, so every
+    // callback the old driver still has queued is inert by the time it fires.
+    // Allowed only for the interactive ecology mode (unbounded, no tiny
+    // validation, no display-independent validation); a truthful no-op
+    // otherwise so bounded/tiny-validation runs terminate exactly as
+    // configured.
+    @discardableResult
+    func resetInteractiveEcologySimulation() -> Bool {
+        guard usesEcologyRendering,
+              SoupScopeAppLifecycle.canResetInteractiveEcology(
+                  plan: ecologyPlan, validationActive: validationActive),
+              let context,
+              let ecologyConfig else {
+            return false
+        }
+        lifecycleGeneration.bump()
+        ecologyDriver?.stopAndWait()
+        ecologyDriver = nil
+
+        let reset = ResidentResetTransition(deviceName: hud.deviceName,
+                                            programCount: EcologyTopology.siteCount,
+                                            drawableWidth: drawablePxW,
+                                            drawableHeight: drawablePxH)
+        residentDisplayedEpoch = reset.displayedEpoch
+        residentRenderedFrames = reset.renderedFrames
+        lastSnapshot = nil
+        hud = reset.hud
+        vizEntropyHistory = reset.vizEntropyHistory
+        vizEntropyAvailable = reset.vizEntropyAvailable
+        ecologyVizAvailability = .initial
+        metricChannel = reset.metricChannel
+        isRunning = reset.intendsToRun
+        if frameStages != nil {
+            frameStages = AppFrameStageAccumulator()
+            lastEpochBatchSeconds = nil
+            lastSnapshotBuildSeconds = nil
+        }
+
+        let refitResult = reset.applyRefitAndBuildLODReadout(
+            camera: &camera, geometry: cameraGeometry(), lod: lod)
+        didFit = refitResult.didFit
+        lodReadout = refitResult.lodReadout
+
+        do {
+            let driver = try makeEcologyDriver(context: context, ecologyConfig: ecologyConfig)
+            ecologyDriver = driver
+            driver.start()
+            objectWillChange.send()
+            return true
+        } catch {
+            let rollback = ResidentResetTransition.failureRollback
+            isRunning = rollback.isRunning
+            hud.setError((hud.errorState.map { $0 + "; " } ?? "")
+                         + "ecology reset failed: \(error)")
+            objectWillChange.send()
+            return false
+        }
     }
 
     private func startResidentIfNeeded() {
@@ -509,7 +859,8 @@ final class AppModel: ObservableObject, @unchecked Sendable {
 
     private func emitResidentFinalDiagnosticAndTerminate(
         reason: ResidentDriverStopReason,
-        snapshot: ResidentProgressSnapshot
+        snapshot: ResidentProgressSnapshot,
+        kind: String = "residentFinalDiagnostic"
     ) {
         let diagnostic = ResidentFinalDiagnostic(
             simulationEpoch: snapshot.simulationEpoch,
@@ -518,7 +869,8 @@ final class AppModel: ObservableObject, @unchecked Sendable {
             frameCount: residentRenderedFrames,
             failures: snapshot.failures,
             unknownHalts: snapshot.unknownHalts,
-            stopReason: reason)
+            stopReason: reason,
+            kind: kind)
         guard residentFinalDiagnosticEmitter.emit(diagnostic, write: { print($0) }) else {
             return
         }
@@ -535,6 +887,7 @@ final class AppModel: ObservableObject, @unchecked Sendable {
 
     func stopResidentSimulation() {
         residentDriver?.stopAndWait()
+        ecologyDriver?.stopAndWait()
     }
 
     // MARK: - Interactive resident Reset

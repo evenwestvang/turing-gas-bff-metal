@@ -84,11 +84,16 @@ public struct EcologyMetalEpochConfig: Equatable, Sendable {
 }
 
 /// Per-epoch instrumentation. Counter, readback/digest, and optional test-capture
-/// costs are reported separately.
+/// costs are reported separately. The app-safe path also reports the visualize
+/// kernel GPU time so the HUD's `visualizationGpuMs` is a real measurement, not
+/// a dead field.
 public struct EcologyMetalEpochInstrumentation: Equatable, Sendable, Codable {
     public var epochWallSeconds: Double
     public var mutateKernelSeconds: Double?
     public var evalKernelSeconds: Double?
+    /// App-safe only: the `bff_ecology_visualize` kernel GPU time. `nil` on the
+    /// accepted CLI path, which never runs the visualize kernel.
+    public var visualizeKernelSeconds: Double?
     public var counterReadbackSeconds: Double
     public var soupReadbackSeconds: Double?
     public var digestSeconds: Double?
@@ -97,6 +102,35 @@ public struct EcologyMetalEpochInstrumentation: Equatable, Sendable, Codable {
     public var readbackBytes: Int
     public var counterBytes: Int
     public var captureBytes: Int
+
+    /// Public memberwise initializer so external test modules can construct
+    /// production reports for focused production-path tests (no Metal required).
+    /// Production callers use the runner's `runEpoch()`/`runEpochAppSafe()`.
+    public init(epochWallSeconds: Double,
+                mutateKernelSeconds: Double?,
+                evalKernelSeconds: Double?,
+                visualizeKernelSeconds: Double?,
+                counterReadbackSeconds: Double,
+                soupReadbackSeconds: Double?,
+                digestSeconds: Double?,
+                captureReadbackSeconds: Double?,
+                uploadBytes: Int,
+                readbackBytes: Int,
+                counterBytes: Int,
+                captureBytes: Int) {
+        self.epochWallSeconds = epochWallSeconds
+        self.mutateKernelSeconds = mutateKernelSeconds
+        self.evalKernelSeconds = evalKernelSeconds
+        self.visualizeKernelSeconds = visualizeKernelSeconds
+        self.counterReadbackSeconds = counterReadbackSeconds
+        self.soupReadbackSeconds = soupReadbackSeconds
+        self.digestSeconds = digestSeconds
+        self.captureReadbackSeconds = captureReadbackSeconds
+        self.uploadBytes = uploadBytes
+        self.readbackBytes = readbackBytes
+        self.counterBytes = counterBytes
+        self.captureBytes = captureBytes
+    }
 }
 
 public struct EcologyMetalEpochReport: Sendable {
@@ -106,6 +140,25 @@ public struct EcologyMetalEpochReport: Sendable {
     public var capturedInputTapes: [[UInt8]]
     public var capturedFinalTapes: [[UInt8]]
     public var instrumentation: EcologyMetalEpochInstrumentation
+
+    /// Public memberwise initializer so external test modules can construct
+    /// production reports for focused production-path tests (no Metal
+    /// required). Production callers use the runner's `runEpoch()`/
+    /// `runEpochAppSafe()`, which is the only path that ever produces a real
+    /// report.
+    public init(counters: EcologyEpochCounters,
+                digest: UInt64?,
+                capturedPairResults: [BFFEcologyMetalPairResult],
+                capturedInputTapes: [[UInt8]],
+                capturedFinalTapes: [[UInt8]],
+                instrumentation: EcologyMetalEpochInstrumentation) {
+        self.counters = counters
+        self.digest = digest
+        self.capturedPairResults = capturedPairResults
+        self.capturedInputTapes = capturedInputTapes
+        self.capturedFinalTapes = capturedFinalTapes
+        self.instrumentation = instrumentation
+    }
 }
 
 /// Test-only per-pair result, mirroring `InteractionResult` field semantics.
@@ -176,6 +229,25 @@ public enum BFFEcologyLayoutProbe {
     }
 }
 
+/// Runtime packaging-contract accessor for the ecology shader resource. The
+/// runner loads `BFFEcologyEpoch.metal` via `ShaderResourceLocator` against
+/// this module's resource bundle; this accessor exposes the same lookup so the
+/// packaging contract ("the ecology shader is a single, provenanced resource
+/// the app directly requires") is verifiable at runtime without constructing a
+/// runner and without asserting on shader source strings. Declared outside the
+/// `#if canImport(Metal)` gate because `ShaderResourceLocator` and
+/// `Bundle.module` are platform-independent — the packaging contract is
+/// verifiable on every host.
+public enum EcologyShaderPackaging {
+    /// The bundled `BFFEcologyEpoch.metal` source URL, or `nil` if the
+    /// resource is missing from both `Bundle.main` and this module's bundle.
+    public static var epochShaderResourceURL: URL? {
+        ShaderResourceLocator.url(forResource: "BFFEcologyEpoch",
+                                  withExtension: "metal",
+                                  moduleBundle: .module)
+    }
+}
+
 #if canImport(Metal)
 
 /// Experimental GPU-resident ecology epoch runner.
@@ -242,6 +314,11 @@ public final class EcologyMetalEpochRunner {
     private let layoutProbePipeline: MTLComputePipelineState
     private let rngProbePipeline: MTLComputePipelineState
     private let pairProbePipeline: MTLComputePipelineState
+    /// Compiled shader library, retained so the app-safe visualize pipeline can
+    /// be built lazily without re-parsing the shader source. The accepted CLI
+    /// `runEpoch()` never touches this; it is only consumed by
+    /// `prepareAppSafeResources()` / `runEpochAppSafe()`.
+    private let library: MTLLibrary
 
     // Buffers
     private let soupBuffer: MTLBuffer
@@ -255,6 +332,12 @@ public final class EcologyMetalEpochRunner {
     private let counterByteCount = Int(BFF_ECO_COUNTER_WORD_COUNT) * MemoryLayout<UInt32>.stride
     private let pairResultByteCount: Int
     private let pairTapeCaptureBytes: Int
+
+    /// App-safe (interactive) execution resources, prepared lazily. `nil`
+    /// unless `prepareAppSafeResources()` has been called. The accepted CLI
+    /// never prepares these, so its memory footprint and `runEpoch()` behavior
+    /// are byte-for-byte unchanged.
+    private var appSafeResources: EcologyAppSafeResources?
 
     public var deviceName: String { device.name }
 
@@ -289,6 +372,7 @@ public final class EcologyMetalEpochRunner {
         } catch {
             throw RunnerError.compileFailed("\(error)")
         }
+        self.library = library
 
         func pipeline(_ name: String) throws -> MTLComputePipelineState {
             guard let fn = library.makeFunction(name: name) else {
@@ -553,6 +637,7 @@ public final class EcologyMetalEpochRunner {
             epochWallSeconds: wall,
             mutateKernelSeconds: mutateTiming.gpuSeconds ?? mutateTiming.hostSeconds,
             evalKernelSeconds: evalTiming.gpuSeconds ?? evalTiming.hostSeconds,
+            visualizeKernelSeconds: nil,
             counterReadbackSeconds: counterReadbackSeconds,
             soupReadbackSeconds: soupReadbackSeconds,
             digestSeconds: digestSeconds,
@@ -569,8 +654,7 @@ public final class EcologyMetalEpochRunner {
             capturedPairResults: capturedPairResults,
             capturedInputTapes: capturedInputTapes,
             capturedFinalTapes: capturedFinalTapes,
-            instrumentation: instr
-        )
+            instrumentation: instr)
     }
 
     // MARK: - Test-only probe dispatch
@@ -738,6 +822,347 @@ public final class EcologyMetalEpochRunner {
             out.append(tape)
         }
         return out
+    }
+
+    // MARK: - App-safe (interactive) execution path
+    //
+    // A separate API from the accepted CLI `runEpoch()`: it shares the exact
+    // mutate+eval kernels and accepted CPU-parity semantics, but performs
+    // **no full-soup CPU readback, no CPU digest, and no GPU wait on the
+    // display thread**. Instead the producer (this runner, driven from a
+    // background simulation queue) schedules an immutable soup+overview blit
+    // into a snapshot ring slot and publishes on command-buffer completion.
+    // The renderer leases the immutable slot and releases on render
+    // command-buffer completion — it never binds the live mutable soup.
+    //
+    // Resources (visualize pipeline, overview texture + byte buffer, snapshot
+    // ring) are prepared lazily so the CLI's footprint and `runEpoch()`
+    // behavior are byte-for-byte unchanged.
+
+    /// The fixed ecology overview texture dimensions (512 × 256 = 131,072
+    /// sites, sourced from `EcologyTopology` — never duplicated).
+    private static let overviewWidth = EcologyTopology.width
+    private static let overviewHeight = EcologyTopology.height
+    private static let snapshotSlotCount = 3
+
+    /// The immutable, GPU-resident overview texture the producer's visualize
+    /// kernel writes and the snapshot blit copies into the immutable ring slots.
+    /// `nil` until `prepareAppSafeResources()` has succeeded. The renderer
+    /// NEVER binds this live texture — it leases the immutable ring copy. Kept
+    /// public so tests and the snapshot blit can confirm the producer resource
+    /// exists; it is not a cross-thread epoch source.
+    public var residentVisualizationTexture: MTLTexture? {
+        appSafeResources?.overviewTexture
+    }
+
+    /// Snapshot-ring diagnostics for the app-safe path. Returns the
+    /// `ResidentSnapshotRingDiagnostics.unprepared` sentinel (slot count 0,
+    /// every counter 0) before preparation so the HUD never fabricates lease
+    /// counts for a ring that does not exist yet. Construction is via that
+    /// narrow public sentinel (defined in BFFMetal) — this module never
+    /// synthesizes a `ResidentSnapshotRingDiagnostics` value itself.
+    public var residentSnapshotDiagnostics: ResidentSnapshotRingDiagnostics {
+        appSafeResources?.snapshotRing.diagnostics
+            ?? .unprepared
+    }
+
+    /// Lease an immutable, same-generation soup+overview snapshot for the
+    /// current published epoch. Returns `nil` if no slot is published yet or
+    /// every slot is busy (renderer backpressure is skipped — the renderer
+    /// falls back to the overview-only path). The lease is released on the
+    /// render command buffer's completion handler; `deinit` also releases.
+    public func acquireResidentSnapshot(expectedByteCount: Int) -> ResidentGPUSnapshotLease? {
+        appSafeResources?.snapshotRing.acquire(expectedByteCount: expectedByteCount)
+    }
+
+    /// Prepare the app-safe resources (visualize pipeline, overview texture +
+    /// byte buffer, snapshot ring). Idempotent; safe to call more than once.
+    /// Throws on pipeline/texture/buffer/ring allocation failure. The CLI
+    /// never calls this.
+    public func prepareAppSafeResources() throws {
+        if appSafeResources != nil { return }
+        guard let fn = library.makeFunction(name: "bff_ecology_visualize") else {
+            throw RunnerError.kernelMissing("bff_ecology_visualize")
+        }
+        let visualizePipeline: MTLComputePipelineState
+        do {
+            visualizePipeline = try device.makeComputePipelineState(function: fn)
+        } catch {
+            throw RunnerError.compileFailed("pipeline bff_ecology_visualize: \(error)")
+        }
+
+        let overviewDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: Self.overviewWidth,
+            height: Self.overviewHeight,
+            mipmapped: false)
+        overviewDesc.usage = [.shaderWrite, .shaderRead]
+        guard let overviewTexture = device.makeTexture(descriptor: overviewDesc) else {
+            throw RunnerError.bufferAllocationFailed("ecology.overviewTexture")
+        }
+        overviewTexture.label = "ecology.overviewTexture"
+
+        let ring: ResidentGPUSnapshotRing
+        do {
+            ring = try ResidentGPUSnapshotRing(
+                device: device,
+                slotCount: Self.snapshotSlotCount,
+                byteCount: soupByteCount,
+                overviewWidth: Self.overviewWidth,
+                overviewHeight: Self.overviewHeight)
+        } catch let ResidentMetalEpochRunner.RunnerError.bufferAllocationFailed(label) {
+            throw RunnerError.bufferAllocationFailed(label)
+        }
+        self.appSafeResources = EcologyAppSafeResources(
+            visualizePipeline: visualizePipeline,
+            overviewTexture: overviewTexture,
+            snapshotRing: ring)
+    }
+
+    /// App-safe epoch execution. Runs the same mutate+eval kernels as the
+    /// accepted `runEpoch()`, then runs `bff_ecology_visualize`, reads back
+    /// ONLY the small counters buffer, asserts `haltUnknown == 0`, and
+    /// schedules an immutable soup+overview snapshot publication (a blit into
+    /// a ring slot, published on command-buffer completion). It does **not**
+    /// read back the full soup, compute a CPU digest, or wait on the GPU from
+    /// the display thread. The `digest` fields of the returned report are
+    /// `nil`/`0` (sentinel: not computed) and must not be presented as a real
+    /// measurement. Stale completions after `stop`/reset are inert under the
+    /// driver's lifecycle-generation fence.
+    @discardableResult
+    public func runEpochAppSafe() throws -> EcologyMetalEpochReport {
+        guard epoch <= UInt64(UInt32.max) else {
+            throw RunnerError.epochOutOfRange(epoch)
+        }
+        let resources = try preparedAppSafeResources()
+        let e = UInt32(epoch)
+        let phase = EcologyMatchingPhase(epoch: e)
+        let epochStart = ResidentClock.now()
+        var readbackBytes = 0
+        let counterBytes = counterByteCount
+
+        var params = BFFEcologyEpochParams(
+            seed: config.seed,
+            epoch: e,
+            stepBudget: UInt32(config.stepBudget),
+            mutationP32: config.mutationP32,
+            variant: BFFEcologyEvalLayout.variantCode(config.variant),
+            bracketMode: config.bracketMode == .dynamicScan
+                ? UInt32(BFF_ECO_BRACKET_DYNAMIC_SCAN)
+                : UInt32(BFF_ECO_BRACKET_JUMP_TABLE),
+            capturePairTapes: 0,
+            reserved0: 0)
+
+        // --- Mutate kernel (same kernel + params as runEpoch) ---
+        let mutateTiming = try encodeTimed(name: "mutate", pipeline: mutatePipeline) { cb in
+            guard let blit = cb.makeBlitCommandEncoder() else {
+                throw RunnerError.commandEncodingFailed("mutate counter fill")
+            }
+            blit.fill(buffer: self.countersBuffer,
+                      range: 0..<self.counterByteCount, value: 0)
+            blit.endEncoding()
+        } encode: { enc in
+            enc.setComputePipelineState(mutatePipeline)
+            enc.setBuffer(soupBuffer, offset: 0, index: 0)
+            enc.setBuffer(countersBuffer, offset: 0, index: 1)
+            enc.setBytes(&params, length: MemoryLayout<BFFEcologyEpochParams>.stride, index: 2)
+            self.dispatchThreads(count: self.soupByteCount, pipeline: mutatePipeline, encoder: enc)
+        }
+
+        // --- Eval scatter kernel (same kernel + params as runEpoch) ---
+        let evalTiming = try encodeTimed(name: "eval-scatter", pipeline: evalPipeline) { enc in
+            enc.setComputePipelineState(evalPipeline)
+            enc.setBuffer(soupBuffer, offset: 0, index: 0)
+            enc.setBuffer(countersBuffer, offset: 0, index: 1)
+            enc.setBytes(&params, length: MemoryLayout<BFFEcologyEpochParams>.stride, index: 2)
+            enc.setBuffer(self.pairResultBuffer, offset: 0, index: 3)
+            enc.setBuffer(self.inputCaptureBuffer, offset: 0, index: 4)
+            enc.setBuffer(self.finalCaptureBuffer, offset: 0, index: 5)
+            self.dispatchThreads(count: EcologyTopology.pairCount,
+                            pipeline: evalPipeline, encoder: enc)
+        }
+
+        // --- Visualize kernel (app-safe only; writes the live overview
+        // texture that the snapshot blit copies into the immutable ring slot).
+        // The renderer never binds this live texture — it leases the immutable
+        // copy. The visualize kernel writes ONLY the texture; there is no
+        // host-readable overview byte buffer on this path (it would be written
+        // and never read). ---
+        let visualizeTiming = try encodeTimed(
+            name: "visualize", pipeline: resources.visualizePipeline) { enc in
+            enc.setComputePipelineState(resources.visualizePipeline)
+            enc.setBuffer(soupBuffer, offset: 0, index: 0)
+            enc.setTexture(resources.overviewTexture, index: 0)
+            self.dispatchThreads(count: EcologyTopology.siteCount,
+                            pipeline: resources.visualizePipeline, encoder: enc)
+        }
+
+        // --- Read back ONLY the small counters buffer (no full-soup readback) ---
+        let counterReadbackStart = ResidentClock.now()
+        let counterWords = readCounterWords()
+        let counterReadbackSeconds = ResidentClock.now() - counterReadbackStart
+        readbackBytes += counterBytes
+
+        let haltUnknown = counterWords[Int(BFF_ECO_COUNTER_HALT_UNKNOWN)]
+        if haltUnknown != 0 {
+            throw RunnerError.unexpectedHalt(haltUnknown)
+        }
+
+        let mutationCount = Int(counterWords[Int(BFF_ECO_COUNTER_MUTATION_COUNT)])
+        let totalRawSteps = Int(counterWords[Int(BFF_ECO_COUNTER_TOTAL_RAW_STEPS)])
+        let totalNoopSteps = Int(counterWords[Int(BFF_ECO_COUNTER_TOTAL_NOOP_STEPS)])
+        let totalLoopOps = Int(counterWords[Int(BFF_ECO_COUNTER_TOTAL_LOOP_OPS)])
+        let totalCopyWrites = Int(counterWords[Int(BFF_ECO_COUNTER_TOTAL_COPY_WRITES)])
+        let totalRemapEvents = Int(counterWords[Int(BFF_ECO_COUNTER_TOTAL_REMAP_EVENTS)])
+        let haltBudget = Int(counterWords[Int(BFF_ECO_COUNTER_HALT_BUDGET)])
+        let haltPCOut = Int(counterWords[Int(BFF_ECO_COUNTER_HALT_PC_OUT)])
+        let haltUnmatched = Int(counterWords[Int(BFF_ECO_COUNTER_HALT_UNMATCHED)])
+
+        // App-safe path does NOT compute a soup digest. The `digest` field is
+        // the sentinel `0` ("not computed"); the report's top-level `digest`
+        // is `nil`. Neither must be presented as a real measurement.
+        let counters = EcologyEpochCounters(
+            epoch: e,
+            phase: phase,
+            interactions: EcologyTopology.pairCount,
+            mutationCount: mutationCount,
+            totalRawSteps: totalRawSteps,
+            totalNoopSteps: totalNoopSteps,
+            totalCommandSteps: totalRawSteps - totalNoopSteps,
+            totalLoopOps: totalLoopOps,
+            totalCopyWrites: totalCopyWrites,
+            totalRemapEvents: totalRemapEvents,
+            haltBudget: haltBudget,
+            haltPCOut: haltPCOut,
+            haltUnmatched: haltUnmatched,
+            writeSites: EcologyTopology.siteCount,
+            writeConflicts: 0,
+            digest: 0)
+
+        // --- Schedule immutable soup+overview publication (async blit). ---
+        // Ring exhaustion skips publication and never backpressures simulation.
+        // `sourceEpoch` is the completed-epoch count (e + 1) the snapshot
+        // represents; the renderer derives the displayed phase from it via the
+        // documented convention (see `noteEcologyFrameSubmitted` in AppModel),
+        // so phase is not carried as a separate field here.
+        let nextEpoch = Int(e) + 1
+        scheduleAppSafeSnapshotPublication(resources: resources,
+                                          sourceEpoch: nextEpoch)
+
+        self.lastEpochCounters = counters
+        epoch += 1
+        let wall = ResidentClock.now() - epochStart
+
+        let instr = EcologyMetalEpochInstrumentation(
+            epochWallSeconds: wall,
+            mutateKernelSeconds: mutateTiming.gpuSeconds ?? mutateTiming.hostSeconds,
+            evalKernelSeconds: evalTiming.gpuSeconds ?? evalTiming.hostSeconds,
+            visualizeKernelSeconds: visualizeTiming.gpuSeconds ?? visualizeTiming.hostSeconds,
+            counterReadbackSeconds: counterReadbackSeconds,
+            soupReadbackSeconds: nil,
+            digestSeconds: nil,
+            captureReadbackSeconds: nil,
+            uploadBytes: 0,
+            readbackBytes: readbackBytes,
+            counterBytes: counterBytes,
+            captureBytes: 0)
+
+        return EcologyMetalEpochReport(
+            counters: counters,
+            digest: nil,
+            capturedPairResults: [],
+            capturedInputTapes: [],
+            capturedFinalTapes: [],
+            instrumentation: instr)
+    }
+
+    /// Returns the prepared app-safe resources, preparing them on demand.
+    /// Called by `runEpochAppSafe()` so a caller that goes straight to
+    /// app-safe execution (the app driver) does not need a separate prepare
+    /// step. The CLI never reaches this path.
+    private func preparedAppSafeResources() throws -> EcologyAppSafeResources {
+        if appSafeResources == nil { try prepareAppSafeResources() }
+        return appSafeResources!
+    }
+
+    /// Schedule an immutable soup+overview snapshot publication: reserve a
+    /// ring slot, blit the live soup + overview texture into it, and publish
+    /// on the blit command buffer's completion handler. If no slot is free
+    /// (ring exhaustion), skip publication silently — never backpressure the
+    /// simulation.
+    ///
+    /// Phase convention (defined explicitly to remove off-by-one ambiguity):
+    /// this is called immediately after the producer completed producing
+    /// ecology epoch `e`, so the snapshot carries `sourceEpoch = e + 1`
+    /// (completed epochs) and the phase for the producing epoch `e`
+    /// (`EcologyMatchingPhase(epoch: e) = e & 3`). The phase is a pure,
+    /// unambiguous function of `sourceEpoch` here — `sourceEpoch >= 1` always
+    /// (the first publication follows epoch 0), so the displayed phase is
+    /// `EcologyMatchingPhase(epoch: sourceEpoch - 1)`. It is therefore NOT
+    /// carried as a separate field; the renderer/HUD derive it from
+    /// `sourceEpoch` via that single rule (see `noteEcologyFrameSubmitted`).
+    private func scheduleAppSafeSnapshotPublication(
+        resources: EcologyAppSafeResources,
+        sourceEpoch: Int
+    ) {
+        guard let (reservation, snapshotBuffer, snapshotOverviewTexture) =
+                resources.snapshotRing.reserveForWrite() else {
+            return
+        }
+        guard let cb = commandQueue.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else {
+            resources.snapshotRing.cancel(reservation)
+            return
+        }
+        cb.label = "ecology.snapshot.blit"
+        let start = ResidentClock.now()
+        blit.copy(from: soupBuffer, sourceOffset: 0,
+                  to: snapshotBuffer, destinationOffset: 0,
+                  size: soupByteCount)
+        let overviewSize = MTLSize(width: resources.overviewTexture.width,
+                                   height: resources.overviewTexture.height,
+                                   depth: 1)
+        blit.copy(from: resources.overviewTexture,
+                  sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: overviewSize,
+                  to: snapshotOverviewTexture,
+                  destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        let ring = resources.snapshotRing
+        let byteCount = soupByteCount
+        cb.addCompletedHandler { completed in
+            let hostSeconds = ResidentClock.now() - start
+            guard completed.status == .completed, completed.error == nil else {
+                ring.cancel(reservation)
+                return
+            }
+            let gpuSpan = completed.gpuEndTime - completed.gpuStartTime
+            let gpuSeconds = (completed.gpuStartTime > 0 && gpuSpan > 0) ? gpuSpan : nil
+            ring.publish(reservation,
+                         sourceEpoch: sourceEpoch,
+                         byteCount: byteCount,
+                         blitHostSeconds: hostSeconds,
+                         blitGPUSeconds: gpuSeconds)
+        }
+        cb.commit()
+    }
+}
+
+/// Owning container for the ecology app-safe (interactive) GPU resources.
+/// Private to this file; the runner exposes them through accessors.
+private final class EcologyAppSafeResources: @unchecked Sendable {
+    let visualizePipeline: MTLComputePipelineState
+    let overviewTexture: MTLTexture
+    let snapshotRing: ResidentGPUSnapshotRing
+
+    init(visualizePipeline: MTLComputePipelineState,
+         overviewTexture: MTLTexture,
+         snapshotRing: ResidentGPUSnapshotRing) {
+        self.visualizePipeline = visualizePipeline
+        self.overviewTexture = overviewTexture
+        self.snapshotRing = snapshotRing
     }
 }
 

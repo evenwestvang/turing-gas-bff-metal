@@ -48,3 +48,22 @@ public enum ShaderResourceLocator {
         preferred ?? fallback()
     }
 }
+
+/// Runtime packaging-contract accessors for the BFFMetal shader resources.
+/// The evaluator/resident runner load these via `ShaderResourceLocator`
+/// against this module's resource bundle; these accessors expose the same
+/// lookups so the packaging contract ("each shader is a single, provenanced
+/// resource the runtime loads by name") is verifiable at runtime without
+/// asserting on shader source strings.
+public enum BFFMetalShaderPackaging {
+    /// The bundled `BFFEvaluate.metal` source URL, or `nil` if missing.
+    public static var evaluateShaderResourceURL: URL? {
+        ShaderResourceLocator.url(forResource: "BFFEvaluate",
+                                  withExtension: "metal", moduleBundle: .module)
+    }
+    /// The bundled `BFFResidentEpoch.metal` source URL, or `nil` if missing.
+    public static var residentEpochShaderResourceURL: URL? {
+        ShaderResourceLocator.url(forResource: "BFFResidentEpoch",
+                                  withExtension: "metal", moduleBundle: .module)
+    }
+}

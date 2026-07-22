@@ -51,6 +51,24 @@ public enum SoupScopeAppLifecycle {
         !plan.enabled
     }
 
+    /// True iff the legacy CPU `SoupRunner` should be constructed for this
+    /// ecology plan. The ecology engine is GPU-resident and shares the
+    /// accepted `EcologyMetalEpochRunner`; it constructs neither the legacy
+    /// CPU `SoupRunner` nor the grounded `ResidentSimulationDriver`, so this
+    /// is always `false`.
+    public static func constructsLegacyCPURunner(forEcology plan: EcologyAppRunPlan) -> Bool {
+        _ = plan
+        return false
+    }
+
+    /// The initial snapshot source for this ecology plan. The ecology soup
+    /// lives on the GPU; the app never builds an epoch-0 CPU snapshot, so the
+    /// source is `.none` exactly like the resident path.
+    public static func initialSnapshotSource(forEcology plan: EcologyAppRunPlan) -> InitialSnapshotSource {
+        _ = plan
+        return .none
+    }
+
     /// The initial snapshot source for this plan: non-resident mode seeds
     /// `lastSnapshot` from the legacy CPU runner's soup; resident mode seeds
     /// nothing (its soup lives on the GPU). Derived from the same
@@ -82,6 +100,27 @@ public enum SoupScopeAppLifecycle {
     /// Pure value decision so the shell and the tests share one source of truth.
     public static func canResetInteractiveResident(plan: ResidentAppRunPlan,
                                                    validationActive: Bool) -> Bool {
+        guard plan.enabled, !plan.limit.isBounded, !plan.tinyValidation else {
+            return false
+        }
+        return !validationActive
+    }
+
+    /// True iff the user-visible Reset gesture is allowed for this ecology
+    /// launch plan and current app state.
+    ///
+    /// Ecology Reset mirrors the resident contract: it reconstructs the
+    /// `EcologySimulationDriver` from the **immutable** `EcologyAppRunPlan`
+    /// and the shared Metal device+queue, so it is only meaningful for the
+    /// *interactive* ecology mode — an ecology run whose limit is `unbounded`,
+    /// with `tinyValidation` off, and no display-independent bounded native
+    /// validation armed. It is a truthful no-op otherwise, so bounded /
+    /// tiny-validation / validation-seconds runs terminate exactly as
+    /// configured. The non-ecology paths are unchanged.
+    ///
+    /// Pure value decision so the shell and tests share one source of truth.
+    public static func canResetInteractiveEcology(plan: EcologyAppRunPlan,
+                                                  validationActive: Bool) -> Bool {
         guard plan.enabled, !plan.limit.isBounded, !plan.tinyValidation else {
             return false
         }

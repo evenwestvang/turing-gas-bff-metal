@@ -74,8 +74,11 @@ let package = Package(
         // Experimental GPU-resident ecology epoch runner host. Builds everywhere;
         // the Metal dispatch paths are #if canImport(Metal). The shader source is
         // bundled as a .copy resource and compiled at runtime via makeLibrary.
-        // Does NOT change BFFMetal's resource list (2 shaders) or SoupScopeApp's
-        // (3 shaders) — BFFEcologyMetal carries its own shader resource.
+        // Does NOT change BFFMetal's resource list (2 shaders) — BFFEcologyMetal
+        // carries its own shader resource. The app bundle therefore packages
+        // exactly four byte-identical provenanced shaders (SoupRender.metal via
+        // SoupScopeApp, BFFEvaluate.metal + BFFResidentEpoch.metal via BFFMetal,
+        // and BFFEcologyEpoch.metal via BFFEcologyMetal).
         .target(
             name: "BFFEcologyMetal",
             dependencies: ["BFFOracle", "BFFMetal", "CBFFEcologyShared"],
@@ -110,16 +113,27 @@ let package = Package(
                           dependencies: ["BFFEcologyMetal", "BFFOracle"]),
         // Platform-independent app core: grid/camera/LOD/normalization/opcode/
         // batcher/HUD/snapshot pure models + launch-option parsing. Depends on
-        // BFFMetal for the soup runner and epoch types; builds and is tested on
-        // Linux. The SwiftUI/Metal shell stays view-only.
+        // BFFMetal for the soup runner and epoch types, and on BFFEcologyMetal
+        // for the immutable `EcologyMetalEpochConfig` the ecology launch path
+        // reconstructs from (the same way it depends on BFFMetal for
+        // `ResidentEpochConfig`). Builds and is tested on Linux. The SwiftUI/
+        // Metal shell stays view-only.
         .target(name: "SoupScopeCore",
-                dependencies: ["BFFOracle", "BFFMetal", "CSoupRender"]),
+                dependencies: ["BFFOracle", "BFFMetal", "BFFEcologyMetal", "CSoupRender"]),
         // SwiftUI + Metal shell on macOS; a stub entry point elsewhere so Linux CI
         // builds it. The render shader is bundled as source and compiled at runtime
-        // (same pattern as BFFMetal's evaluator — no committed metallib).
+        // (same pattern as BFFMetal's evaluator — no committed metallib). The app
+        // directly depends on BFFEcologyMetal so it can load and drive the ecology
+        // shader at runtime; the app bundle therefore packages exactly four
+        // byte-identical provenanced shaders (SoupRender.metal via SoupScopeApp,
+        // BFFEvaluate.metal + BFFResidentEpoch.metal via BFFMetal, and
+        // BFFEcologyEpoch.metal via BFFEcologyMetal). Grounded behavior is
+        // unchanged: each shader has a single source of truth in its owning
+        // target and is never duplicated across the bundle.
         .executableTarget(
             name: "SoupScopeApp",
-            dependencies: ["SoupScopeCore", "BFFMetal", "BFFOracle", "CSoupRender"],
+            dependencies: ["SoupScopeCore", "BFFMetal", "BFFEcologyMetal",
+                           "BFFOracle", "CSoupRender"],
             resources: [.copy("Shaders/SoupRender.metal")]
         ),
         .testTarget(
@@ -129,7 +143,8 @@ let package = Package(
         ),
         .testTarget(
             name: "SoupScopeCoreTests",
-            dependencies: ["SoupScopeCore", "BFFOracle", "BFFMetal", "CSoupRender"]
+            dependencies: ["SoupScopeCore", "BFFOracle", "BFFMetal",
+                           "BFFEcologyMetal", "CSoupRender"]
         ),
         .testTarget(
             name: "BFFMetalTests",
@@ -143,7 +158,8 @@ let package = Package(
         // Builds everywhere; Metal dispatch tests skip on non-Metal hosts.
         .testTarget(
             name: "BFFEcologyMetalTests",
-            dependencies: ["BFFEcologyMetal", "BFFOracle", "CBFFEcologyShared"]
+            dependencies: ["BFFEcologyMetal", "BFFOracle", "BFFMetal",
+                           "CBFFEcologyShared"]
         ),
         // Fixture + version-gate coverage for the Brotli 1.1.0 q2 integration.
         // Requires libbrotli (apt/brew); the exact-byte-count assertions hold on

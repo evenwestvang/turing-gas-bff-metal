@@ -62,7 +62,16 @@ final class SoupMTKView: MTKView {
         case " "?: appModel?.togglePause()
         case "f"?, "F"?: appModel?.fitAll()
         case "m"?, "M"?: appModel?.cycleMetricChannel()
-        case "r"?, "R"?: appModel?.resetInteractiveResidentSimulation()
+        case "r"?, "R"?:
+            // Route Reset to whichever interactive engine is live. The
+            // non-ecology path keeps its existing resident reset; ecology
+            // resets through its own immutable-config reconstruction. Both
+            // use the same lifecycle generation fence.
+            if appModel?.usesEcologyRendering == true {
+                appModel?.resetInteractiveEcologySimulation()
+            } else {
+                appModel?.resetInteractiveResidentSimulation()
+            }
         default: super.keyDown(with: event)
         }
     }

@@ -51,14 +51,19 @@ public struct ResidentFinalDiagnostic: Codable, Equatable, Sendable {
     public var unknownHalts: Int
     public var stopReason: ResidentDriverStopReason
 
+    /// `kind` defaults to `"residentFinalDiagnostic"` so existing resident
+    /// callers and tests are unchanged. Ecology passes
+    /// `"ecologyFinalDiagnostic"` so a bounded ecology run is truthfully
+    /// ecology-labeled, never reported as a resident diagnostic.
     public init(simulationEpoch: Int,
                 displayedEpoch: Int,
                 textureSourceEpoch: Int,
                 frameCount: Int,
                 failures: Int,
                 unknownHalts: Int,
-                stopReason: ResidentDriverStopReason) {
-        self.kind = "residentFinalDiagnostic"
+                stopReason: ResidentDriverStopReason,
+                kind: String = "residentFinalDiagnostic") {
+        self.kind = kind
         self.simulationEpoch = simulationEpoch
         self.displayedEpoch = displayedEpoch
         self.textureSourceEpoch = textureSourceEpoch

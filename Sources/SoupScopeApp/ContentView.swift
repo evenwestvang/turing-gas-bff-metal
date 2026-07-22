@@ -18,14 +18,19 @@ struct ContentView: View {
                     residentChannel: appModel.usesResidentRendering
                         ? appModel.residentVizChannel
                         : nil,
+                    ecologyChannel: appModel.usesEcologyRendering
+                        ? appModel.ecologyVizChannel
+                        : nil,
                     running: appModel.isRunning,
                     vizEntropyBitsPerByte: appModel.vizEntropyAvailable
                         ? appModel.vizEntropyHistory.latest?.meanByteEntropyBitsPerByte
                         : nil)
-            if appModel.usesResidentRendering {
+            if appModel.usesResidentRendering || appModel.usesEcologyRendering {
                 VizEntropyOverlay(history: appModel.vizEntropyHistory,
-                                  available: appModel.vizEntropyAvailable,
-                                  channel: appModel.residentVizChannel)
+                                   available: appModel.vizEntropyAvailable,
+                                   channelLabel: appModel.usesResidentRendering
+                                       ? appModel.residentVizChannel.label
+                                       : appModel.ecologyVizChannel.label)
                     .frame(maxWidth: .infinity, maxHeight: .infinity,
                            alignment: .bottomTrailing)
             }

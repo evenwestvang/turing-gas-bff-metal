@@ -5,10 +5,13 @@ import XCTest
 /// - VizEntropyHistory state feeds the HUD entropy line
 /// - ResidentResetTransition clears entropy state correctly
 /// - HUDModel carries all required raw metric fields
+/// - HUDPrimaryModeLine keeps the ecology-route signage in the primary HUD
+///   (outside the collapsed Raw metrics disclosure), while the ecology
+///   provenance detail stays carried only by EcologyHUDDiagnostics
 ///
-/// These tests use production helper types (HUDModel, VizEntropyHistory,
-/// ResidentResetTransition) and do not depend on Metal or SwiftUI.
-/// They make no fragile source-string assertions.
+/// These tests use production helper types (HUDModel, HUDPrimaryModeLine,
+/// VizEntropyHistory, ResidentResetTransition) and do not depend on Metal or
+/// SwiftUI. They make no fragile source-string assertions.
 final class HUDPresentationTests: XCTestCase {
 
     // MARK: - Entropy availability → HUD data flow
@@ -108,6 +111,60 @@ final class HUDPresentationTests: XCTestCase {
         XCTAssertEqual(transition.hud.epoch, 0, "reset clears epoch")
         XCTAssertNil(transition.hud.errorState, "reset clears error state")
         XCTAssertNil(transition.hud.resident, "reset clears resident diagnostics")
+    }
+
+    // MARK: - Ecology signage stays in the primary HUD
+
+    func testEcologySignageVisibleInPrimaryHUDForEveryEcologyChannel() {
+        // The primary HUD's mode line is the exact shared route label whenever
+        // ecology mode is active, for every channel selection — it never
+        // depends on the Raw metrics disclosure being expanded.
+        for channel in EcologyVizChannel.allCases {
+            XCTAssertEqual(HUDPrimaryModeLine.text(ecologyChannel: channel),
+                           EcologyAppRunPlan.label,
+                           "ecology route must stay visibly labeled for channel \(channel)")
+        }
+    }
+
+    func testNoEcologySignageOutsideEcologyMode() {
+        XCTAssertNil(HUDPrimaryModeLine.text(ecologyChannel: nil),
+                     "resident/CPU-snapshot paths carry no ecology signage")
+    }
+
+    func testEcologySignageIndependentOfDiagnosticsArrival() {
+        // The signage reflects mode routing, not data availability: it is
+        // identical before any ecology diagnostics exist and after a displayed
+        // lease initializes them, so the label is visible from launch while
+        // the collapsed Raw metrics disclosure holds the provenance detail.
+        var hud = HUDModel()
+        XCTAssertNil(hud.ecology, "no ecology diagnostics yet")
+        let beforeDiagnostics = HUDPrimaryModeLine.text(ecologyChannel: .composite)
+        XCTAssertEqual(beforeDiagnostics, EcologyAppRunPlan.label,
+                       "signage visible before the first report or lease")
+
+        hud.noteEcologyDisplayedLease(sourceEpoch: 3)
+        XCTAssertNotNil(hud.ecology, "displayed lease initializes diagnostics")
+        XCTAssertEqual(HUDPrimaryModeLine.text(ecologyChannel: .composite),
+                       beforeDiagnostics,
+                       "diagnostics arrival does not change the signage")
+    }
+
+    func testRawProvenanceStaysOnDiagnosticsNotInPrimarySignage() {
+        // Produced/published/displayed source epoch/phase provenance is
+        // carried only by EcologyHUDDiagnostics (the Raw metrics disclosure's
+        // data source); the primary signage is exactly the static route label
+        // with no embedded provenance and no fabricated availability.
+        var hud = HUDModel()
+        hud.noteEcologyDisplayedLease(sourceEpoch: 7)
+        XCTAssertEqual(hud.ecology?.displayedSourceEpoch, 7)
+        XCTAssertNotNil(hud.ecology?.displayedPhase)
+        XCTAssertEqual(hud.ecology?.producedEpoch, 0,
+                       "produced remains truthfully unavailable")
+        XCTAssertNil(hud.ecology?.publishedSourceEpoch,
+                     "published remains truthfully unavailable")
+        XCTAssertEqual(HUDPrimaryModeLine.text(ecologyChannel: .composite),
+                       EcologyAppRunPlan.label,
+                       "primary signage is the static label only")
     }
 
     // MARK: - Channel labels

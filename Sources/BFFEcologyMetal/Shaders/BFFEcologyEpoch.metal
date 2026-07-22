@@ -8,9 +8,10 @@
 // Kernels:
 //   1. bff_ecology_mutate — per-byte mutation from ecology RNG
 //   2. bff_ecology_eval_scatter — per-pair BFF interpreter with both bracket modes
-//   3. bff_ecology_layout_probe — test-only ABI verification
-//   4. bff_ecology_rng_probe — test-only RNG boundary vectors
-//   5. bff_ecology_pair_probe — test-only topology pair mapping verification
+//   3. bff_ecology_visualize — app-safe per-site RGB overview from the live soup
+//   4. bff_ecology_layout_probe — test-only ABI verification
+//   5. bff_ecology_rng_probe — test-only RNG boundary vectors
+//   6. bff_ecology_pair_probe — test-only topology pair mapping verification
 
 #include <metal_stdlib>
 using namespace metal;
@@ -456,4 +457,73 @@ kernel void bff_ecology_pair_probe(device uint32_t *pairAB [[buffer(0)]],
     bff_ecology_pair((uint32_t)gid, params.epoch & 3u, a, b);
     pairAB[gid * 2u] = a;
     pairAB[gid * 2u + 1u] = b;
+}
+
+// ============================================================
+// Kernel: bff_ecology_visualize
+// ============================================================
+// App-safe per-site RGB overview of the live ecology soup. One GPU thread per
+// ecology site (512 × 256 = 131,072). Each texel is a deterministic function
+// of THAT site's 64 program bytes only — soup-derived scalar summaries, not
+// energy/death/movement/predation/fitness/reproduction/paper metrics:
+//   R = opcode-byte density (count of the ten BFF command bytes), scaled.
+//   G = per-site byte mean (Σ bytes >> 6), scaled.
+//   B = structural positional-XOR fingerprint (Σ (b << (i & 3))) ^ mean.
+//
+// Writes ONLY the 512×256 rgba8Unorm texture. Unlike `bff_resident_visualize`
+// (which also writes a host-readable byte buffer the resident CPU-snapshot
+// path consumes), the ecology app-safe path has no host reader for an
+// overview byte buffer — the renderer leases the immutable snapshot's TEXTURE
+// (blitted from this live texture into a ring slot), and the producer never
+// reads the overview back to the CPU. Allocating and writing a 512 KiB byte
+// buffer that is never read would be wasted work, so this kernel does not
+// take one. The producer runs this AFTER mutate+eval and BEFORE scheduling
+// the immutable snapshot publication (a blit of soup + this overview texture
+// into a ring slot). The renderer never binds the live soup or the live
+// overview texture; it leases the immutable slot. This kernel is NOT called
+// by the accepted CLI `EcologyMetalEpochRunner.runEpoch()`, which keeps its
+// exact readback+digest semantics; it is the app-safe execution path only.
+kernel void bff_ecology_visualize(device const uchar *soup [[buffer(0)]],
+                                  texture2d<float, access::write> texture [[texture(0)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    if (gid >= BFF_ECO_SITE_COUNT) return;
+
+    uint32_t start = gid * BFF_ECO_PROG_SIZE;
+    uint32_t sum = 0u;
+    uint32_t commandCount = 0u;
+    uint32_t xors = 0u;
+    for (uint i = 0u; i < BFF_ECO_PROG_SIZE; i++) {
+        uchar b = soup[start + i];
+        sum += (uint32_t)b;
+        xors ^= ((uint32_t)b << (i & 3u));
+        switch (b) {
+        case BFF_ECO_OP_HEAD0_LEFT:
+        case BFF_ECO_OP_HEAD0_RIGHT:
+        case BFF_ECO_OP_HEAD1_LEFT:
+        case BFF_ECO_OP_HEAD1_RIGHT:
+        case BFF_ECO_OP_INC:
+        case BFF_ECO_OP_DEC:
+        case BFF_ECO_OP_WRITE:
+        case BFF_ECO_OP_READ:
+        case BFF_ECO_OP_LOOP_OPEN:
+        case BFF_ECO_OP_LOOP_CLOSE:
+            commandCount++;
+            break;
+        default:
+            break;
+        }
+    }
+
+    uint32_t mean = sum >> 6u;
+    uint32_t commands = min(commandCount * 24u, 255u);
+    uint32_t edge = (mean ^ xors) & 255u;
+
+    uint2 coord = uint2(gid % BFF_ECO_TOPOLOGY_WIDTH, gid / BFF_ECO_TOPOLOGY_WIDTH);
+    if (coord.x < texture.get_width() && coord.y < texture.get_height()) {
+        texture.write(float4((float)commands / 255.0f,
+                              (float)mean / 255.0f,
+                              (float)edge / 255.0f,
+                              1.0f),
+                      coord);
+    }
 }

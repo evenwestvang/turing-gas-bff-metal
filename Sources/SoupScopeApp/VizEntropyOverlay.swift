@@ -14,7 +14,7 @@ import SoupScopeCore
 struct VizEntropyOverlay: View {
     let history: VizEntropyHistory
     let available: Bool
-    let channel: ResidentVizChannel
+    let channelLabel: String
 
     fileprivate static let panelBackground = Color(
         red: 0.965, green: 0.955, blue: 0.935, opacity: 0.92)

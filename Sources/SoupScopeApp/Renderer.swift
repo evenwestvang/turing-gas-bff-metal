@@ -3,6 +3,7 @@ import Foundation
 import Metal
 import MetalKit
 import BFFMetal
+import BFFOracle
 import SoupScopeCore
 import CSoupRender
 
@@ -58,7 +59,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         var metricTextureSeconds: Double? = nil
         var renderSubmitSeconds: Double? = nil
 
-        let snapshot = appModel.usesResidentRendering ? nil : appModel.stepFrame()
+        let snapshot = (appModel.usesResidentRendering || appModel.usesEcologyRendering)
+            ? nil : appModel.stepFrame()
 
         guard let descriptor = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable,
@@ -115,6 +117,62 @@ final class Renderer: NSObject, MTKViewDelegate {
                     encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                     appModel.noteResidentFrameSubmitted(sourceEpoch: sourceEpoch)
                 }
+            }
+        } else if appModel.usesEcologyRendering {
+            // Ecology renderer ownership contract:
+            //
+            // NEVER binds the producer's live mutable soup or its live overview
+            // texture. Every frame acquires a published immutable soup+overview
+            // snapshot lease — the SAME paired slot the producer published on
+            // its blit command buffer's completion. Close LOD (microBlend > 0)
+            // binds the lease's soup buffer + overview texture through the
+            // resident render pipeline; far-only LOD (microBlend == 0) binds
+            // only the lease's overview texture through the overview pipeline.
+            // Both paths use the same lease and release it on THIS render
+            // command buffer's completion, so the slot cannot be recycled
+            // until the renderer is done with it.
+            //
+            // Before the first publication, or when acquire fails (ring busy /
+            // no publication yet), the renderer binds NO producer resource and
+            // draws nothing — the cleared neutral background is the unavailable
+            // state. The displayed epoch/phase is taken from the lease's
+            // `sourceEpoch` (see `noteEcologyFrameSubmitted`), so it always
+            // corresponds to the resource actually rendered this frame. No
+            // full-soup CPU readback, no CPU digest, no GPU wait on this
+            // display thread.
+            let expectedByteCount = EcologyTopology.soupByteCount
+            let lease = appModel.acquireEcologySnapshot()
+            if let lease = lease,
+               lease.byteCount == expectedByteCount,
+               lease.overviewTexture.width == EcologyTopology.width,
+               lease.overviewTexture.height == EcologyTopology.height {
+                var uniforms = appModel.makeUniforms()
+                if ResidentRenderDecision.requiresSnapshotLease(microBlend: uniforms.microBlend) {
+                    encoder.setRenderPipelineState(context.residentRenderPipeline)
+                    encoder.setFragmentBytes(&uniforms,
+                                             length: MemoryLayout<VizUniforms>.stride,
+                                             index: 0)
+                    encoder.setFragmentBuffer(lease.buffer, offset: 0, index: 1)
+                    encoder.setFragmentTexture(lease.overviewTexture, index: 0)
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                } else {
+                    encoder.setRenderPipelineState(context.residentOverviewRenderPipeline)
+                    encoder.setFragmentBytes(&uniforms,
+                                             length: MemoryLayout<VizUniforms>.stride,
+                                             index: 0)
+                    encoder.setFragmentTexture(lease.overviewTexture, index: 0)
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                }
+                lease.releaseOnCommandBufferCompletion(commandBuffer)
+                appModel.noteEcologyFrameSubmitted(sourceEpoch: lease.sourceEpoch)
+            } else {
+                lease?.release()
+                // Neutral background: no producer resource is bound. The
+                // unavailable acquisition preserves the prior displayed
+                // ecology source epoch/phase (the last valid lease
+                // rendered) rather than reporting a fabricated epoch zero;
+                // see `noteEcologyFrameUnavailable`/`noteEcologyDisplayUnavailable`.
+                appModel.noteEcologyFrameUnavailable()
             }
         } else if let snapshot {
             let soupStart = timing ? AppMonotonicClock.nowSeconds() : 0

@@ -1,5 +1,6 @@
 import BFFOracle
 import BFFMetal
+import BFFEcologyMetal
 
 /// Launch-time configuration for the SoupScope app, parsed from command-line
 /// arguments so program count / seed / budget / shadow sample are configurable
@@ -39,6 +40,13 @@ public struct AppLaunchOptions: Equatable, Sendable {
     public var residentTinyValidation: Bool
     public var residentCheckpointInterval: Int
     public var residentVisualizationWidth: Int
+    /// Experimental "SoupScope Spatial Ecology" launch plan. Populated only
+    /// when `--ecology` selects the ecology engine (a separate engine from
+    /// `.resident`). Plain/empty launch keeps the resident route; only an
+    /// explicit `--ecology` invocation routes here. The ecology topology is
+    /// fixed 512×256 (131,072 sites) and is not configurable, so the plan
+    /// carries only the accepted-CLI config knobs.
+    public var ecologyPlan: EcologyAppRunPlan
 
     public init(seed: UInt32 = 0xB00F,
                 programCount: Int = ProgramGrid.capacity,
@@ -54,7 +62,8 @@ public struct AppLaunchOptions: Equatable, Sendable {
                 residentSecondsLimit: Double? = nil,
                 residentTinyValidation: Bool = false,
                 residentCheckpointInterval: Int = 0,
-                residentVisualizationWidth: Int = ProgramGrid.canonicalWidth) {
+                residentVisualizationWidth: Int = ProgramGrid.canonicalWidth,
+                ecologyBracketMode: BracketMode = .dynamicScan) {
         self.seed = seed
         self.programCount = programCount
         self.stepBudget = stepBudget
@@ -70,6 +79,15 @@ public struct AppLaunchOptions: Equatable, Sendable {
         self.residentTinyValidation = residentTinyValidation
         self.residentCheckpointInterval = residentCheckpointInterval
         self.residentVisualizationWidth = residentVisualizationWidth
+        self.ecologyPlan = EcologyAppRunPlan(
+            enabled: false,
+            seed: seed,
+            stepBudget: stepBudget,
+            mutationP32: mutationP32,
+            variant: variant,
+            bracketMode: ecologyBracketMode,
+            limit: .unbounded,
+            tinyValidation: false)
     }
 
     public enum ParseError: Error, Equatable, CustomStringConvertible {
@@ -82,6 +100,14 @@ public struct AppLaunchOptions: Equatable, Sendable {
         /// `--programs` above the 512×256 canonical canvas capacity (131072).
         case programCountExceedsCanvas(count: Int, capacity: Int)
         case conflictingResidentLimits
+        case conflictingEcologyLimits
+        case ecologyBudgetExceedsMetalContract(Int)
+        case unknownBracketMode(String)
+        /// `--ecology` was combined with an explicit `--programs`. The ecology
+        /// topology is fixed by contract (512×256 = 131,072 sites), so an
+        /// explicit program count is neither honored nor silently ignored —
+        /// it is a parse error so no false HUD/config state is emitted.
+        case ecologyTopologyNotConfigurable(explicitProgramCount: Int)
 
         public var description: String {
             switch self {
@@ -90,11 +116,18 @@ public struct AppLaunchOptions: Equatable, Sendable {
             case .notANumber(let f, let v): return "\(f) requires a number, got '\(v)'"
             case .unknownVariant(let v): return "unknown variant '\(v)' (use 'noheads' or 'bff')"
             case .unknownPlanner(let v): return "unknown resident planner '\(v)' (use 'keyed' or 'cpu-upload')"
+            case .unknownBracketMode(let v): return "unknown bracket mode '\(v)' (use 'dynamicScan' or 'jumpTable')"
             case .unknownFlag(let f): return "unknown argument '\(f)'"
             case .programCountExceedsCanvas(let n, let cap):
                 return "program count \(n) exceeds the 512×256 canonical canvas capacity \(cap)"
             case .conflictingResidentLimits:
                 return "use at most one of --resident-epochs or --resident-seconds"
+            case .conflictingEcologyLimits:
+                return "use at most one of --ecology-epochs or --ecology-seconds"
+            case .ecologyBudgetExceedsMetalContract(let n):
+                return "ecology Metal contract pins step budget to 1...8192, got \(n)"
+            case .ecologyTopologyNotConfigurable(let n):
+                return "ecology topology is fixed (512×256 = 131072); --programs \(n) is not accepted with --ecology"
             }
         }
     }
@@ -120,6 +153,14 @@ public struct AppLaunchOptions: Equatable, Sendable {
                              full-soup checkpoint cadence; 0 disables (default 0)
       --resident-visualization-width N
                              resident visualization texture width (default 512)
+      --ecology              opt into "Experimental Spatial Ecology" (BFF-Ecology v1)
+                             — a separate engine from --resident; fixed 512×256 torus
+      --ecology-brackets dynamicScan|jumpTable
+                             ecology bracket mode (default dynamicScan)
+      --ecology-epochs N     ecology measurement bound; print diagnostics and exit
+      --ecology-seconds S    ecology measurement bound; print diagnostics and exit
+      --ecology-tiny-validation
+                             shadow one ecology epoch against the CPU reference
     """
 
     /// Parse arguments (already stripped of the executable name). Recognizes the
@@ -141,6 +182,22 @@ public struct AppLaunchOptions: Equatable, Sendable {
             options.simulationMode = .resident
         }
         var shadowSampleAll = false
+        var ecologyEpochLimit: Int?
+        var ecologySecondsLimit: Double?
+        var ecologyTinyValidation = false
+        var ecologyBracket: BracketMode = .dynamicScan
+        // Track whether `--programs` was passed explicitly so the fixed-topology
+        // ecology route can reject it (the ecology topology is 512×256 by
+        // contract, not configurable). The default program count is not an
+        // explicit `--programs` invocation.
+        var programsExplicitlySet = false
+        func bracket(_ flag: String, _ v: String) throws -> BracketMode {
+            switch v {
+            case "dynamicScan": return .dynamicScan
+            case "jumpTable": return .jumpTable
+            default: throw ParseError.unknownBracketMode(v)
+            }
+        }
         var i = 0
         func value(_ flag: String) throws -> String {
             guard i < args.count else { throw ParseError.missingValue(flag) }
@@ -161,7 +218,9 @@ public struct AppLaunchOptions: Equatable, Sendable {
             i += 1
             switch flag {
             case "--seed": options.seed = try u32(flag, try value(flag))
-            case "--programs": options.programCount = try int(flag, try value(flag))
+            case "--programs":
+                options.programCount = try int(flag, try value(flag))
+                programsExplicitlySet = true
             case "--budget": options.stepBudget = try int(flag, try value(flag))
             case "--mutation-p32": options.mutationP32 = try u32(flag, try value(flag))
             case "--shadow-sample":
@@ -217,6 +276,24 @@ public struct AppLaunchOptions: Equatable, Sendable {
             case "--resident-visualization-width":
                 options.residentVisualizationWidth = try int(flag, try value(flag))
                 options.simulationMode = .resident
+            case "--ecology":
+                options.simulationMode = .ecology
+            case "--ecology-brackets":
+                ecologyBracket = try bracket(flag, try value(flag))
+                options.simulationMode = .ecology
+            case "--ecology-epochs":
+                ecologyEpochLimit = try int(flag, try value(flag))
+                options.simulationMode = .ecology
+            case "--ecology-seconds":
+                let raw = try value(flag)
+                guard let s = Double(raw) else {
+                    throw ParseError.notANumber(flag: flag, value: raw)
+                }
+                ecologySecondsLimit = s
+                options.simulationMode = .ecology
+            case "--ecology-tiny-validation":
+                ecologyTinyValidation = true
+                options.simulationMode = .ecology
             case "--help", "-h":
                 // Recognized but not an error; the shell prints usage and continues.
                 break
@@ -231,6 +308,55 @@ public struct AppLaunchOptions: Equatable, Sendable {
         }
         if options.residentEpochLimit != nil && options.residentSecondsLimit != nil {
             throw ParseError.conflictingResidentLimits
+        }
+        if ecologyEpochLimit != nil && ecologySecondsLimit != nil {
+            throw ParseError.conflictingEcologyLimits
+        }
+        // Ecology Metal contract: pin stepBudget to 1...8192 (the accepted CLI
+        // domain). Reject over-budget clearly, never clamp.
+        if options.simulationMode == .ecology,
+           options.stepBudget > 8192 || options.stepBudget <= 0 {
+            throw ParseError.ecologyBudgetExceedsMetalContract(options.stepBudget)
+        }
+        // The ecology topology is fixed (512×256 = 131,072 sites) by contract.
+        // An explicit `--programs` combined with `--ecology` would either be
+        // silently ignored (false config state) or silently honored (wrong
+        // topology); reject it explicitly instead. The fixed app grid/HUD is
+        // 131072 = EcologyTopology.siteCount = ProgramGrid.capacity.
+        if options.simulationMode == .ecology, programsExplicitlySet {
+            throw ParseError.ecologyTopologyNotConfigurable(
+                explicitProgramCount: options.programCount)
+        }
+        if options.simulationMode == .ecology {
+            let limit: ResidentRunLimit
+            if let ecologyEpochLimit {
+                limit = .epochs(ecologyEpochLimit)
+            } else if let ecologySecondsLimit {
+                limit = .seconds(ecologySecondsLimit)
+            } else if ecologyTinyValidation {
+                limit = .epochs(1)
+            } else {
+                limit = .unbounded
+            }
+            options.ecologyPlan = EcologyAppRunPlan(
+                enabled: true,
+                seed: options.seed,
+                stepBudget: options.stepBudget,
+                mutationP32: options.mutationP32,
+                variant: options.variant,
+                bracketMode: ecologyBracket,
+                limit: limit,
+                tinyValidation: ecologyTinyValidation)
+        } else {
+            options.ecologyPlan = EcologyAppRunPlan(
+                enabled: false,
+                seed: options.seed,
+                stepBudget: options.stepBudget,
+                mutationP32: options.mutationP32,
+                variant: options.variant,
+                bracketMode: ecologyBracket,
+                limit: .unbounded,
+                tinyValidation: false)
         }
         return options
     }
@@ -292,5 +418,20 @@ public struct AppLaunchOptions: Equatable, Sendable {
                                       visualizationEnabled: true,
                                       visualizationWidth: plan.visualizationWidth,
                                       pairingDiagnosticsEnabled: false)
+    }
+
+    /// Build the immutable `EcologyMetalEpochConfig` from the ecology launch
+    /// plan. The step-budget Metal contract (1...8192) is enforced here too so
+    /// a programmatic caller (Reset reconstruction) gets the same rejection
+    /// the parser applies. The topology is fixed by the ecology contract, so
+    /// unlike `residentConfig()` there is no program-count knob.
+    public func ecologyConfig() throws -> EcologyMetalEpochConfig {
+        try EcologyMetalEpochConfig(
+            seed: ecologyPlan.seed,
+            stepBudget: ecologyPlan.stepBudget,
+            mutationP32: ecologyPlan.mutationP32,
+            variant: ecologyPlan.variant,
+            bracketMode: ecologyPlan.bracketMode,
+            capturePairTapes: ecologyPlan.tinyValidation)
     }
 }

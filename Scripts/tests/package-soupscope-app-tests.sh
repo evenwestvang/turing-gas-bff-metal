@@ -49,32 +49,43 @@ expect_stdout() {
     fi
 }
 
-# Build a canonical, valid bin dir: exactly the three required shaders, one each,
+# Build a canonical, valid bin dir: exactly the four required shaders, one each,
 # in the pinned per-target bundle path. Echoes the bin dir.
 make_good_bindir() {
     local root
     root=$(mktemp -d)
     mkdir -p "$root/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources"
     mkdir -p "$root/${PACKAGE_NAME}_SoupScopeApp.bundle/Contents/Resources"
+    mkdir -p "$root/${PACKAGE_NAME}_BFFEcologyMetal.bundle/Contents/Resources"
     printf 'evaluate\n' > "$root/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources/BFFEvaluate.metal"
     printf 'epoch\n'    > "$root/${PACKAGE_NAME}_BFFMetal.bundle/Contents/Resources/BFFResidentEpoch.metal"
     printf 'render\n'   > "$root/${PACKAGE_NAME}_SoupScopeApp.bundle/Contents/Resources/SoupRender.metal"
+    printf 'ecology\n'  > "$root/${PACKAGE_NAME}_BFFEcologyMetal.bundle/Contents/Resources/BFFEcologyEpoch.metal"
     printf '%s' "$root"
 }
 
-# Build a valid, sealed Contents/Resources (exactly the three shaders). Echoes it.
+# Build a valid, sealed Contents/Resources (exactly the four shaders). Echoes it.
 make_good_resources() {
     local root
     root=$(mktemp -d)
     printf 'evaluate\n' > "$root/BFFEvaluate.metal"
     printf 'epoch\n'    > "$root/BFFResidentEpoch.metal"
     printf 'render\n'   > "$root/SoupRender.metal"
+    printf 'ecology\n'  > "$root/BFFEcologyEpoch.metal"
     printf '%s' "$root"
 }
 
 echo "manifest"
-expect_stdout "required_basenames is exactly the three shaders, sorted" \
-    $'BFFEvaluate.metal\nBFFResidentEpoch.metal\nSoupRender.metal' required_basenames
+expect_stdout "required_basenames is exactly the four shaders, sorted" \
+    $'BFFEcologyEpoch.metal\nBFFEvaluate.metal\nBFFResidentEpoch.metal\nSoupRender.metal' required_basenames
+
+# Exact enumeration, not merely "the four known names are present": the manifest
+# has exactly four entries (no third shader leftover, no fifth shader), and the
+# build-set / sealed-resources gates reject both a missing and an extra .metal.
+manifest_count=$(printf '%s\n' "${REQUIRED_SHADERS[@]}" | wc -l | tr -d ' ')
+[[ "$manifest_count" -eq 4 ]] \
+    && ok "manifest has exactly four shader entries" \
+    || bad "manifest has $manifest_count entries (expected 4)"
 
 echo "resolve_shader_source"
 bindir=$(make_good_bindir)
@@ -87,6 +98,9 @@ expect_stdout "resolves BFFResidentEpoch from BFFMetal bundle" \
 expect_stdout "resolves SoupRender from SoupScopeApp bundle" \
     "$bindir/${PACKAGE_NAME}_SoupScopeApp.bundle/Contents/Resources/SoupRender.metal" \
     resolve_shader_source "SoupRender.metal" "SoupScopeApp" "$bindir"
+expect_stdout "resolves BFFEcologyEpoch from BFFEcologyMetal bundle" \
+    "$bindir/${PACKAGE_NAME}_BFFEcologyMetal.bundle/Contents/Resources/BFFEcologyEpoch.metal" \
+    resolve_shader_source "BFFEcologyEpoch.metal" "BFFEcologyMetal" "$bindir"
 expect_fail "fails when the expected per-target bundle is absent" \
     resolve_shader_source "SoupRender.metal" "NoSuchTarget" "$bindir"
 
@@ -130,7 +144,7 @@ expect_fail "rejects a duplicate/stale .metal elsewhere under bin" \
 
 echo "verify_packaged_resources"
 res=$(make_good_resources)
-expect_ok "accepts exactly the three sealed shaders" verify_packaged_resources "$res"
+expect_ok "accepts exactly the four sealed shaders" verify_packaged_resources "$res"
 
 # Extra file.
 resx=$(make_good_resources)

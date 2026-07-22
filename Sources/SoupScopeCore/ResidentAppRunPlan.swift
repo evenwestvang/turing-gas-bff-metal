@@ -3,6 +3,11 @@ import BFFMetal
 public enum AppSimulationMode: Equatable, Sendable {
     case nonResident
     case resident
+    /// Experimental "SoupScope Spatial Ecology" route. A separate engine from
+    /// `.resident`: it constructs neither the legacy `SoupRunner` nor the
+    /// grounded `ResidentSimulationDriver`, routing instead through
+    /// `EcologySimulationDriver` over the accepted `EcologyMetalEpochRunner`.
+    case ecology
 }
 
 public enum ResidentRunLimit: Equatable, Sendable {

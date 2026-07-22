@@ -249,6 +249,33 @@ public struct ResidentSnapshotRingDiagnostics: Equatable, Sendable, Codable {
     public var lastBlitHostSeconds: Double?
     public var lastBlitGPUSeconds: Double?
     public var slots: [ResidentSnapshotSlotDiagnostics]
+
+    /// Sentinel for a ring that has not been allocated yet (slot count 0,
+    /// every counter 0, no publication). The narrowest public cross-module
+    /// construction of this diagnostics value: a single `public static let`
+    /// initialized inside this module, so callers in other modules never need
+    /// the synthesized memberwise initializer (which is `internal`) and cannot
+    /// fabricate a diagnostics value that misrepresents a real ring.
+    public static let unprepared = ResidentSnapshotRingDiagnostics(
+        slotCount: 0,
+        expectedByteCount: 0,
+        nextGeneration: 1,
+        publishedSlot: nil,
+        publishedGeneration: nil,
+        publishedSourceEpoch: nil,
+        activeLeaseCount: 0,
+        writingSlotCount: 0,
+        reservationCount: 0,
+        publishCount: 0,
+        skippedReservationCount: 0,
+        cancelledReservationCount: 0,
+        stalePublicationCount: 0,
+        failedAcquireCount: 0,
+        staleReleaseCount: 0,
+        generationExhaustedReservationCount: 0,
+        lastBlitHostSeconds: nil,
+        lastBlitGPUSeconds: nil,
+        slots: [])
 }
 
 public struct ResidentSnapshotRingState: Sendable {
@@ -862,14 +889,27 @@ public final class ResidentGPUSnapshotLease: @unchecked Sendable {
     }
 }
 
-private final class ResidentGPUSnapshotRing: @unchecked Sendable {
+/// The immutable GPU soup+overview snapshot ring. Public so the ecology
+/// engine can reuse the **exact** same producer-publishes/renderer-leases
+/// contract as the grounded resident engine, instead of re-implementing a
+/// divergent ring. The ring is a `@unchecked Sendable` owner of per-slot
+/// `.storageModePrivate` `MTLBuffer`s and overview `MTLTexture`s; it never
+/// touches the producer's live mutable soup. Its state machine is the public
+/// `ResidentSnapshotRingState` value type, so all reservation/publish/acquire/
+/// release semantics are defined and tested in one place.
+///
+/// The resident runner allocates and drives this ring unchanged; ecology
+/// constructs its own instance of the same type. `ResidentGPUSnapshotLease`
+/// stays `fileprivate`-init: only this ring (same file) constructs leases, so
+/// callers cannot fabricate a lease that does not correspond to a real slot.
+public final class ResidentGPUSnapshotRing: @unchecked Sendable {
     private let lock = NSLock()
     private var state: ResidentSnapshotRingState
     private let buffers: [MTLBuffer]
     private let overviewTextures: [MTLTexture]
 
-    init(device: MTLDevice, slotCount: Int, byteCount: Int,
-         overviewWidth: Int, overviewHeight: Int) throws {
+    public init(device: MTLDevice, slotCount: Int, byteCount: Int,
+                overviewWidth: Int, overviewHeight: Int) throws {
         self.state = try ResidentSnapshotRingState(slotCount: slotCount,
                                                    expectedByteCount: byteCount)
         var builtBuffers: [MTLBuffer] = []
@@ -902,7 +942,7 @@ private final class ResidentGPUSnapshotRing: @unchecked Sendable {
         self.overviewTextures = builtTextures
     }
 
-    func reserveForWrite() -> (ResidentSnapshotReservation, MTLBuffer, MTLTexture)? {
+    public func reserveForWrite() -> (ResidentSnapshotReservation, MTLBuffer, MTLTexture)? {
         lock.lock()
         let reservation = state.reserveForWrite()
         lock.unlock()
@@ -910,11 +950,11 @@ private final class ResidentGPUSnapshotRing: @unchecked Sendable {
         return (reservation, buffers[reservation.slot], overviewTextures[reservation.slot])
     }
 
-    func publish(_ reservation: ResidentSnapshotReservation,
-                 sourceEpoch: Int,
-                 byteCount: Int,
-                 blitHostSeconds: Double?,
-                 blitGPUSeconds: Double?) {
+    public func publish(_ reservation: ResidentSnapshotReservation,
+                        sourceEpoch: Int,
+                        byteCount: Int,
+                        blitHostSeconds: Double?,
+                        blitGPUSeconds: Double?) {
         lock.lock()
         _ = state.publish(reservation,
                           sourceEpoch: sourceEpoch,
@@ -924,13 +964,13 @@ private final class ResidentGPUSnapshotRing: @unchecked Sendable {
         lock.unlock()
     }
 
-    func cancel(_ reservation: ResidentSnapshotReservation) {
+    public func cancel(_ reservation: ResidentSnapshotReservation) {
         lock.lock()
         state.cancel(reservation)
         lock.unlock()
     }
 
-    func acquire(expectedByteCount: Int) -> ResidentGPUSnapshotLease? {
+    public func acquire(expectedByteCount: Int) -> ResidentGPUSnapshotLease? {
         lock.lock()
         let token = state.acquire(expectedByteCount: expectedByteCount)
         lock.unlock()
@@ -942,7 +982,7 @@ private final class ResidentGPUSnapshotRing: @unchecked Sendable {
         }
     }
 
-    var diagnostics: ResidentSnapshotRingDiagnostics {
+    public var diagnostics: ResidentSnapshotRingDiagnostics {
         lock.lock()
         let snapshot = state.diagnostics
         lock.unlock()
